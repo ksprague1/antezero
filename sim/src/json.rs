@@ -174,7 +174,11 @@ fn write_string(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
 ///
 /// Returns what is malformed and at which byte.
 pub fn parse(s: &str) -> Result<Json, String> {
-	let mut p = Parser { src: s, i: 0 };
+	let mut p = Parser {
+		src: s,
+		i: 0,
+		depth: 0,
+	};
 	let v = p.value()?;
 	p.ws();
 	if p.i != s.len() {
@@ -183,9 +187,14 @@ pub fn parse(s: &str) -> Result<Json, String> {
 	Ok(v)
 }
 
+/// The deepest nesting a document may have (the parser recurses once per
+/// level; a state dump nests a few).
+const MAX_DEPTH: usize = 64;
+
 struct Parser<'src> {
 	src: &'src str,
 	i: usize,
+	depth: usize,
 }
 
 impl Parser<'_> {
@@ -272,6 +281,17 @@ impl Parser<'_> {
 	}
 
 	fn value(&mut self) -> Result<Json, String> {
+		self.depth += 1;
+		if self.depth > MAX_DEPTH {
+			return Err(self.err("nested too deep"));
+		}
+		let v = self.item();
+		self.depth -= 1;
+		v
+	}
+
+	/// The value at the cursor, at the current depth.
+	fn item(&mut self) -> Result<Json, String> {
 		self.ws();
 		match self.peek()? {
 			b'n' => self.literal("null", Json::Null),
@@ -461,6 +481,7 @@ mod tests {
 			"+1",
 			"{1:2}",
 			"-",
+			&"[".repeat(100_000),
 		] {
 			assert!(parse(bad).is_err(), "{bad:?} parsed");
 		}

@@ -1,5 +1,7 @@
 //! A [`Game`] written as a state dump, in the shape of the game's.
 
+use std::collections::BTreeMap;
+
 use crate::canon::JokerField;
 use crate::card::{AnyCard, Card, CardCore, Kind, Sticker};
 use crate::data::{
@@ -54,13 +56,14 @@ pub(crate) fn write(g: &Game) -> Json {
 }
 
 fn rng(g: &Game) -> Json {
-	let mut streams: Vec<(String, f64)> = g.rng.named_streams().collect();
-	streams.push(("hashed_seed".into(), g.rng.hashed_seed()));
-	let mut out = object(streams.iter().map(|(k, v)| (k.as_str(), Json::Num(*v))));
-	if let Json::Obj(m) = &mut out {
-		m.insert("seed".into(), g.rng.seed().into());
-	}
-	out
+	let mut streams: BTreeMap<String, Json> = g
+		.rng
+		.named_streams()
+		.map(|(k, v)| (k, Json::Num(v)))
+		.collect();
+	streams.insert("hashed_seed".into(), g.rng.hashed_seed().into());
+	streams.insert("seed".into(), g.rng.seed().into());
+	Json::Obj(streams)
 }
 
 fn blind(b: &Blind) -> Json {
@@ -257,13 +260,13 @@ fn round(r: &Round, out: &mut Vec<(&str, Json)>) {
 }
 
 fn blind_select(b: &BlindSelect, out: &mut Vec<(&str, Json)>) {
-	let per_slot = |value: &dyn Fn(BlindSlot) -> Json| {
+	fn per_slot(value: impl Fn(BlindSlot) -> Json) -> Json {
 		object(
 			BlindSlot::ALL
 				.into_iter()
 				.map(|slot| (slot.name(), value(slot))),
 		)
-	};
+	}
 	let bosses_used = object(
 		ALL_BLINDS
 			.iter()
@@ -273,9 +276,9 @@ fn blind_select(b: &BlindSelect, out: &mut Vec<(&str, Json)>) {
 	out.extend([
 		(
 			"blind_states",
-			per_slot(&|slot| b.states[slot].name().into()),
+			per_slot(|slot| b.states[slot].name().into()),
 		),
-		("blind_choices", per_slot(&|slot| b.kind(slot).key().into())),
+		("blind_choices", per_slot(|slot| b.kind(slot).key().into())),
 		(
 			"blind_tags",
 			object(
@@ -347,9 +350,8 @@ fn tags(t: &Tags, out: &mut Vec<(&str, Json)>) {
 
 /// What every card has, with the fields of its `ability` table in `ability`.
 fn core(
-	c: &CardCore, key: &str, mut fields: Vec<(&str, Json)>, ability: Vec<(&str, Json)>,
+	c: &CardCore, key: &str, mut fields: Vec<(&str, Json)>, mut ability: Vec<(&str, Json)>,
 ) -> Json {
-	let mut ability = ability;
 	ability.push(("couponed", c.couponed.into()));
 	ability.push(("hands_played_at_create", c.hands_played_at_create.into()));
 	fields.extend([
@@ -415,7 +417,12 @@ fn card(c: &Card) -> Json {
 	match c.kind {
 		Kind::Joker(j) => {
 			let mut extra = Vec::new();
-			for &field in JokerField::COMMON.iter().chain(JokerField::of(j)) {
+			// `core` writes `couponed`, a field of every card.
+			let fields = JokerField::COMMON
+				.iter()
+				.chain(JokerField::of(j))
+				.filter(|&&f| f != JokerField::Couponed);
+			for &field in fields {
 				let v = joker_field(field, c);
 				match field.path().strip_prefix("extra.") {
 					Some(key) => extra.push((key, v)),

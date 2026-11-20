@@ -40,13 +40,13 @@ fn bad(key: &str, v: &Json) -> DumpError {
 	DumpError(format!("bad {key}: {v:?}"))
 }
 
-fn num(j: &Json, key: &str) -> Result<f64, DumpError> {
+fn number(j: &Json, key: &str) -> Result<f64, DumpError> {
 	let v = j.get(key);
 	v.as_f64().ok_or_else(|| bad(key, v))
 }
 
 /// A number the game leaves `nil` until it is set.
-fn opt_num(j: &Json, key: &str) -> Result<Option<f64>, DumpError> {
+fn opt_number(j: &Json, key: &str) -> Result<Option<f64>, DumpError> {
 	match j.get(key) {
 		Json::Null => Ok(None),
 		v => v.as_f64().map(Some).ok_or_else(|| bad(key, v)),
@@ -60,11 +60,11 @@ fn whole<T: TryFrom<i64>>(j: &Json, key: &str, x: f64) -> Result<T, DumpError> {
 }
 
 fn int<T: TryFrom<i64>>(j: &Json, key: &str) -> Result<T, DumpError> {
-	whole(j, key, num(j, key)?)
+	whole(j, key, number(j, key)?)
 }
 
 fn opt_int<T: TryFrom<i64>>(j: &Json, key: &str) -> Result<Option<T>, DumpError> {
-	opt_num(j, key)?.map(|x| whole(j, key, x)).transpose()
+	opt_number(j, key)?.map(|x| whole(j, key, x)).transpose()
 }
 
 /// A flag: the game leaves it `nil` while it is false.
@@ -217,7 +217,7 @@ fn read_rng(j: &Json) -> Result<PseudoRandom, DumpError> {
 		return Err(bad("seed", j.get("seed")));
 	}
 	let mut rng = PseudoRandom::new(seed);
-	if num(j, "hashed_seed")? != rng.hashed_seed() {
+	if number(j, "hashed_seed")? != rng.hashed_seed() {
 		return Err(bad("hashed_seed", j.get("hashed_seed")));
 	}
 	let streams = j.as_object().ok_or_else(|| bad("rng", j))?;
@@ -225,7 +225,8 @@ fn read_rng(j: &Json) -> Result<PseudoRandom, DumpError> {
 		if k == "seed" || k == "hashed_seed" {
 			continue;
 		}
-		if k.len() > Key::CAPACITY {
+		// A stream's state starts from its key followed by the seed.
+		if k.len() + seed.len() > Key::CAPACITY {
 			return Err(DumpError(format!("RNG stream {k:?} is too long")));
 		}
 		let state = v.as_f64().ok_or_else(|| bad(k, v))?;
@@ -236,28 +237,31 @@ fn read_rng(j: &Json) -> Result<PseudoRandom, DumpError> {
 
 fn read_run(j: &Json, state: State) -> Result<Run, DumpError> {
 	let round = int(j, "round")?;
-	let skips = num(j, "skips")?;
+	let skips = number(j, "skips")?;
 	// Blinds beaten or skipped: every round started was beaten but one being
 	// played or lost.
 	let unfinished = u32::from(matches!(state, State::SelectingHand | State::GameOver));
-	let blinds_cleared = u32::try_from(round).map_or(0, |r: u32| r.saturating_sub(unfinished))
-		+ whole::<u32>(j, "skips", skips)?;
+	let blinds_cleared = u32::try_from(round)
+		.ok()
+		.and_then(|r| r.checked_sub(unfinished))
+		.and_then(|beaten| beaten.checked_add(whole(j, "skips", skips).ok()?))
+		.ok_or_else(|| bad("round", j.get("round")))?;
 	Ok(Run {
 		ante: int(j, "ante")?,
 		round,
-		dollars: num(j, "dollars")?,
-		dollar_buffer: opt_num(j, "dollar_buffer")?.unwrap_or(0.0),
-		interest_cap: num(j, "interest_cap")?,
-		interest_amount: num(j, "interest_amount")?,
-		bankrupt_at: num(j, "bankrupt_at")?,
-		rental_rate: num(j, "rental_rate")?,
-		perishable_rounds: num(j, "perishable_rounds")?,
-		ecto_minus: num(j, "ecto_minus")?,
-		probabilities: num(j, "probabilities")?,
-		hands_played: num(j, "hands_played")?,
-		unused_discards: num(j, "unused_discards")?,
+		dollars: number(j, "dollars")?,
+		dollar_buffer: opt_number(j, "dollar_buffer")?.unwrap_or(0.0),
+		interest_cap: number(j, "interest_cap")?,
+		interest_amount: number(j, "interest_amount")?,
+		bankrupt_at: number(j, "bankrupt_at")?,
+		rental_rate: number(j, "rental_rate")?,
+		perishable_rounds: number(j, "perishable_rounds")?,
+		ecto_minus: number(j, "ecto_minus")?,
+		probabilities: number(j, "probabilities")?,
+		hands_played: number(j, "hands_played")?,
+		unused_discards: number(j, "unused_discards")?,
 		skips,
-		starting_deck_size: num(j, "starting_deck_size")?,
+		starting_deck_size: number(j, "starting_deck_size")?,
 		blinds_cleared,
 		won: flag(j, "won")?,
 		win_notified: flag(j, "win_notified")?,
@@ -287,7 +291,7 @@ fn read_history(j: &Json) -> Result<History, DumpError> {
 		planets_used.insert(p.ok_or_else(|| bad("planets_used", k))?);
 	}
 	let usage = j.get("consumeable_usage_total");
-	let used = |set: &str| Ok::<f64, DumpError>(opt_num(usage, set)?.unwrap_or(0.0));
+	let used = |set: &str| Ok::<f64, DumpError>(opt_number(usage, set)?.unwrap_or(0.0));
 	Ok(History {
 		used_jokers,
 		used_vouchers,
@@ -313,17 +317,17 @@ fn read_round(j: &Json) -> Result<Round, DumpError> {
 			.transpose()
 	};
 	Ok(Round {
-		chips: num(j, "chips")?,
-		hands_left: num(j, "hands_left")?,
-		discards_left: num(j, "discards_left")?,
-		hands_played: num(j, "hands_played_round")?,
-		discards_used: num(j, "discards_used")?,
-		cash_out: num(j, "round_dollars")?,
-		base_hands: num(j, "rr_hands")?,
-		base_discards: num(j, "rr_discards")?,
-		temp_handsize: opt_num(j, "temp_handsize")?,
-		bonus_next_hands: num(bonus, "next_hands")?,
-		bonus_discards: num(bonus, "discards")?,
+		chips: number(j, "chips")?,
+		hands_left: number(j, "hands_left")?,
+		discards_left: number(j, "discards_left")?,
+		hands_played: number(j, "hands_played_round")?,
+		discards_used: number(j, "discards_used")?,
+		cash_out: number(j, "round_dollars")?,
+		base_hands: number(j, "rr_hands")?,
+		base_discards: number(j, "rr_discards")?,
+		temp_handsize: opt_number(j, "temp_handsize")?,
+		bonus_next_hands: number(bonus, "next_hands")?,
+		bonus_discards: number(bonus, "discards")?,
 		idol_card: IdolCard {
 			rank: named(idol, "rank", rank_of_value)?,
 			suit: named(idol, "suit", Suit::from_name)?,
@@ -364,11 +368,8 @@ fn read_blind_select(j: &Json) -> Result<BlindSelect, DumpError> {
 		})?;
 	}
 	let used = j.get("bosses_used");
-	for k in used
-		.as_object()
-		.ok_or_else(|| bad("bosses_used", used))?
-		.keys()
-	{
+	let bosses = used.as_object().ok_or_else(|| bad("bosses_used", used))?;
+	for k in bosses.keys() {
 		let boss = BlindKind::from_key(k).ok_or_else(|| bad("bosses_used", used))?;
 		out.bosses_used[boss] = int(used, k)?;
 	}
@@ -396,16 +397,16 @@ fn read_blind(j: &Json) -> Result<Blind, DumpError> {
 	};
 	Ok(Blind {
 		kind,
-		chips: num(j, "chips")?,
-		dollars: num(j, "dollars")?,
-		mult: num(j, "mult")?,
+		chips: number(j, "chips")?,
+		dollars: number(j, "dollars")?,
+		mult: number(j, "mult")?,
 		disabled: flag(j, "disabled")?,
 		triggered: flag(j, "triggered")?,
 		prepped: flag(j, "prepped")?,
 		eye_hands,
 		only_hand,
-		discards_sub: opt_num(j, "discards_sub")?.unwrap_or(0.0),
-		hands_sub: opt_num(j, "hands_sub")?.unwrap_or(0.0),
+		discards_sub: opt_number(j, "discards_sub")?.unwrap_or(0.0),
+		hands_sub: opt_number(j, "hands_sub")?.unwrap_or(0.0),
 	})
 }
 
@@ -430,22 +431,22 @@ fn read_shop(j: &Json) -> Result<Shop, DumpError> {
 		open: flag(j, "shop_open")?,
 		free: flag(j, "shop_free")?,
 		d6ed: flag(j, "shop_d6ed")?,
-		reroll_cost: num(j, "reroll_cost")?,
-		reroll_cost_increase: num(j, "reroll_cost_increase")?,
-		free_rerolls: num(j, "free_rerolls")?,
-		base_reroll_cost: num(j, "rr_reroll_cost")?,
-		temp_reroll_cost: opt_num(j, "temp_reroll_cost")?,
+		reroll_cost: number(j, "reroll_cost")?,
+		reroll_cost_increase: number(j, "reroll_cost_increase")?,
+		free_rerolls: number(j, "free_rerolls")?,
+		base_reroll_cost: number(j, "rr_reroll_cost")?,
+		temp_reroll_cost: opt_number(j, "temp_reroll_cost")?,
 		booster_slots,
 		voucher: opt_named(j, "voucher", Voucher::from_key)?,
 		voucher_seen: false,
-		joker_max: num(j, "shop_joker_max")?,
-		discount_percent: num(j, "discount_percent")?,
-		edition_rate: num(j, "edition_rate")?,
-		joker_rate: num(j, "joker_rate")?,
-		tarot_rate: num(j, "tarot_rate")?,
-		planet_rate: num(j, "planet_rate")?,
-		spectral_rate: num(j, "spectral_rate")?,
-		playing_card_rate: num(j, "playing_card_rate")?,
+		joker_max: number(j, "shop_joker_max")?,
+		discount_percent: number(j, "discount_percent")?,
+		edition_rate: number(j, "edition_rate")?,
+		joker_rate: number(j, "joker_rate")?,
+		tarot_rate: number(j, "tarot_rate")?,
+		planet_rate: number(j, "planet_rate")?,
+		spectral_rate: number(j, "spectral_rate")?,
+		playing_card_rate: number(j, "playing_card_rate")?,
 		first_buffoon: flag(j, "first_shop_buffoon")?,
 	})
 }
@@ -487,11 +488,11 @@ fn read_hands(j: &Json) -> Result<HandLevels, DumpError> {
 	for h in HandType::ALL {
 		let l = j.get(h.name());
 		out[h] = HandLevel {
-			level: num(l, "level")?,
-			chips: num(l, "chips")?,
-			mult: num(l, "mult")?,
-			played: num(l, "played")?,
-			played_this_round: num(l, "played_this_round")?,
+			level: number(l, "level")?,
+			chips: number(l, "chips")?,
+			mult: number(l, "mult")?,
+			played: number(l, "played")?,
+			played_this_round: number(l, "played_this_round")?,
 			visible: flag(l, "visible")?,
 		};
 	}
@@ -500,7 +501,8 @@ fn read_hands(j: &Json) -> Result<HandLevels, DumpError> {
 
 fn read_tags(j: &Json) -> Result<Tags, DumpError> {
 	let mut held = Vec::new();
-	for (t, id) in list(j, "tag_info")?.iter().zip(1..) {
+	let numbered = list(j, "tag_info")?.iter().zip(1..);
+	for (t, id) in numbered {
 		let kind = named(t, "key", TagKind::from_key)?;
 		// Every tag has an `orbital_hand`, a placeholder but the Orbital Tag's.
 		let orbital_hand = if kind == TagKind::Orbital {
@@ -535,10 +537,10 @@ fn read_tags(j: &Json) -> Result<Tags, DumpError> {
 
 fn read_areas(j: &Json) -> Result<Areas, DumpError> {
 	let limit = |limit: &str, real: &str| -> Result<Limit, DumpError> {
-		let limit = num(j, limit)?;
+		let limit = number(j, limit)?;
 		Ok(Limit {
 			limit,
-			real: opt_num(j, real)?.unwrap_or(limit),
+			real: opt_number(j, real)?.unwrap_or(limit),
 		})
 	};
 	let order = match text(j, "sort_mode")? {
@@ -564,8 +566,8 @@ fn read_areas(j: &Json) -> Result<Areas, DumpError> {
 		shop_vouchers: cards(j, "shop_vouchers")?,
 		shop_boosters: cards(j, "shop_booster")?,
 		pack_cards: any_cards(j, "pack_cards")?,
-		joker_buffer: num(j, "joker_buffer")?,
-		consumable_buffer: num(j, "consumeable_buffer")?,
+		joker_buffer: number(j, "joker_buffer")?,
+		consumable_buffer: number(j, "consumeable_buffer")?,
 		next_sort_id: int(j, "sort_id")?,
 		..Areas::default()
 	})
@@ -606,19 +608,19 @@ fn core(c: &Json) -> Result<CardCore, DumpError> {
 			"back" => true,
 			_ => return Err(bad("facing", c.get("facing"))),
 		},
-		base_cost: num(c, "base_cost")?,
-		extra_cost: num(c, "extra_cost")?,
-		cost: num(c, "cost")?,
-		sell_cost: num(c, "sell_cost")?,
+		base_cost: number(c, "base_cost")?,
+		extra_cost: number(c, "extra_cost")?,
+		cost: number(c, "cost")?,
+		sell_cost: number(c, "sell_cost")?,
 		couponed: flag(ab, "couponed")?,
-		hands_played_at_create: num(ab, "hands_played_at_create")?,
+		hands_played_at_create: number(ab, "hands_played_at_create")?,
 		added_to_deck: flag(c, "added_to_deck")?,
 	})
 }
 
 fn playing_card(c: &Json) -> Result<PlayingCard, DumpError> {
 	let ab = c.get("ability");
-	let original = num(c, "suit_nominal_original")?;
+	let original = number(c, "suit_nominal_original")?;
 	Ok(PlayingCard {
 		core: core(c)?,
 		suit: named(c, "suit", Suit::from_name)?,
@@ -629,7 +631,7 @@ fn playing_card(c: &Json) -> Result<PlayingCard, DumpError> {
 			.ok_or_else(|| bad("suit_nominal_original", c.get("suit_nominal_original")))?,
 		enhancement: named(c, "key", Enhancement::from_key)?,
 		seal: opt_named(c, "seal", |s| by_name(&Seal::ALL, Seal::name, s))?,
-		perma_bonus: num(ab, "perma_bonus")?,
+		perma_bonus: number(ab, "perma_bonus")?,
 		forced_selection: flag(ab, "forced_selection")?,
 		played_this_ante: flag(ab, "played_this_ante")?,
 		wheel_flipped: flag(ab, "wheel_flipped")?,
@@ -654,12 +656,12 @@ fn card(c: &Json) -> Result<Card, DumpError> {
 			}
 			if flag(ab, "perishable")? {
 				card.ab.sticker = Some(Sticker::Perishable {
-					tally: num(ab, "perish_tally")?,
+					tally: number(ab, "perish_tally")?,
 				});
 			}
 		}
 		Kind::Tarot(_) | Kind::Planet(_) | Kind::Spectral(_) => {
-			card.ab.extra_value = num(ab, "extra_value")?;
+			card.ab.extra_value = number(ab, "extra_value")?;
 		}
 		Kind::Booster(_) => {
 			card.booster_slot = opt_int::<u8>(ab, "booster_pos")?
@@ -684,9 +686,9 @@ fn set_joker_field(c: &mut Card, field: JokerField, ab: &Json) -> Result<(), Dum
 	};
 	let a = &mut c.ab;
 	match field {
-		JokerField::Mult => a.mult = num(table, key)?,
-		JokerField::XMult => a.x_mult = num(table, key)?,
-		JokerField::ExtraValue => a.extra_value = num(table, key)?,
+		JokerField::Mult => a.mult = number(table, key)?,
+		JokerField::XMult => a.x_mult = number(table, key)?,
+		JokerField::ExtraValue => a.extra_value = number(table, key)?,
 		JokerField::Eternal => {
 			if flag(table, key)? {
 				a.sticker = Some(Sticker::Eternal);
@@ -694,18 +696,59 @@ fn set_joker_field(c: &mut Card, field: JokerField, ab: &Json) -> Result<(), Dum
 		}
 		JokerField::Rental => a.rental = flag(table, key)?,
 		JokerField::Couponed => c.core.couponed = flag(table, key)?,
-		JokerField::ExtraChips => a.chips = num(table, key)?,
-		JokerField::ExtraDollars => a.dollars = num(table, key)?,
-		JokerField::Extra | JokerField::ExtraHandSize => a.extra = num(table, key)?,
-		JokerField::InvisRounds => a.invis_rounds = num(table, key)?,
-		JokerField::YorickDiscards => a.yorick_discards = num(table, key)?,
-		JokerField::CainoXmult => a.caino_xmult = num(table, key)?,
-		JokerField::LoyaltyRemaining => a.loyalty_remaining = num(table, key)?,
+		JokerField::ExtraChips => a.chips = number(table, key)?,
+		JokerField::ExtraDollars => a.dollars = number(table, key)?,
+		JokerField::Extra | JokerField::ExtraHandSize => a.extra = number(table, key)?,
+		JokerField::InvisRounds => a.invis_rounds = number(table, key)?,
+		JokerField::YorickDiscards => a.yorick_discards = number(table, key)?,
+		JokerField::CainoXmult => a.caino_xmult = number(table, key)?,
+		JokerField::LoyaltyRemaining => a.loyalty_remaining = number(table, key)?,
 		JokerField::ToDoPokerHand => a.to_do = opt_named(table, key, HandType::from_name)?,
-		JokerField::SteelTally => a.steel_tally = num(table, key)?,
-		JokerField::StoneTally => a.stone_tally = num(table, key)?,
-		JokerField::DriverTally => a.driver_tally = num(table, key)?,
-		JokerField::NineTally => a.nine_tally = num(table, key)?,
+		JokerField::SteelTally => a.steel_tally = number(table, key)?,
+		JokerField::StoneTally => a.stone_tally = number(table, key)?,
+		JokerField::DriverTally => a.driver_tally = number(table, key)?,
+		JokerField::NineTally => a.nine_tally = number(table, key)?,
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeMap;
+
+	use super::*;
+
+	/// A dump of a new run with `change` made to its top-level fields.
+	fn changed(change: impl FnOnce(&mut BTreeMap<String, Json>)) -> Json {
+		let mut dump = Game::new_run("TESTSEED", Back::Red, Stake::White).to_dump();
+		let Json::Obj(fields) = &mut dump else {
+			panic!("a dump is an object");
+		};
+		change(fields);
+		dump
+	}
+
+	#[test]
+	fn a_new_run_reads_back() {
+		assert!(read(&changed(|_| {})).is_ok());
+	}
+
+	#[test]
+	fn a_stream_key_too_long_with_the_seed_is_refused() {
+		let dump = changed(|f| {
+			let Some(Json::Obj(rng)) = f.get_mut("rng") else {
+				panic!("a dump has its RNG streams");
+			};
+			rng.insert("k".repeat(Key::CAPACITY - 4), Json::Num(0.5));
+		});
+		assert!(read(&dump).is_err());
+	}
+
+	#[test]
+	fn a_negative_round_is_refused() {
+		let dump = changed(|f| {
+			f.insert("round".into(), Json::Num(-1.0));
+		});
+		assert!(read(&dump).is_err());
+	}
 }
