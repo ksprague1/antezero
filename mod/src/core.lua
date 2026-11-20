@@ -494,32 +494,23 @@ end
 
 -- One game update, then the requests it may answer, then the settle count
 -- (BalatroBot serves its requests inside its own love.update). A bot run
--- outside a bridge session plays at the bot's speed setting: dt = 1/60 at
--- GAMESPEED 1, as many updates per frame as the setting asks for and a
--- frame has time for (the rest are dropped: the run just plays slower than
--- asked).
+-- outside a bridge session plays at the bot's speed setting: updates of
+-- 1/60 s of game time (the game scales dt by its game speed), as many per
+-- frame as the setting asks for and a frame has time for (the rest are
+-- dropped: the run just plays slower than asked).
 local love_update = love.update
 love.update = function(dt)
-  local n, gamespeed = 1, nil
+  local n, step = 1, dt
   if AZB.bot and AZB.bot.stepping() then
-    gamespeed = G.SETTINGS.GAMESPEED
     n = AZB.bot.steps(dt)
+    step = 1 / 60 / G.SETTINGS.GAMESPEED
   end
   local t0 = love.timer.getTime()
   for i = 1, n do
     if i > 1 and love.timer.getTime() - t0 > 0.008 then break end
-    if gamespeed then
-      G.SETTINGS.GAMESPEED = 1
-      love_update(1 / 60)
-    else
-      love_update(dt)
-    end
+    love_update(step)
     if AZB.server then AZB.server.update() end
     local ok, err = pcall(AZB.tick)
     if not ok then sendErrorMessage("tick failed: " .. tostring(err), "AnteZero") end
-    if gamespeed then
-      if G.SETTINGS.GAMESPEED ~= 1 then gamespeed = G.SETTINGS.GAMESPEED end -- changed in the settings menu
-      G.SETTINGS.GAMESPEED = gamespeed
-    end
   end
 end

@@ -62,7 +62,10 @@ function B.release()
   local live = G.PROFILES[G.SETTINGS.profile]
   for k in pairs(live) do live[k] = nil end
   for k, v in pairs(s.profile) do live[k] = v end
-  set_discover_tallies() -- the collection score of the restored discoveries
+  set_discover_tallies()
+  set_profile_progress()
+  -- A progress save queued during the run would still write the run's unlocks and discoveries.
+  if G.FILE_HANDLER and G.FILE_HANDLER.progress then G:save_progress() end
   B.saved = nil
   AZB.guard_saves(false)
   B.protected = false
@@ -111,14 +114,10 @@ function Game:start_run(args)
   args = args or {}
   local bot = B.pending and not args.savetext and not args.challenge
   B.pending = false
-  if not bot then
-    B.release()
-    return start_run(self, args)
-  end
+  B.release() -- a bot run before this one is settled first
+  if not bot then return start_run(self, args) end
   protect()
-  B.active, B.run = false, nil
-  AZB.cancel_waiters()
-  if not G.SETTINGS.tutorial_complete and not B.tutorial then
+  if not G.SETTINGS.tutorial_complete then
     B.tutorial = {G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress}
     G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress = true, nil
   end
