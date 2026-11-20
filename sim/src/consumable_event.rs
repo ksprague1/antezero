@@ -229,6 +229,9 @@ fn death(areas: &mut Areas, discount_percent: f64, target: u32, source: u32) {
 			position_of(&areas.hand.cards, source),
 		) {
 		copy_into(areas, discount_percent, si, ti);
+		// Both highlighted cards are flipped around the copy, as in `rebase`.
+		areas.hand.cards[ti].wheel_flipped = false;
+		areas.hand.cards[si].wheel_flipped = false;
 	}
 }
 
@@ -344,6 +347,9 @@ fn rebase(
 		let c = &mut areas.hand.cards[i];
 		let (suit, rank) = change(c);
 		c.set_base(suit, rank);
+		// The game flips the card face up and back around the change, and a
+		// card turning face up loses `ability.wheel_flipped`.
+		c.wheel_flipped = false;
 		CardDebuff::new(blind, &areas.jokers).apply(c);
 	}
 }
