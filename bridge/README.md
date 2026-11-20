@@ -18,18 +18,21 @@ Two uses:
 a bot run begins and talks to it over JSON-RPC on 127.0.0.1:12346
 (`AZB_PORT`).
 
-A bot run is played in step with the simulator (same seed, deck, stake and
-actions), so the mod gives it the oracle's conditions for its duration:
-seeded, everything unlocked in memory, a fixed 1/60 s clock at game speed 1
-(the bot's speed setting is the number of such updates per 1/60 s). Search
-and that speed are the mod's settings (Mods > AnteZero > Config; 1x and
-search on by default). None
-of it reaches the player's files: save writes are blocked during the run and
-the profile, unlocks and tutorial state are put back when it is left. While
-the bot plays, input is limited to Esc, Run Info and Options, whose menus
-pause it; a strip at the top shows its last action, how sure the policy was,
-and the critic's win estimate. If the game and the simulator ever disagree
-the bot stops and hands the run back.
+A bot run is an ordinary run on the player's profile, with the cards it has
+unlocked and discovered: before every decision the agent rebuilds its
+simulator from the game's state dump (`az_state`, `sim::dump`), so whatever
+the game holds is what the bot plays. The run plays on a fixed 1/60 s clock
+at game speed 1 (the bot's speed setting is the number of such updates per
+1/60 s) and skips the tutorial. With "Bot runs count" off (the default)
+nothing of it reaches the player's files: save writes and achievements are
+blocked during the run, and the profile, unlocks, discoveries and tutorial
+state are put back when it is left. With it on, the run counts like one the
+player played: wins, stats, stake progress, unlocks, discoveries and
+achievements are kept and saved. Search, the speed and that switch are the
+mod's settings (Mods > AnteZero > Config; 1x, search on, not counting by
+default). While the bot plays, input is limited to Esc, Run Info and
+Options, whose menus pause it; a strip at the top shows its last action,
+how sure the policy was, and the critic's win estimate.
 
 ## Developer tools
 

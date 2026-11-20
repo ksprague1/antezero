@@ -3,6 +3,16 @@
 -- antezero_bridge.canon.from_lua (Python) consume it unchanged. Extra
 -- information lives under the `az` key, which canon ignores.
 
+-- SMODS sets base.suit_nominal_original to the suit's suit_nominal (0.01 to
+-- 0.04 for the vanilla suits), vanilla to a tenth of it.
+local VANILLA_SUIT_ORIGINAL = {Diamonds = 0.001, Clubs = 0.002, Hearts = 0.003, Spades = 0.004}
+local function vanilla_suit_original(v)
+  for k, suit in pairs(SMODS.Suits or {}) do
+    if VANILLA_SUIT_ORIGINAL[k] and suit.suit_nominal == v then return VANILLA_SUIT_ORIGINAL[k] end
+  end
+  return v
+end
+
 local function edition_of(c)
   return c.edition and c.edition.type or nil
 end
@@ -25,7 +35,7 @@ local function card_info(c)
     t.bonus = c.ability.bonus
     t.perma_bonus = c.ability.perma_bonus
     t.times_played = c.base.times_played
-    t.suit_nominal_original = c.base.suit_nominal_original
+    t.suit_nominal_original = vanilla_suit_original(c.base.suit_nominal_original)
   end
   t.base_cost = c.base_cost
   t.extra_cost = c.extra_cost
@@ -98,7 +108,7 @@ local function sim_state(s, g)
   s.pack_interrupt = g.PACK_INTERRUPT and AZB.state_name(g.PACK_INTERRUPT)
   s.facing_blind = g.facing_blind or false
   s.last_blind_boss = (g.last_blind and g.last_blind.boss) or false
-  s.bosses_used = g.bosses_used
+  s.bosses_used = g.bosses_used.boss or g.bosses_used -- SMODS keeps the bosses' counts under `boss`
   s.blind_selected = g.round_resets.blind and g.round_resets.blind.name
   s.orbital_choices = {__array = true}
   for ante, c in pairs(g.orbital_choices or {}) do
