@@ -141,6 +141,9 @@ pub struct OpOptions {
 	/// Whether skipping a blind is offered (a training switch: the game
 	/// itself always allows skips).
 	pub allow_skip: bool,
+	/// Whether a sort that would move no card the player can tell apart is
+	/// offered (a training switch: a policy can pad its turns with it).
+	pub null_sorts: bool,
 }
 
 impl Default for OpOptions {
@@ -148,6 +151,7 @@ impl Default for OpOptions {
 		OpOptions {
 			candidates: 0,
 			allow_skip: true,
+			null_sorts: true,
 		}
 	}
 }
@@ -158,7 +162,7 @@ impl Default for OpOptions {
 /// token limit (which the observation does not show) are dropped.
 pub fn ops(g: &Game, lay: &Layout, options: OpOptions, out: &mut Vec<Op>) {
 	out.clear();
-	base_ops(g, lay, options.allow_skip, out);
+	base_ops(g, lay, options, out);
 	out.retain(|o| o.target.is_none_or(|token| token < lay.n_tokens));
 	out.truncate(MAX_OPS);
 	if options.candidates > 0 && g.flow.phase == Phase::Round {
@@ -307,7 +311,7 @@ fn pack_ops(g: &Game, lay: &Layout, out: &mut Vec<Op>) {
 /// The ops of the current phase, then the ones open in every phase: hand
 /// reordering, using and selling what is owned, joker reordering. The order
 /// is part of the action space.
-fn base_ops(g: &Game, lay: &Layout, allow_skip: bool, out: &mut Vec<Op>) {
+fn base_ops(g: &Game, lay: &Layout, options: OpOptions, out: &mut Vec<Op>) {
 	let nh = shown_hand(&g.areas.hand.cards).len();
 	let all = CardMask::first(nh);
 	match g.flow.phase {
@@ -318,7 +322,7 @@ fn base_ops(g: &Game, lay: &Layout, allow_skip: bool, out: &mut Vec<Op>) {
 				(Action::SkipBlind, OpKind::SkipBlind),
 				(Action::RerollBoss, OpKind::RerollBoss),
 			] {
-				if (k != OpKind::SkipBlind || allow_skip) && legal(g, a) {
+				if (k != OpKind::SkipBlind || options.allow_skip) && legal(g, a) {
 					out.push(Op::simple(k));
 				}
 			}
@@ -351,8 +355,16 @@ fn base_ops(g: &Game, lay: &Layout, allow_skip: bool, out: &mut Vec<Op>) {
 	// Reordering the hand (in rounds, and in packs opened with it drawn).
 	let can_reorder = g.flow.rearranges < MAX_REARRANGES;
 	if can_reorder && matches!(g.flow.phase, Phase::Round | Phase::Pack) && nh >= 2 {
-		out.push(Op::simple(OpKind::SortRank));
-		out.push(Op::simple(OpKind::SortSuit));
+		let hand = &g.areas.hand;
+		let null = !options.null_sorts && hand.in_order();
+		for (order, kind) in [
+			(HandSort::Rank, OpKind::SortRank),
+			(HandSort::Suit, OpKind::SortSuit),
+		] {
+			if !(null && hand.order == order) {
+				out.push(Op::simple(kind));
+			}
+		}
 		out.push(Op {
 			cards: Some(CardArg {
 				min: 1,

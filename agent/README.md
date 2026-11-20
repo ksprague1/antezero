@@ -110,8 +110,8 @@ so no hidden order or id leaks through ties.
 
 **Item effects** (`effects.py`): an id alone has to be learned from games in
 which the item was owned, and a policy does not keep what it does not know.
-Each joker, consumable, voucher and booster pack therefore also carries 142
-fixed features that say what its text says: what it gives and how much,
+Each joker, consumable, voucher and booster pack therefore also carries about
+150 fixed features that say what its text says: what it gives and how much,
 what it gains per event, when it acts, and what it names or needs (hand
 types, suits, ranks, enhancements, conditions such as few cards, money,
 discards left or its place among the jokers). They are added to the item's
@@ -129,6 +129,13 @@ older checkpoints read; `model.effects=false` gives a table of zeros.
    Bell) and reachability of the minimum enforced by masking;
 3. a *destination pointer* for reordering (joker order matters: Blueprint,
    Brainstorm, x-mult ordering).
+
+At most two reorders may follow each other. A trained policy still spent a
+sixth of its steps re-sorting a sorted hand, twice before most plays that
+would not clear the blind, although the reward pays nothing for it;
+`env.null_sorts=false` stops offering a sort that would move no card the
+player can tell apart.
+
 The log-probability of a full action is the sum of the three parts, computed
 by the same code when sampling and when training (teacher-forced): in float32
 the two agree to 1e-4 (`tests/test_agent.py`). Rounding depends on the

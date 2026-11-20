@@ -32,24 +32,21 @@ pub(crate) struct Rows<'a> {
 	pub n_hand: &'a mut i32,
 }
 
-/// The ops of an observation with `candidates` scored plays and, if
-/// `allow_skip`, blind skips.
+/// `options`, checked.
 ///
 /// # Errors
 ///
 /// Returns a `ValueError` if `candidates` is more than
 /// `obs::MAX_CANDIDATES`.
-pub(crate) fn op_options(candidates: usize, allow_skip: bool) -> PyResult<OpOptions> {
-	if candidates > obs::MAX_CANDIDATES {
+pub(crate) fn op_options(options: OpOptions) -> PyResult<OpOptions> {
+	if options.candidates > obs::MAX_CANDIDATES {
 		return Err(PyValueError::new_err(format!(
-			"play_candidates must be at most {}, got {candidates}",
-			obs::MAX_CANDIDATES
+			"play_candidates must be at most {}, got {}",
+			obs::MAX_CANDIDATES,
+			options.candidates
 		)));
 	}
-	Ok(OpOptions {
-		candidates,
-		allow_skip,
-	})
+	Ok(options)
 }
 
 /// What an observation holds besides its fixed part.

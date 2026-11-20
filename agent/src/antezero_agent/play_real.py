@@ -57,7 +57,7 @@ def play(model, cfg, env, seed: str, deck: str, stake: int, max_ante: int, use_s
     max_steps = cfg.env.step_limit if max_steps is None else max_steps
     env.reset(seed, deck, stake)
     sim = az.Game(seed, deck, stake, endless=cfg.env.endless)
-    sim.allow_skip = cfg.env.allow_skip  # the policy must see the action set it was trained on
+    sim.allow_skip, sim.null_sorts = cfg.env.allow_skip, cfg.env.null_sorts  # the action set the policy was trained on
     sim.steamodded = True  # the bridge's game runs Steamodded, whose ×Mult rounds differently
     steps, code = 0, "reset"
 

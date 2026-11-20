@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use sim::data::{ALL_JOKERS, ALL_PLANETS, Back};
 use sim::game::{BlindSlot, BlindStatus, Game as SimGame, Phase};
 use sim::inject::Inject;
-use sim::obs::{self, BuildPreview, Op};
+use sim::obs::{self, BuildPreview, Op, OpOptions};
 use sim::rng::splitmix64;
 use sim::{Action, CardMask, Stake, num};
 
@@ -813,7 +813,8 @@ impl VecEnv {
 	/// of antes 2-3 holding a gift (a joker or three levels of a hand type);
 	/// late snapshots need `snapshot_min_ante` above those antes then.
 	/// `practice_eternal`: a gifted joker is Eternal where the game allows the
-	/// sticker, sellable otherwise.
+	/// sticker, sellable otherwise. `null_sorts`: whether a hand sort that
+	/// would change nothing is offered.
 	///
 	/// Episodes end when the run is lost, or won unless `endless`; they are
 	/// truncated (not terminal: bootstrap from `final_*`) after `step_limit`
@@ -828,14 +829,14 @@ impl VecEnv {
 		reason = "pyo3 extracts `backs` as an owned `Vec<String>`, which is only read"
 	)]
 	#[new]
-	#[pyo3(signature = (num_envs, backs = vec!["b_red".to_string()], stakes = vec![1], seed = 0, endless = false, max_ante = 16, step_limit = 5000, gamma = 0.999, r_win = 1.0, r_endless = 0.0, r_loss = 0.0, w_blind = 0.04, w_score = 0.02, threads = 0, play_candidates = 0, deck_tokens = false, snapshot_prob = 0.0, snapshot_min_ante = 2, allow_skip = true, build_previews = true, terminal_phi = true, order_gain = true, order_label_rate = 0.0, practice_prob = 0.0, practice_eternal = false))]
+	#[pyo3(signature = (num_envs, backs = vec!["b_red".to_string()], stakes = vec![1], seed = 0, endless = false, max_ante = 16, step_limit = 5000, gamma = 0.999, r_win = 1.0, r_endless = 0.0, r_loss = 0.0, w_blind = 0.04, w_score = 0.02, threads = 0, play_candidates = 0, deck_tokens = false, snapshot_prob = 0.0, snapshot_min_ante = 2, allow_skip = true, build_previews = true, terminal_phi = true, order_gain = true, order_label_rate = 0.0, practice_prob = 0.0, practice_eternal = false, null_sorts = true))]
 	fn new(
 		py: Python<'_>, num_envs: usize, backs: Vec<String>, stakes: Vec<u8>, seed: u64,
 		endless: bool, max_ante: i32, step_limit: u32, gamma: f32, r_win: f32, r_endless: f32,
 		r_loss: f32, w_blind: f32, w_score: f32, threads: usize, play_candidates: usize,
 		deck_tokens: bool, snapshot_prob: f32, snapshot_min_ante: i32, allow_skip: bool,
 		build_previews: bool, terminal_phi: bool, order_gain: bool, order_label_rate: f32,
-		practice_prob: f32, practice_eternal: bool,
+		practice_prob: f32, practice_eternal: bool, null_sorts: bool,
 	) -> PyResult<VecEnv> {
 		let bad = |msg: String| Err(PyValueError::new_err(msg));
 		if num_envs == 0 {
@@ -888,7 +889,11 @@ impl VecEnv {
 			step_limit,
 			reward,
 			obs: ObsOptions {
-				ops: op_options(play_candidates, allow_skip)?,
+				ops: op_options(OpOptions {
+					candidates: play_candidates,
+					allow_skip,
+					null_sorts,
+				})?,
 				deck_tokens,
 				previews: build_previews,
 				order_gain,
@@ -1020,7 +1025,8 @@ impl VecEnv {
 		self.slots.iter().map(|s| s.invalid).sum()
 	}
 
-	/// A snapshot of env `i` as a `Game` (with the env's `allow_skip`).
+	/// A snapshot of env `i` as a `Game` (with the env's `allow_skip` and
+	/// `null_sorts`).
 	fn game(&self, i: usize) -> PyResult<Game> {
 		let s = self
 			.slots
@@ -1028,6 +1034,7 @@ impl VecEnv {
 			.ok_or_else(|| PyValueError::new_err("index out of range"))?;
 		let mut game = Game::from(s.g.clone());
 		game.allow_skip = self.cfg.obs.ops.allow_skip;
+		game.null_sorts = self.cfg.obs.ops.null_sorts;
 		Ok(game)
 	}
 

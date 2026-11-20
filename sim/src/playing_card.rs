@@ -189,6 +189,12 @@ impl PlayingCard {
 	#[inline]
 	#[must_use]
 	pub fn nominal(&self, sort: HandSort) -> f64 {
+		self.sort_key(sort) + 0.000_001 * self.unique_val()
+	}
+
+	/// What `sort` orders the hand by, without the tie-break between cards
+	/// that look the same.
+	pub(crate) fn sort_key(&self, sort: HandSort) -> f64 {
 		let mut mult = if sort == HandSort::Suit { 1000.0 } else { 1.0 };
 		if self.is_stone() {
 			mult = -1000.0;
@@ -197,7 +203,6 @@ impl PlayingCard {
 			+ self.suit.nominal() * mult
 			+ self.orig_suit.nominal_original() * 0.0001 * mult
 			+ self.rank.face_nominal()
-			+ 0.000_001 * self.unique_val()
 	}
 
 	/// `Card:get_chip_bonus()`.

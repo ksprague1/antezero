@@ -320,6 +320,8 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
         old = Config.from_dict(ck["config"])
         if old.env.num_envs * old.ppo.rollout_len != cfg.env.num_envs * cfg.ppo.rollout_len:
             raise ValueError("cannot resume with another env.num_envs * ppo.rollout_len (the update count would change meaning)")
+        if old.model != cfg.model:
+            raise ValueError("cannot resume with another model: the checkpoint's weights and effect table are its own")
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "log.csv"
     log_path.touch()

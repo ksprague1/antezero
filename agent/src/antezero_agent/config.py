@@ -101,6 +101,10 @@ class EnvConfig:
     # rewarded like beating the blind) never samples "select" again; turning
     # skips off for a while makes it play every blind.
     allow_skip: bool = True
+    # Offer a hand sort that would move no card the player can tell apart. A
+    # trained policy spent a sixth of its steps on such sorts, two before most
+    # plays that would not clear the blind.
+    null_sorts: bool = True
     # Stake curriculum: the next stake is added once the 95% Wilson lower
     # bound of the win rate over the latest `curriculum_min_episodes` fresh
     # episodes on the top stake (since the last change) reaches the target.

@@ -120,6 +120,7 @@ fn skipping_can_be_switched_off() {
 		obs::OpOptions {
 			candidates: 4,
 			allow_skip: false,
+			..Default::default()
 		},
 		&mut ops,
 	);
@@ -418,6 +419,49 @@ fn reorder_destinations_are_checked() {
 	);
 	assert_eq!(obs::decode(&g, mv, CardMask::from_bits(1), None), None);
 	assert_eq!(obs::decode(&g, mv, CardMask::from_bits(1), mv.dest), None);
+}
+
+/// The sorts offered in `g` with `null_sorts` off.
+fn sorts(g: &Game) -> Vec<obs::OpKind> {
+	let mut buf = ObsBuf::new();
+	let lay = encode_with_deck(g, &mut buf);
+	let mut ops = Vec::new();
+	obs::ops(
+		g,
+		&lay,
+		obs::OpOptions {
+			null_sorts: false,
+			..Default::default()
+		},
+		&mut ops,
+	);
+	ops.iter()
+		.map(|o| o.kind)
+		.filter(|k| matches!(k, obs::OpKind::SortRank | obs::OpKind::SortSuit))
+		.collect()
+}
+
+#[test]
+fn a_sort_that_changes_nothing_can_be_left_out() {
+	use obs::OpKind::{SortRank, SortSuit};
+	let mut g = Game::new_run("NULLSORT", Back::Red, Stake::White);
+	g.step(Action::SelectBlind).unwrap();
+	// A dealt hand is in rank order: only the other sort does anything.
+	assert_eq!(sorts(&g), [SortSuit]);
+	g.step(Action::SortHand(HandSort::Suit)).unwrap();
+	assert_eq!(sorts(&g), [SortRank]);
+	// Moved out of order, both sorts change the hand again.
+	let last = num::byte(g.areas.hand.cards.len() - 1);
+	g.step(Action::SortHand(HandSort::Rank)).unwrap();
+	g.step(Action::Discard(CardMask::from_bits(1))).unwrap();
+	g.step(Action::MoveHand { from: 0, to: last }).unwrap();
+	assert_eq!(sorts(&g), [SortRank, SortSuit]);
+	// Face-down cards hide whether the hand is in order.
+	g.step(Action::SortHand(HandSort::Rank)).unwrap();
+	g.step(Action::Discard(CardMask::from_bits(1))).unwrap();
+	assert_eq!(sorts(&g), [SortSuit]);
+	g.areas.hand.cards[0].core.face_down = true;
+	assert_eq!(sorts(&g), [SortRank, SortSuit]);
 }
 
 /// Every other state of a [`walk`] from `seed` (the first, the third, ...).

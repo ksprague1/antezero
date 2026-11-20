@@ -15,7 +15,7 @@ from antezero_agent.search import shaped_reward
 from antezero_agent.stats import wilson
 from antezero_agent.train import LOG_FIELDS, Rollout, gae, train
 
-OP = {"select": 0, "cash_out": 14, "end_shop": 13, "skip_pack": 16}
+OP = {"select": 0, "cash_out": 14, "end_shop": 13, "skip_pack": 16, "sort_rank": 18, "sort_suit": 19}
 
 
 def tiny(d=32, layers=1):
@@ -320,6 +320,19 @@ def gift_of(g):
     return held, top, held > 0 and c["jokers.0.ab.eternal"] == "true"
 
 
+def test_null_sorts_can_be_left_out():
+    """A dealt hand is in rank order: with env.null_sorts off the rank sort is not offered, in the env and in its games."""
+    cfg = preset("smoke")
+    for on in (True, False):
+        env = make_env(cfg, num_envs=1, null_sorts=on)
+        heuristic(env)
+        g = env.game(0)
+        o = g.encode()
+        assert g.phase == "round" and g.null_sorts is on
+        for kinds in (o["ops"][: int(o["n_ops"]), 0].tolist(), np.asarray(env.ops)[0, : int(np.asarray(env.n_ops)[0]), 0].tolist()):
+            assert (OP["sort_rank"] in kinds) is on and OP["sort_suit"] in kinds
+
+
 def test_practice_restarts_hold_one_gift_and_feed_no_pool():
     cfg = preset("smoke")
     env = make_env(cfg, num_envs=64, play_candidates=4, snapshot_prob=0.3, snapshot_min_ante=4, practice_prob=0.4)
@@ -541,6 +554,10 @@ def test_smoke_train_resume_and_run_protection(tmp_path):
     cfg.env.num_envs, cfg.ppo.rollout_len, cfg.ppo.total_steps = 4, 16, 4 * 64
     assert train(cfg, resume=str(ck), max_updates=1)["update"] == 3
     cfg.env.num_envs = 2
+    with pytest.raises(ValueError):
+        train(cfg, resume=str(ck), max_updates=1)
+    # A checkpoint keeps its model, and with it the effect table it reads.
+    cfg.env.num_envs, cfg.model.effects = 4, False
     with pytest.raises(ValueError):
         train(cfg, resume=str(ck), max_updates=1)
 

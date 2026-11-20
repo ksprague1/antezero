@@ -57,7 +57,7 @@ def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, cr
     from antezero_bridge.game_env import ActionRejected
 
     sim = az.Game(run["seed"], run["back"], int(run["stake"]), endless=cfg.env.endless)
-    sim.allow_skip = cfg.env.allow_skip  # the policy must see the action set it was trained on
+    sim.allow_skip, sim.null_sorts = cfg.env.allow_skip, cfg.env.null_sorts  # the action set the policy was trained on
     sim.steamodded = True  # the game runs Steamodded, whose xMult rounds differently
     steps = 0
     try:

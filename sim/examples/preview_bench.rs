@@ -143,6 +143,7 @@ fn time_phase(states: &[Game], phase: Phase, buf: &mut ObsBuf) {
 			obs::OpOptions {
 				candidates: 8,
 				allow_skip: false,
+				..Default::default()
 			},
 			&mut ops,
 		);
@@ -178,6 +179,7 @@ fn time_phase(states: &[Game], phase: Phase, buf: &mut ObsBuf) {
 			obs::OpOptions {
 				candidates: if phase == Phase::Round { 8 } else { 0 },
 				allow_skip: false,
+				..Default::default()
 			},
 			&mut ops,
 		);

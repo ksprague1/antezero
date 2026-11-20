@@ -37,6 +37,8 @@ pub(crate) struct Game {
 	previews: Vec<BuildPreview>,
 	/// Whether `encode` and the factored choices offer skipping blinds.
 	pub(crate) allow_skip: bool,
+	/// Whether they offer sorts that change nothing.
+	pub(crate) null_sorts: bool,
 }
 
 impl From<SimGame> for Game {
@@ -48,8 +50,18 @@ impl From<SimGame> for Game {
 			ops: Vec::new(),
 			previews: Vec::new(),
 			allow_skip: true,
+			null_sorts: true,
 		}
 	}
+}
+
+/// The ops `game` offers, with `candidates` scored plays.
+fn options_of(game: &Game, candidates: usize) -> PyResult<OpOptions> {
+	op_options(OpOptions {
+		candidates,
+		allow_skip: game.allow_skip,
+		null_sorts: game.null_sorts,
+	})
 }
 
 impl Clone for Game {
@@ -62,6 +74,7 @@ impl Clone for Game {
 			ops: Vec::new(),
 			previews: self.previews.clone(),
 			allow_skip: self.allow_skip,
+			null_sorts: self.null_sorts,
 		}
 	}
 }
@@ -129,7 +142,7 @@ impl Game {
 		build_previews: bool, order_gain: bool,
 	) -> PyResult<Bound<'py, PyDict>> {
 		let options = ObsOptions {
-			ops: op_options(play_candidates, self.allow_skip)?,
+			ops: options_of(self, play_candidates)?,
 			deck_tokens,
 			previews: build_previews,
 			order_gain,
@@ -169,7 +182,7 @@ impl Game {
 	fn step_factored(
 		&mut self, py: Python<'_>, op: usize, cards: u32, dest: u32, play_candidates: usize,
 	) -> PyResult<()> {
-		let options = op_options(play_candidates, self.allow_skip)?;
+		let options = options_of(self, play_candidates)?;
 		py.detach(|| {
 			let a = decode_factored(&mut self.g, &mut self.ops, op, cards, dest, options)?
 				.ok_or_else(|| PyValueError::new_err("illegal factored action"))?;
@@ -190,7 +203,7 @@ impl Game {
 	fn factored_to_code(
 		&mut self, py: Python<'_>, op: usize, cards: u32, dest: u32, play_candidates: usize,
 	) -> PyResult<Option<String>> {
-		let options = op_options(play_candidates, self.allow_skip)?;
+		let options = options_of(self, play_candidates)?;
 		let action =
 			py.detach(|| decode_factored(&mut self.g, &mut self.ops, op, cards, dest, options))?;
 		Ok(action.map(|a| a.to_string()))
@@ -239,6 +252,19 @@ impl Game {
 	#[setter]
 	fn set_allow_skip(&mut self, v: bool) {
 		self.allow_skip = v;
+	}
+
+	/// Whether `encode` and `step_factored` offer a sort that would move no
+	/// card the player can tell apart. Like `allow_skip`, part of the action
+	/// set a policy was trained on.
+	#[getter]
+	fn null_sorts(&self) -> bool {
+		self.null_sorts
+	}
+
+	#[setter]
+	fn set_null_sorts(&mut self, v: bool) {
+		self.null_sorts = v;
 	}
 
 	/// Whether ×Mult is rounded like Steamodded (`mult + mult * (x - 1)`),

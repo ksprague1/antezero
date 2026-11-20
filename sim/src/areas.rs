@@ -135,6 +135,18 @@ impl Hand {
 		self.cards
 			.sort_by(|a, b| b.nominal(order).total_cmp(&a.nominal(order)));
 	}
+
+	/// Whether sorting by the current order would move no card the player
+	/// can tell apart: every card is face up and none stands before one
+	/// that sorts ahead of it.
+	pub(crate) fn in_order(&self) -> bool {
+		let order = self.order;
+		self.cards.iter().all(|c| !c.core.face_down)
+			&& self
+				.cards
+				.windows(2)
+				.all(|pair| pair[0].sort_key(order) >= pair[1].sort_key(order))
+	}
 }
 
 /// The cards of one area.

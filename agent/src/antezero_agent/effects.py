@@ -6,7 +6,7 @@ look similar. ``matrix()`` is indexed by center id; rows of other centers are ze
 it was trained with, so the rows can be corrected without changing what older checkpoints read.
 
 Sizes are the printed ones, scaled to order 1: chips / 100, mult / 10, xmult - 1, dollars / 5; growth per event
-chips / 10, mult / 2, xmult x 4, dollars / 2, value / 2; hand size, hands and discards / 2. A joker paid per unit of
+chips / 10, mult / 2, xmult x 4, dollars / 2, value / 2; hand size, hands and discards / 2; a payout's cap / 50. A joker paid per unit of
 something (Bull per dollar, Blue Joker per deck card, Steel Joker per Steel card) carries a typical total and the
 flag of the unit.
 """
@@ -24,28 +24,28 @@ SEALS = ["gold", "red", "blue", "purple"]
 RARITIES = ["common", "uncommon", "rare", "legendary"]
 COLS = [
     # what it gives, per trigger
-    "chips", "mult", "xmult", "dollars",
-    # what it gains per growth event; whether it shrinks with use, resets, or can destroy itself
-    "g_chips", "g_mult", "g_xmult", "g_dollars", "g_value", "decays", "resets", "perishes",
+    "chips", "mult", "xmult", "dollars", "cap",
+    # what it gains per growth event; whether it shrinks with use, resets, or can destroy itself (risk: its chance per round)
+    "g_chips", "g_mult", "g_xmult", "g_dollars", "g_value", "decays", "resets", "perishes", "risk",
     # the chance of its effect (1 when certain), cards retriggered, copying a joker's ability
     "chance", "retrigger", "copies",
     # what it creates (how many), and whether that is a copy of something held or chosen
-    "mk_tarot", "mk_planet", "mk_spectral", "mk_joker", "mk_card", "mk_consumable", "copy",
+    "mk_tarot", "mk_planet", "mk_spectral", "mk_joker", "mk_card", "mk_consumable", "mk_tag", "copy",
     "hand_size", "hands", "discards", "joker_slots", "cons_slots", "shop_slots",
     # rule changes
     "rule_hand", "rule_economy", "discount", "rate", "levels_hand", "luck", "survival", "anti_boss", "ante_down",
-    "alters_cards", "destroys_cards", "destroys_jokers", "loses_money", "sell_to_use", "edition",
+    "alters_cards", "strips", "destroys_cards", "destroys_jokers", "loses_money", "sell_to_use", "edition",
     # when it acts
-    "on_scored", "on_held", "on_hand", "on_discard", "on_round_end", "on_blind", "on_shop", "on_sell", "on_consumable", "on_boss", "passive",
+    "on_scored", "on_held", "on_hand", "on_discard", "on_round_end", "on_blind", "on_shop", "on_sell", "on_consumable", "on_boss", "no_boss", "passive",
     # what it names
     *(f"h_{h}" for h in HANDS), *(f"s_{s}" for s in SUITS), *(f"r_{r}" for r in RANKS), *(f"e_{e}" for e in ENHANCEMENTS),
     *(f"seal_{s}" for s in SEALS),
     # what it needs
     "few_cards", "four_cards", "one_card", "first_card", "rich", "poor", "discards_left", "no_discards", "discard_penalty",
-    "first_hand", "first_discard", "last_hand", "periodic", "big_deck", "thin_deck", "other_jokers", "empty_slots", "needs_room",
+    "first_hand", "first_discard", "last_hand", "round_only", "periodic", "big_deck", "thin_deck", "other_jokers", "empty_slots", "needs_room",
     "needs_many", "pos_right", "pos_leftmost", "mixed_suits", "same_hand", "varied_hand", "no_face", "needs_all", "variable",
     "skips", "pack_skips", "likes_planets", "likes_tarots", "likes_cards", "likes_destroyed", "likes_uncommon",
-    # playing cards a consumable acts on, cards a pack shows
+    # playing cards it takes at once (selected, discarded or changed), cards a pack shows
     "n_cards", "choices",
     # a joker's rarity, or that of the joker it creates
     *RARITIES,
@@ -54,7 +54,7 @@ COLS = [
 E = len(COLS)
 SCALE = {
     "chips": 100, "mult": 10, "dollars": 5, "g_chips": 10, "g_mult": 2, "g_xmult": 0.25, "g_dollars": 2, "g_value": 2,
-    "hand_size": 2, "hands": 2, "discards": 2, "rate": 4, "n_cards": 3, "choices": 5,
+    "hand_size": 2, "hands": 2, "discards": 2, "rate": 4, "n_cards": 3, "choices": 5, "cap": 50,
 }  # fmt: skip
 FACES = (11, 12, 13)
 
@@ -95,7 +95,7 @@ JOKERS = {
     "j_half": row("on_hand", "few_cards", mult=20),
     "j_stencil": row("on_hand", "empty_slots", xmult=2),  # x1 per empty joker slot, itself included
     "j_four_fingers": row("rule_hand", "passive", hand=("flush", "straight")),
-    "j_mime": row("on_held", retrigger=1),
+    "j_mime": row("on_held", "on_round_end", retrigger=1),
     "j_credit_card": row("rule_economy", "passive", "poor"),
     "j_ceremonial": row("on_blind", "on_hand", "destroys_jokers", "other_jokers", "pos_right", g_mult=6),  # twice the destroyed joker's sell value
     "j_banner": row("on_hand", "discards_left", chips=60),  # 30 per discard left
@@ -114,7 +114,7 @@ JOKERS = {
     "j_delayed_grat": row("on_round_end", "discard_penalty", dollars=6),  # $2 per discard when none was used
     "j_hack": row("on_scored", rank=(2, 3, 4, 5), retrigger=1),
     "j_pareidolia": row("rule_hand", "passive", rank=FACES),
-    "j_gros_michel": row("on_hand", "perishes", mult=15),
+    "j_gros_michel": row("on_hand", "perishes", mult=15, risk=1 / 6),
     "j_even_steven": row("on_scored", rank=(2, 4, 6, 8, 10), mult=4),
     "j_odd_todd": row("on_scored", rank=(14, 3, 5, 7, 9), chips=31),
     "j_scholar": row("on_scored", rank=14, chips=20, mult=4),
@@ -133,18 +133,18 @@ JOKERS = {
     "j_sixth_sense": row("on_hand", "first_hand", "one_card", "destroys_cards", "needs_room", rank=6, mk_spectral=1),
     "j_constellation": row("on_consumable", "on_hand", "likes_planets", g_xmult=0.1),
     "j_hiker": row("on_scored", "alters_cards", g_chips=5),
-    "j_faceless": row("on_discard", rank=FACES, dollars=5),
+    "j_faceless": row("on_discard", rank=FACES, dollars=5, n_cards=3),
     "j_green_joker": row("on_hand", "discard_penalty", g_mult=1),
     "j_superposition": row("on_hand", "needs_all", "needs_room", hand="straight", rank=14, mk_tarot=1),
     "j_todo_list": row("on_hand", "variable", dollars=4),
-    "j_cavendish": row("on_hand", xmult=3),
-    "j_card_sharp": row("on_hand", "same_hand", xmult=3),
+    "j_cavendish": row("on_hand", "perishes", xmult=3, risk=0.001),
+    "j_card_sharp": row("on_hand", "same_hand", "round_only", xmult=3),
     "j_red_card": row("on_shop", "on_hand", "pack_skips", g_mult=3),
-    "j_madness": row("on_blind", "on_hand", "destroys_jokers", g_xmult=0.5),
+    "j_madness": row("on_blind", "on_hand", "no_boss", "destroys_jokers", g_xmult=0.5),
     "j_square": row("on_hand", "four_cards", g_chips=4),
     "j_seance": row("on_hand", "needs_room", hand="straight_flush", mk_spectral=1),
     "j_riff_raff": row("on_blind", "needs_room", "common", mk_joker=2),
-    "j_vampire": row("on_scored", "on_hand", "alters_cards", enh="any", g_xmult=0.1),
+    "j_vampire": row("on_scored", "on_hand", "strips", enh="any", g_xmult=0.1),
     "j_shortcut": row("rule_hand", "passive", hand="straight"),
     "j_hologram": row("on_hand", "likes_cards", g_xmult=0.25),
     "j_vagabond": row("on_hand", "poor", "needs_room", mk_tarot=1),
@@ -170,7 +170,7 @@ JOKERS = {
     "j_lucky_cat": row("on_scored", "on_hand", enh="lucky", g_xmult=0.25),
     "j_baseball": row("on_hand", "other_jokers", "likes_uncommon", xmult=1.5),
     "j_bull": row("on_hand", "rich", chips=50),  # 2 per dollar
-    "j_diet_cola": row("sell_to_use"),
+    "j_diet_cola": row("sell_to_use", mk_tag=1),
     "j_trading": row("on_discard", "first_discard", "one_card", "destroys_cards", dollars=3),
     "j_flash": row("on_shop", "on_hand", g_mult=2),
     "j_popcorn": row("on_hand", "decays", "perishes", mult=20),
@@ -206,7 +206,7 @@ JOKERS = {
     "j_idol": row("on_scored", "variable", xmult=2),
     "j_seeing_double": row("on_hand", "mixed_suits", suit="clubs", xmult=2),
     "j_matador": row("on_hand", "on_boss", dollars=8),
-    "j_hit_the_road": row("on_discard", "on_hand", "resets", rank=11, g_xmult=0.5),
+    "j_hit_the_road": row("on_discard", "on_hand", "resets", "round_only", rank=11, g_xmult=0.5),
     "j_duo": row("on_hand", hand="pair", xmult=2),
     "j_trio": row("on_hand", hand="three", xmult=3),
     "j_family": row("on_hand", hand="four", xmult=4),
@@ -226,15 +226,17 @@ JOKERS = {
     "j_triboulet": row("on_scored", rank=(13, 12), xmult=2),
     "j_yorick": row("on_discard", "on_hand", "periodic", g_xmult=1),
     "j_chicot": row("anti_boss", "on_boss", "passive"),
-    "j_perkeo": row("on_shop", "copy", mk_consumable=1),
+    "j_perkeo": row("on_shop", "copy", "edition", mk_consumable=1),
 }  # fmt: skip
+# The hand a planet levels, and the chips and mult a level adds.
 PLANETS = {
-    "c_mercury": "pair", "c_venus": "three", "c_earth": "full_house", "c_mars": "four", "c_jupiter": "flush", "c_saturn": "straight",
-    "c_uranus": "two_pair", "c_neptune": "straight_flush", "c_pluto": "high_card", "c_planet_x": "five", "c_ceres": "flush_house",
-    "c_eris": "flush_five",
+    "c_mercury": ("pair", 15, 1), "c_venus": ("three", 20, 2), "c_earth": ("full_house", 25, 2), "c_mars": ("four", 30, 3),
+    "c_jupiter": ("flush", 15, 2), "c_saturn": ("straight", 30, 3), "c_uranus": ("two_pair", 20, 1),
+    "c_neptune": ("straight_flush", 40, 4), "c_pluto": ("high_card", 10, 1), "c_planet_x": ("five", 35, 3),
+    "c_ceres": ("flush_house", 40, 4), "c_eris": ("flush_five", 50, 3),
 }  # fmt: skip
 TAROTS = {
-    "c_fool": row("copy", mk_consumable=1),  # the last tarot or planet used
+    "c_fool": row("copy", "needs_room", mk_consumable=1),  # the last tarot or planet used
     "c_magician": row("alters_cards", enh="lucky", n_cards=2),
     "c_high_priestess": row("needs_room", mk_planet=2),
     "c_empress": row("alters_cards", enh="mult", n_cards=2),
@@ -243,12 +245,12 @@ TAROTS = {
     "c_lovers": row("alters_cards", enh="wild", n_cards=1),
     "c_chariot": row("alters_cards", enh="steel", n_cards=1),
     "c_justice": row("alters_cards", enh="glass", n_cards=1),
-    "c_hermit": row("rich", dollars=20),
+    "c_hermit": row("rich", dollars=20, cap=20),
     "c_wheel_of_fortune": row("other_jokers", "edition", chance=0.25),
     "c_strength": row("alters_cards", n_cards=2),
     "c_hanged_man": row("destroys_cards", "thin_deck", n_cards=2),
-    "c_death": row("alters_cards", "copy", n_cards=1),
-    "c_temperance": row("other_jokers", dollars=20),
+    "c_death": row("alters_cards", "copy", n_cards=2),
+    "c_temperance": row("other_jokers", dollars=20, cap=50),
     "c_devil": row("alters_cards", enh="gold", n_cards=1),
     "c_tower": row("alters_cards", enh="stone", n_cards=1),
     "c_star": row("alters_cards", suit="diamonds", n_cards=3),
@@ -258,9 +260,9 @@ TAROTS = {
     "c_world": row("alters_cards", suit="spades", n_cards=3),
 }  # fmt: skip
 SPECTRALS = {
-    "c_familiar": row("destroys_cards", rank=FACES, enh="any", mk_card=3),
-    "c_grim": row("destroys_cards", rank=14, enh="any", mk_card=2),
-    "c_incantation": row("destroys_cards", rank=range(2, 11), enh="any", mk_card=4),
+    "c_familiar": row("destroys_cards", rank=FACES, enh="any", mk_card=3, n_cards=1),
+    "c_grim": row("destroys_cards", rank=14, enh="any", mk_card=2, n_cards=1),
+    "c_incantation": row("destroys_cards", rank=range(2, 11), enh="any", mk_card=4, n_cards=1),
     "c_talisman": row("alters_cards", seal="gold", n_cards=1),
     "c_aura": row("alters_cards", "edition", n_cards=1),
     "c_wraith": row("needs_room", "loses_money", "rare", mk_joker=1),
@@ -294,19 +296,19 @@ VOUCHERS = {
     "v_nacho_tong": row("passive", hands=1),
     "v_wasteful": row("passive", discards=1),
     "v_recyclomancy": row("passive", discards=1),
-    "v_tarot_merchant": row("on_shop", "likes_tarots", rate=2),
-    "v_tarot_tycoon": row("on_shop", "likes_tarots", rate=4),
-    "v_planet_merchant": row("on_shop", "likes_planets", rate=2),
-    "v_planet_tycoon": row("on_shop", "likes_planets", rate=4),
+    "v_tarot_merchant": row("on_shop", "likes_tarots", rate=2.4),
+    "v_tarot_tycoon": row("on_shop", "likes_tarots", rate=8),
+    "v_planet_merchant": row("on_shop", "likes_planets", rate=2.4),
+    "v_planet_tycoon": row("on_shop", "likes_planets", rate=8),
     "v_seed_money": row("rule_economy", "on_round_end", "rich", dollars=5),  # the interest cap, raised by $5 a round
     "v_money_tree": row("rule_economy", "on_round_end", "rich", dollars=10),
     "v_blank": row("passive"),
     "v_antimatter": row("passive", joker_slots=1),
-    "v_magic_trick": row("on_shop", mk_card=1),
-    "v_illusion": row("on_shop", "edition", enh="any", seal=SEALS, mk_card=1),
+    "v_magic_trick": row("on_shop", mk_card=1, rate=4),
+    "v_illusion": row("on_shop", "edition", enh="any", mk_card=1, rate=4),
     "v_hieroglyph": row("ante_down", hands=-1),
     "v_petroglyph": row("ante_down", discards=-1),
-    "v_directors_cut": row("anti_boss", "on_boss", "rule_economy"),
+    "v_directors_cut": row("anti_boss", "on_boss", "rule_economy", "periodic"),  # once per ante
     "v_retcon": row("anti_boss", "on_boss", "rule_economy"),
     "v_paint_brush": row("passive", hand_size=1),
     "v_palette": row("passive", hand_size=1),
@@ -346,7 +348,7 @@ def matrix() -> torch.Tensor:
     """[N_CENTERS, E] features by center id."""
     rows = {k: {**r, "is_joker": 1.0} for k, r in JOKERS.items()}
     rows |= {k: {**r, "is_tarot": 1.0} for k, r in TAROTS.items()}
-    rows |= {k: {**row("levels_hand", hand=h), "is_planet": 1.0} for k, h in PLANETS.items()}
+    rows |= {k: {**row("levels_hand", hand=h, chips=c, mult=m), "is_planet": 1.0} for k, (h, c, m) in PLANETS.items()}
     rows |= {k: {**r, "is_spectral": 1.0} for k, r in SPECTRALS.items()}
     rows |= {k: {**r, "is_voucher": 1.0} for k, r in VOUCHERS.items()}
     centers = az.centers()
