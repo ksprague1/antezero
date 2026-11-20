@@ -123,7 +123,7 @@ class RoundSearch:
         if min(gate, keep, eg_gate, eg_keep) < 1 or min(final, eg_final) < 2 or samples < 0:
             raise ValueError("need gate, keep, eg_gate, eg_keep >= 1, final, eg_final >= 2, samples >= 0")
         self.model, self.device = model.eval(), torch.device(device)
-        self.K, self.dt, self.pv, self.limit = cfg.env.play_candidates, cfg.env.deck_tokens, cfg.env.build_previews, cfg.env.step_limit
+        self.K, self.dt, self.pv, self.og, self.limit = cfg.env.play_candidates, cfg.env.deck_tokens, cfg.env.build_previews, cfg.env.order_gain, cfg.env.step_limit
         self.gate, self.final, self.keep, self.samples, self.min_ante = gate, final, keep, samples, min_ante
         self.endgame, self.eg_gate, self.eg_final, self.eg_keep, self.eg_min_ante = endgame, eg_gate, eg_final, eg_keep, eg_min_ante
         self.threads = threads or os.cpu_count() or 1
@@ -132,7 +132,7 @@ class RoundSearch:
         self.rows: Counter = Counter()  # policy rows by purpose (cost accounting)
 
     def enc(self, g: az.Game) -> dict:
-        d = g.encode(self.K, self.dt, self.pv)
+        d = g.encode(self.K, self.dt, self.pv, self.og)
         kinds = d["ops"][: min(self.K, int(d["n_ops"])), 0].tolist()
         d["_k"] = next((i for i, x in enumerate(kinds) if x != az.OP_PLAY_TOP), len(kinds))  # leading scored candidates
         return d
@@ -148,7 +148,6 @@ class RoundSearch:
             return False
         return g.phase in ("shop", "pack") or (g.phase == "blind_select" and "reroll_boss" in g.legal_codes())
 
-    # ------------------------------------------------------------- scheduler
     def run(self, gens: list) -> list:
         """Runs generators to completion -> their return values (in the order
         they finish)."""
@@ -245,7 +244,6 @@ class RoundSearch:
             codes = [to_code(g, d, j, *next(out)[1:3]) for j in range(int(d["n_ops"]))]
             results[ri] = list(dict.fromkeys(c for c in codes if c and not c.startswith(FREE)))
 
-    # ------------------------------------------------------------ generators
     def rollout(self, ws: list, label: str, to_end: bool = False):
         """Greedy policy until every world leaves the round -> [(cleared,
         chip fraction)]; ``to_end``: until the game is won or lost -> [(won,
@@ -369,7 +367,7 @@ class RoundSearch:
             for i, c in enumerate(fin):
                 won[c] += [x[0] for x in res[i * len(part) : (i + 1) * len(part)]]
             if not any(sum(won[c]) > sum(won[gcode]) for c in keep):
-                break  # no finalist leads greedy
+                break
         p = {c: _sign_p(won[c], won[gcode]) for c in keep}
         best = max((c for c in keep if p[c] <= EG_ALPHA), key=lambda c: sum(won[c]), default=gcode)
         info.update(final_worlds=len(won[gcode]), final_greedy=sum(won[gcode]), final_best=max(sum(won[c]) for c in keep), p=min(p.values()), rank=keep.index(best) if best != gcode else -1)

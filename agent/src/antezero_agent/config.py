@@ -35,6 +35,8 @@ class ModelConfig:
     # exactly, the learning step 1.3-1.8x faster. Part of the model: a policy
     # trained this way is also run this way.
     bf16_encoder: bool = False
+    # Read what each item does from the table of effects.py; off = a table of zeros, for A/B controls.
+    effects: bool = True
 
 
 @dataclass
@@ -71,14 +73,30 @@ class EnvConfig:
     # Build previews in shops, packs and blind select: the build's scoring
     # capacity against the coming blinds (globals) and what each buy / pick /
     # use / redeem / sell would add (item token columns). Off: those inputs
-    # stay zero (the pre-preview observation), for A/B controls.
+    # stay zero, for A/B controls.
     build_previews: bool = True
+    # In rounds, each joker-move op carries what the best single move of its
+    # joker would add to the top play candidate's score (capped at the chips
+    # still needed). Off: the input stays zero, for A/B controls.
+    order_gain: bool = True
+    # The share of played hands the simulator labels with the single joker
+    # moves that would have scored best (what ppo.aux_order learns from).
+    order_label_rate: float = 0.0
     seed: int = 1
     # Restart a fraction of episodes from ante-start snapshots of recent
     # episodes (hidden state resampled) so late antes get trained more.
     # Such episodes are excluded from the win-rate statistics.
     snapshot_prob: float = 0.0
     snapshot_min_ante: int = 2
+    # Restart a further fraction from ante starts of antes 2-3 holding a gift
+    # the run did not choose (a sellable joker or three levels of a hand
+    # type), so builds the policy never reaches get played. Late snapshots
+    # then need snapshot_min_ante above 3; excluded from the statistics
+    # likewise.
+    practice_prob: float = 0.0
+    # A gifted joker is Eternal (where the game allows the sticker), so the
+    # run has to play with it instead of selling it at once.
+    practice_eternal: bool = False
     # Offer skipping blinds. A policy that collapsed onto skipping (it was
     # rewarded like beating the blind) never samples "select" again; turning
     # skips off for a while makes it play every blind.
@@ -98,8 +116,6 @@ class PPOConfig:
     gamma: float = 0.999
     gae_lambda: float = 0.95
     epochs: int = 3
-    # `num_envs * rollout_len` must split into this many equal minibatches
-    # of at least 2 samples.
     minibatches: int = 8
     # Sum each minibatch's gradient over this many equal chunks: the same
     # step in less GPU memory (e.g. 2 on 24 GB with 2048-sample minibatches).
@@ -125,9 +141,14 @@ class PPOConfig:
     # Exploration of REDEEM, which the policy stopped sampling (p ~ 1e-12:
     # PPO never sees its value): in training rollouts a sampled shop exit
     # with a legal voucher redeems it instead with this probability. Those
-    # steps train without an importance weight, at `explore_weight`, inside
-    # the clip band only. Greedy play stays the policy's own argmax.
+    # steps train without an importance weight, at `explore_weight`, by at
+    # most the clip per update. Greedy play stays the policy's own argmax.
     explore_redeem: float = 0.0
+    # The same for purchases and pack picks the policy does not make: a
+    # sampled shop exit buys a random legal joker, tarot or planet of the
+    # shop instead, a sampled pack pick or skip takes a random one of the
+    # pack.
+    explore_buy: float = 0.0
     explore_weight: float = 0.25
     lr: float = 3e-4
     lr_final: float = 3e-5
@@ -156,16 +177,31 @@ class PPOConfig:
     # critic (ppo.critic) then values each state as it is acted on, while the
     # simulator steps, instead of in a pass after the rollout.
     fast_rollout: int = 0
+    # fast_rollout: each acting step runs the policy on this many groups of
+    # envs, sorted by token count, each padded to its own longest state
+    # instead of the batch's (25 tokens on average against 40). The same
+    # policy on other batches, so not the plain loop's samples.
+    act_chunks: int = 1
     # Keep the rollout's tokens and ops (33 of its 34 KB per state) in host
     # memory, gathered there per minibatch (CUDA only): 4,096 envs x 128 then
     # take 16 GiB of RAM instead of GPU memory. The same update, bitwise.
     rollout_obs_on_cpu: bool = False
     # Decoupled critic (critic.py), frozen: its value replaces the policy's value
     # head in the advantages (GAE and the truncation bootstrap); the head still
-    # trains, on the resulting returns. "" = off (today's update); otherwise the
+    # trains, on the resulting returns. "" = off; otherwise the
     # checkpoint it is read from (a critic's, or a training checkpoint that
     # holds one). A resumed run keeps its own.
     critic: str = ""
+    # With ppo.critic: 1 = a copy of the critic keeps learning during the
+    # run, from the realised returns of finished episodes (critic.Learner),
+    # and the log compares it with the frozen one; 2 = the copy also replaces
+    # the frozen critic after every update.
+    critic_learn: int = 0
+    # Weight of the ordering loss on the labelled played hands where a single
+    # joker move would have gained (env.order_label_rate): it raises the
+    # labelled moves and their destinations, through the order-gain input and
+    # the destination head only. PPO's own loss is unchanged. 0 = off.
+    aux_order: float = 0.0
 
 
 @dataclass
@@ -186,7 +222,6 @@ class Config:
 
     @staticmethod
     def from_dict(d: dict) -> Config:
-        """The inverse of ``to_json``; unknown fields are an error."""
         sections = {"model": ModelConfig, "env": EnvConfig, "ppo": PPOConfig}
         known = {f.name for f in dataclasses.fields(Config)}
         unknown = set(d) - known
@@ -205,8 +240,6 @@ class Config:
         return Config(**kw)
 
     def validate(self) -> None:
-        """Rejects settings training cannot run with (before anything is
-        allocated or written)."""
         e, p = self.env, self.ppo
         checks = [
             (e.num_envs > 0 and p.rollout_len > 0, "env.num_envs and ppo.rollout_len must be positive"),
@@ -226,6 +259,21 @@ class Config:
             (bool(e.backs) and bool(e.stakes), "env.backs and env.stakes must not be empty"),
             (not e.curriculum or e.curriculum_min_episodes > 0, "env.curriculum_min_episodes must be positive"),
             (p.fast_rollout in (0, 1, 2) and (p.fast_rollout < 2 or e.num_envs % 2 == 0), "ppo.fast_rollout must be 0, 1 or 2 (2: with an even env.num_envs)"),
+            (
+                p.act_chunks == 1 or (p.act_chunks > 1 and p.fast_rollout and e.num_envs % (p.act_chunks * max(1, p.fast_rollout)) == 0),
+                "ppo.act_chunks > 1 needs ppo.fast_rollout and must split its envs (each half with fast_rollout=2) evenly",
+            ),
+            (p.critic_learn in (0, 1, 2) and (not p.critic_learn or bool(p.critic)), "ppo.critic_learn is 0, 1 or 2 and needs ppo.critic"),
+            (0.0 <= e.order_label_rate <= 1.0, "env.order_label_rate must be in [0, 1]"),
+            (
+                0.0 <= e.snapshot_prob and 0.0 <= e.practice_prob and e.snapshot_prob + e.practice_prob <= 1.0,
+                "env.snapshot_prob and env.practice_prob must be >= 0 and sum to at most 1",
+            ),
+            (
+                not (e.practice_prob and e.snapshot_prob) or e.snapshot_min_ante > 3,
+                "env.practice_prob with env.snapshot_prob needs env.snapshot_min_ante > 3",
+            ),
+            (p.aux_order >= 0.0 and (not p.aux_order or e.order_label_rate > 0.0), "ppo.aux_order must be >= 0 and needs env.order_label_rate > 0"),
         ]
         for ok, msg in checks:
             if not ok:

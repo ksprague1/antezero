@@ -57,7 +57,7 @@ def choose(
     K = cfg.env.play_candidates if play_candidates is None else play_candidates
     dt = cfg.env.deck_tokens if deck_tokens is None else deck_tokens
     model.eval()
-    o = obs_from_numpy(game.encode(K, dt, cfg.env.build_previews), device)
+    o = obs_from_numpy(game.encode(K, dt, cfg.env.build_previews, cfg.env.order_gain), device)
     cands: dict[str, None] = {}
     greedy = model.act(o, deterministic=True)
     batch = _stack([o] * max(1, n_actions * 2))
@@ -84,7 +84,7 @@ def choose(
     vals = torch.zeros(len(nexts))
     live = [i for i, c in enumerate(nexts) if not c.is_terminal()]
     if live:
-        ob = _stack([obs_from_numpy(nexts[i].encode(K, dt, cfg.env.build_previews), device) for i in live])
+        ob = _stack([obs_from_numpy(nexts[i].encode(K, dt, cfg.env.build_previews, cfg.env.order_gain), device) for i in live])
         cls, _, _, _ = model.encode(ob)
         vals[live] = model.value(cls).squeeze(-1).float().cpu()
     score = torch.zeros(len(codes))

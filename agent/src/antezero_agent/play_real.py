@@ -41,7 +41,7 @@ def greedy(model, cfg, sim: az.Game, dev) -> tuple[str | None, dict, object]:
     """The policy's own choice in ``sim``: its action code, ``Net.act``'s
     output and the observation it was made from."""
     K = cfg.env.play_candidates
-    o = obs_from_numpy(sim.encode(K, cfg.env.deck_tokens, cfg.env.build_previews), dev)
+    o = obs_from_numpy(sim.encode(K, cfg.env.deck_tokens, cfg.env.build_previews, cfg.env.order_gain), dev)
     out = model.act(o, deterministic=True)
     return sim.factored_to_code(int(out["op"][0]), int(out["cards"][0]), int(out["dest"][0]), K), out, o
 

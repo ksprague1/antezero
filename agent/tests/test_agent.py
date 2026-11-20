@@ -1,4 +1,5 @@
 import csv
+import json
 
 import numpy as np
 import pytest
@@ -8,7 +9,7 @@ import antezero_sim as az
 from antezero_agent.collect import Collector
 from antezero_agent.config import Config, ModelConfig, parse_overrides, preset
 from antezero_agent.critic import Critic
-from antezero_agent.model import NEG, OP_END_SHOP, OP_REDEEM, Net, Obs, noise_shapes, obs_from_numpy, sample
+from antezero_agent.model import NEG, OP_BUY, OP_BUY_AND_USE, OP_END_SHOP, OP_PICK, OP_REDEEM, Net, Obs, noise_shapes, obs_from_numpy, sample
 from antezero_agent.runtime import load_model, make_env, read_checkpoint, seeded
 from antezero_agent.search import shaped_reward
 from antezero_agent.stats import wilson
@@ -87,7 +88,6 @@ def test_teacher_forced_logp_matches_sampling():
 
 
 def test_bf16_encoder_changes_nothing_on_cpu():
-    """``model.bf16_encoder`` is a CUDA setting: on the CPU the same network gives the same numbers."""
     env = make_env(preset("smoke"), num_envs=16)
     a, b = tiny(), tiny()
     b.cfg.bf16_encoder = True
@@ -142,7 +142,7 @@ def test_shaping_telescopes_to_true_return_plus_progress():
                     checked += 1
                     progress += ep[6] > 0
                 acc[i], t[i] = 0.0, 0
-        assert checked >= 20 and progress >= 5  # some checked episodes cleared blinds
+        assert checked >= 20 and progress >= 5
 
 
 def test_a_loss_costs_no_progress():
@@ -177,7 +177,7 @@ def test_skipping_a_blind_earns_no_progress():
 
 def test_a_standalone_game_can_hide_skips_like_training():
     """play_real builds its own Game: a policy trained with allow_skip=False
-    must not be offered skips there (it skipped blinds in the real game)."""
+    must not be offered skips there."""
     g = az.Game("SKIPTEST")
     assert g.allow_skip and env_game_skip_offered(g)
     g.allow_skip = False
@@ -237,8 +237,6 @@ def test_progress_potential_is_the_run_position():
 
 @pytest.mark.parametrize("tp", [True, False])
 def test_search_reward_matches_vecenv(tp):
-    """``search.shaped_reward`` is the reward ``VecEnv`` gives, terminal
-    transitions included, with Phi kept or zeroed at terminal states."""
     cfg = preset("smoke")
     cfg.env.play_candidates = 4
     cfg.env.r_loss = 0.5
@@ -268,6 +266,18 @@ def test_gae_stops_at_episode_ends():
     # t=2); t=0: 1 + 0.9*0.5 - 0.5 + 0.9*0.8*1.5
     assert torch.allclose(adv[:, 0], torch.tensor([2.03, 1.5, 11.5]))
     assert torch.allclose(ret[:, 0], torch.tensor([2.53, 2.0, 12.0]))
+
+
+def test_gae_stops_before_an_explored_step():
+    r = Rollout(3, 1, torch.device("cpu"))
+    r.reward[:, 0] = torch.tensor([1.0, 2.0, 3.0])
+    r.value[:, 0] = 0.5
+    cut = torch.tensor([[False], [True], [False]])
+    adv, _ = gae(r, torch.tensor([10.0]), gamma=0.9, lam=0.8, cut=cut)
+    # t=2 and the explored t=1 as without the cut (11.5; 2 + 0.9*0.5 - 0.5 + 0.9*0.8*11.5); t=0 sees only the value
+    # of the state it led to: 1 + 0.9*0.5 - 0.5.
+    assert torch.allclose(adv[:, 0], torch.tensor([0.95, 10.23, 11.5]))
+    assert torch.equal(gae(r, torch.tensor([10.0]), gamma=0.9, lam=0.8, cut=torch.zeros_like(cut))[0], gae(r, torch.tensor([10.0]), gamma=0.9, lam=0.8)[0])
 
 
 def test_truncation_bootstraps_from_final_observation():
@@ -302,6 +312,67 @@ def test_snapshot_restarts():
     assert env.invalid_actions() == 0
 
 
+def gift_of(g):
+    """What a run of the heuristic holds, which never buys: (jokers, top hand level, the first joker is eternal)."""
+    c = g.canonical()
+    held = int(c["jokers.len"])
+    top = max(int(v) for k, v in c.items() if k.startswith("hands.") and k.endswith(".level"))
+    return held, top, held > 0 and c["jokers.0.ab.eternal"] == "true"
+
+
+def test_practice_restarts_hold_one_gift_and_feed_no_pool():
+    cfg = preset("smoke")
+    env = make_env(cfg, num_envs=64, play_candidates=4, snapshot_prob=0.3, snapshot_min_ante=4, practice_prob=0.4)
+    restarted, jokers, levels = set(), 0, 0
+    for _ in range(6000):
+        heuristic(env)
+        for e in env.pop_episodes():
+            if e[0] in restarted:
+                assert e[10], "a restarted episode is flagged as one"
+            g = env.game(e[0])
+            restarted.discard(e[0])
+            if g.ante == 1:
+                continue
+            restarted.add(e[0])
+            # Only runs with a gift get past ante 3 here, and they feed neither pool: no late restart, no second gift.
+            assert 2 <= g.ante <= 3 and g.phase == "blind_select"
+            held, top, eternal = gift_of(g)
+            # One sellable joker or three levels of a hand type.
+            assert (held, top) in ((1, 1), (0, 4)) and not eternal
+            jokers += held
+            levels += top == 4
+    assert jokers > 0 and levels > 0
+    assert env.invalid_actions() == 0
+
+
+def test_practice_eternal_gifts_are_eternal_where_the_game_allows():
+    env = make_env(preset("smoke"), num_envs=64, play_candidates=4, practice_prob=0.5, practice_eternal=True)
+    eternal, plain = set(), set()
+    for _ in range(4000):
+        heuristic(env)
+        for e in env.pop_episodes():
+            g = env.game(e[0])
+            if g.ante > 1 and gift_of(g)[0]:
+                (eternal if gift_of(g)[2] else plain).add(g.canonical()["jokers.0.key"])
+    assert len(eternal) > 20
+    # The jokers the game never makes Eternal.
+    assert plain <= {"j_gros_michel", "j_ice_cream", "j_cavendish", "j_turtle_bean", "j_ramen", "j_diet_cola", "j_popcorn", "j_selzer", "j_mr_bones", "j_invisible", "j_luchador"}
+    assert env.invalid_actions() == 0
+
+
+def test_restart_shares_are_checked():
+    cfg = preset("smoke")
+    for bad in (dict(snapshot_prob=0.1, snapshot_min_ante=3, practice_prob=0.1), dict(snapshot_prob=0.8, snapshot_min_ante=5, practice_prob=0.25)):
+        with pytest.raises(ValueError):
+            make_env(cfg, num_envs=2, **bad)
+        for k, v in bad.items():
+            setattr(cfg.env, k, v)
+        with pytest.raises(ValueError):
+            cfg.validate()
+    make_env(preset("smoke"), num_envs=2, snapshot_prob=0.8, snapshot_min_ante=5, practice_prob=0.2)
+    make_env(preset("smoke"), num_envs=2, practice_prob=1.0)
+
+
 def test_explore_redeem_replaces_sampled_shop_exits():
     cfg = preset("smoke")
     cfg.env.num_envs = 64
@@ -313,19 +384,47 @@ def test_explore_redeem_replaces_sampled_shop_exits():
         kinds = o.ops[..., 0]
         legal = torch.arange(kinds.shape[1])[None] < o.n_ops[:, None]
         red = ((kinds == OP_REDEEM) & legal).any(-1)
-        out = m.act(o, explore=1.0)
+        out = m.act(o, explore=(1.0, 0.0))
         chosen = kinds.gather(1, out["op"][:, None]).squeeze(1)
-        assert not (red & (chosen == OP_END_SHOP)).any()  # every sampled exit with a legal voucher redeems it
+        assert not (red & (chosen == OP_END_SHOP)).any()
         x = out["explored"]
         assert (red | ~x).all() and (chosen[x] == OP_REDEEM).all() and (out["cards"][x] == 0).all()
         logp, _, _ = m.evaluate(o, out["op"], out["card_seq"], out["dest"])
         assert torch.allclose(logp, out["logp"], atol=1e-4)  # the policy's own log-prob of the explored action
-        assert torch.equal(m.act(o, deterministic=True, explore=1.0)["op"], m.act(o, deterministic=True)["op"])
+        assert torch.equal(m.act(o, deterministic=True, explore=(1.0, 1.0))["op"], m.act(o, deterministic=True)["op"])
         for i in np.flatnonzero(x.numpy()):  # the kind constants match the simulator's
             assert env.game(int(i)).factored_to_code(int(out["op"][i]), 0, 0, cfg.env.play_candidates).startswith("redeem")
         explored += int(x.sum())
         heuristic(env)  # leaves every shop, so money (and affordable vouchers) accumulate
     assert explored > 0
+
+
+def test_explore_buy_tries_purchases_and_pack_cards():
+    """A sampled shop exit buys a legal shop card instead, a sampled pack pick or skip takes a card of the pack; the
+    replaced op is always legal and its log-probability the policy's own."""
+    cfg = preset("smoke")
+    cfg.env.num_envs = 64
+    env = make_env(cfg)
+    m = tiny()
+    seen = {"buy": 0, "pick": 0}
+    for _ in range(600):
+        o = obs_from_numpy(env)
+        kinds = o.ops[..., 0]
+        legal = torch.arange(kinds.shape[1])[None] < o.n_ops[:, None]
+        known = m.tryable[o.tok_i[..., 1].gather(1, o.ops[..., 1].clamp(min=0))]
+        buys = (((kinds == OP_BUY) | (kinds == OP_BUY_AND_USE)) & legal & known).any(-1)
+        out = m.act(o, explore=(0.0, 1.0))
+        chosen, x = kinds.gather(1, out["op"][:, None]).squeeze(1), out["explored"]
+        assert not (buys & (chosen == OP_END_SHOP)).any()  # every sampled exit with one of them to buy buys it
+        assert legal.gather(1, out["op"][:, None]).all() and known.gather(1, out["op"][:, None]).squeeze(1)[x].all()
+        assert ((chosen[x] == OP_BUY) | (chosen[x] == OP_BUY_AND_USE) | (chosen[x] == OP_PICK)).all()
+        logp, _, _ = m.evaluate(o, out["op"], out["card_seq"], out["dest"])
+        assert torch.allclose(logp, out["logp"], atol=1e-4)
+        for i in np.flatnonzero(x.numpy()):  # the kind constants match the simulator's
+            code = env.game(int(i)).factored_to_code(int(out["op"][i]), int(out["cards"][i]), int(out["dest"][i]), cfg.env.play_candidates)
+            seen[code.split()[0].split("_")[0]] += 1
+        step(env, out)
+    assert seen["buy"] > 0 and seen["pick"] > 0, seen
 
 
 @pytest.mark.parametrize("all_explored", [False, True])
@@ -337,7 +436,7 @@ def test_explore_redeem_trains(tmp_path, monkeypatch, all_explored):
     losses = []
     for mark in (False, True):
 
-        def marked(self, o, deterministic=False, explore=0.0, mark=mark):
+        def marked(self, o, deterministic=False, explore=(0.0, 0.0), mark=mark):
             out = act(self, o, deterministic, explore)
             out["explored"] = ((torch.arange(o.batch, device=o.ops.device) % 2 == 0) | all_explored) & mark
             return out
@@ -365,11 +464,11 @@ def test_pre_drawn_noise_replays_sampling():
     m, env = tiny(), make_env(preset("smoke"), num_envs=16, play_candidates=4)
     for _ in range(10):
         o = obs_from_numpy(env)
-        for explore in (0.0, 1.0):
+        for explore in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)):
             with seeded(1):
                 a = m.act(o, explore=explore)
             with seeded(1):
-                qs = [torch.empty(s).uniform_() if u else torch.empty(s).exponential_(1) for s, u in noise_shapes(o.batch, explore)]
+                qs = [torch.empty(s).uniform_() if u else torch.empty(s).exponential_(1) for s, u in noise_shapes(o.batch, *explore)]
                 b = m.act(o, explore=explore, noise=qs)
             assert all(torch.equal(a[k], b[k]) for k in a)
         step(env, a)
@@ -385,8 +484,6 @@ def test_deterministic_policy_is_reproducible():
 
 
 def test_tiny_overfit_every_head():
-    """The network can memorize arbitrary legal actions (op, card set,
-    destination) on a small batch: gradients reach every head."""
     cfg = preset("smoke")
     env = make_env(cfg, num_envs=48, play_candidates=4)
     m = tiny(64, 2)
@@ -415,6 +512,15 @@ def test_tiny_overfit_every_head():
     assert float(logp.detach().mean()) > -0.15, float(logp.detach().mean())
 
 
+def test_training_logs_outcomes_per_deck(tmp_path):
+    cfg = preset("smoke")
+    cfg.run_dir, cfg.env.backs, cfg.ppo.rollout_len, cfg.ppo.total_steps = str(tmp_path), ["b_red", "b_blue"], 128, 8 * 128
+    row = train(cfg, max_updates=1)
+    cells = json.loads((tmp_path / "smoke" / "cells.jsonl").read_text())
+    assert cells.pop("update") == 1 and set(cells) <= {"b_red/1", "b_blue/1"}
+    assert sum(n for _, n in cells.values()) == row["episodes"] > 0
+
+
 def test_smoke_train_resume_and_run_protection(tmp_path):
     cfg = preset("smoke")
     cfg.run_dir = str(tmp_path)
@@ -422,10 +528,8 @@ def test_smoke_train_resume_and_run_protection(tmp_path):
     assert row["update"] == 1 and row["invalid_actions"] == 0
     ck = tmp_path / "smoke" / "last.pt"
     assert read_checkpoint(ck)["update"] == 1
-    # A fresh run does not overwrite an existing one ...
     with pytest.raises(FileExistsError):
         train(cfg, max_updates=1)
-    # ... but it can be resumed, appending to the same log.
     row = train(cfg, resume=str(ck), max_updates=1)
     assert row["update"] == 2
     with open(tmp_path / "smoke" / "log.csv", newline="") as f:
@@ -557,8 +661,38 @@ def test_collector_fills_host_storage_the_same():
     assert len(widths) > 3
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the Collector needs CUDA")
+@pytest.mark.parametrize("host", [False, True])
+def test_act_chunks_fill_the_rollout_in_env_order(monkeypatch, host):
+    """``ppo.act_chunks``: the policy runs on groups of envs sorted by token count, each at its own length, but the
+    rollout is still what a plain loop stores: a twin env given the same actions shows the stored observations,
+    rewards and ends, and the stored log-probs are those of the stored actions."""
+    cfg, dev = preset("smoke"), torch.device("cuda")
+    cfg.env.num_envs, cfg.env.deck_tokens, cfg.ppo.rollout_len, cfg.ppo.fast_rollout, cfg.ppo.act_chunks = 16, True, 24, 1, 4
+    cfg.validate()
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)  # train() turns TF32 on: acting and evaluating then differ by ~1e-3
+    model, sent, pick = tiny().to(dev), [], Collector._pick
+    monkeypatch.setattr(Collector, "_pick", lambda self, roll, t, h: sent.append([x.copy() for x in pick(self, roll, t, h)]) or sent[-1])
+    roll = Rollout(24, 16, dev, host)
+    col = Collector(cfg, model, dev, 5, 1, lambda o: torch.zeros(o.batch, device=dev))
+    col.collect(roll, lambda eps: None)
+    assert col.chunk == 4 and len(col.act.graphs) > 1 and col.invalid_actions() == 0
+    twin = make_env(cfg, seed=5)
+    for t, acts in enumerate(sent):
+        for k in ("tok_i", "tok_f", "glob_i", "glob_f", "ops", "ops_f", "n_ops", "n_tokens", "n_hand"):
+            assert np.array_equal(np.asarray(getattr(twin, k)), getattr(roll, k)[t].cpu().numpy()), (t, k)
+        rew, done, _trunc = twin.step(*acts)
+        assert np.array_equal(rew, roll.reward[t].cpu().numpy()) and np.array_equal(done, roll.done[t].cpu().numpy() > 0), t
+    idx = torch.arange(roll.T * roll.N, device=dev)
+    with torch.no_grad():
+        lp, _ent, _val = model.evaluate(roll.obs(idx), roll.op.flatten(), roll.card_seq.flatten(0, 1), roll.dest.flatten())
+    assert torch.allclose(lp, roll.logp.flatten(), atol=1e-4)
+    cfg.ppo.act_chunks = 3
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+
 def test_every_saved_checkpoint_is_kept(tmp_path):
-    """A copy stays at every save (what gets averaged), with or without an in-run eval."""
     cfg = preset("smoke")
     cfg.run_dir = str(tmp_path)
     train(cfg, max_updates=2)

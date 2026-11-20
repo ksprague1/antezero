@@ -43,7 +43,6 @@ BATCH = 1024
 
 
 def _envs(cfg: Config, episodes: int, seed: int, backs, stakes, max_ante, endless, batch: int) -> Iterator[az.VecEnv]:
-    """The evaluation games, ``batch`` at a time."""
     e = cfg.env
     for k, start in enumerate(range(0, episodes, batch)):
         yield make_env(
@@ -55,6 +54,8 @@ def _envs(cfg: Config, episodes: int, seed: int, backs, stakes, max_ante, endles
             endless=e.endless if endless is None else endless,
             max_ante=max_ante or e.max_ante,
             snapshot_prob=0.0,
+            practice_prob=0.0,
+            order_label_rate=0.0,
         )
 
 
@@ -85,7 +86,6 @@ def summarize(eps: list[tuple], invalid: int = 0) -> dict:
             # Cut off before an outcome (counted as not won above).
             "unresolved": int(sum(bool(x[9]) and not x[5] for x in eps)),
             "invalid_actions": invalid,
-            # Episodes for a +-1% interval at the observed rate.
             "episodes_for_1pct": episodes_needed(min(max(rate["win_rate"], 0.01), 0.99), 0.01),
         },
         "survival_past_ante": {str(a): float((antes > a).mean()) for a in range(1, max(top, 9) + 1)} if len(eps) else {},

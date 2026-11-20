@@ -1,6 +1,3 @@
-"""What training, evaluation and play share: the device, the environment
-factory and checkpoints."""
-
 from __future__ import annotations
 
 import contextlib
@@ -37,8 +34,6 @@ def seeded(seed: int, device="cpu"):
 
 
 def make_env(cfg: Config, seed: int | None = None, num_envs: int | None = None, **over) -> az.VecEnv:
-    """A ``VecEnv`` as configured by ``cfg.env`` (``over`` replaces any of
-    its keyword arguments)."""
     e = cfg.env
     kw = dict(
         backs=list(e.backs),
@@ -58,9 +53,13 @@ def make_env(cfg: Config, seed: int | None = None, num_envs: int | None = None, 
         deck_tokens=e.deck_tokens,
         snapshot_prob=e.snapshot_prob,
         snapshot_min_ante=e.snapshot_min_ante,
+        practice_prob=e.practice_prob,
+        practice_eternal=e.practice_eternal,
         allow_skip=e.allow_skip,
         build_previews=e.build_previews,
         terminal_phi=e.terminal_phi,
+        order_gain=e.order_gain,
+        order_label_rate=e.order_label_rate,
     )
     kw.update(over)
     return az.VecEnv(num_envs or e.num_envs, **kw)
@@ -74,7 +73,6 @@ def obs_schema() -> dict:
 
 
 def save_checkpoint(path: Path, model: Net, opt, cfg: Config, update: int, steps: int, extra: dict | None = None) -> None:
-    """Atomically writes a training checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
     ck = {
         "model": model.state_dict(),
@@ -91,8 +89,6 @@ def save_checkpoint(path: Path, model: Net, opt, cfg: Config, update: int, steps
 
 
 def read_checkpoint(path: str | Path) -> dict:
-    """A checkpoint's contents (on the CPU), after checking it matches this
-    simulator's observation schema."""
     ck = torch.load(path, map_location="cpu", weights_only=True)
     if ck.get("obs_schema") != obs_schema():
         raise ValueError(f"{path} was trained on another observation schema than this simulator's")
@@ -100,11 +96,9 @@ def read_checkpoint(path: str | Path) -> dict:
 
 
 def load_model(path: str | Path, device="cpu") -> tuple[Net, Config, dict]:
-    """The network of a checkpoint (in eval mode, on ``device``), its config
-    and its metadata (update, steps)."""
     ck = read_checkpoint(path)
     cfg = Config.from_dict(ck["config"])
-    model = Net(cfg.model)
+    model = Net(cfg.model, ck["model"].get("fx"))
     model.load_state_dict(ck["model"])
     meta = {k: ck[k] for k in ("update", "steps")}
     return model.to(device).eval(), cfg, meta

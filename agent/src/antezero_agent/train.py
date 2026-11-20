@@ -32,16 +32,15 @@ import torch
 
 from .collect import Collector
 from .config import Config, parse_overrides, preset
-from .critic import Critic, critic_state
-from .model import MAX_CARDS, Net, Obs, count_params, obs_from_numpy
+from .critic import Critic, Learner, critic_state
+from .model import GAIN, MAX_CARDS, Net, Obs, count_params, obs_from_numpy
 from .runtime import make_env, pick_device, read_checkpoint, save_checkpoint
 from .stats import wilson
 
 
 class Rollout:
-    """Fixed-size on-device storage for ``T`` steps of ``N`` envs. Integer
-    features use compact (lossless) dtypes; floats stay float32 so training
-    sees exactly the observations the actions were sampled on.
+    """Integer features use compact (lossless) dtypes; floats stay float32 so
+    training sees exactly the observations the actions were sampled on.
 
     ``obs_on_cpu`` (CUDA devices; ``ppo.rollout_obs_on_cpu``): the tokens and
     ops (33.0 of the 33.9 KB per state) live in host memory instead, and
@@ -71,6 +70,9 @@ class Rollout:
         self.c_val = z(T, N, dt=torch.float32)  # the frozen critic's values (ppo.critic)
         self.reward = z(T, N, dt=torch.float32)
         self.done = z(T, N, dt=torch.float32)
+        # The joker-order labels of the actions (VecEnv.aux_kind / aux_dest; env.order_label_rate).
+        self.aux_kind = z(T, N, dt=torch.int8) - 1
+        self.aux_dest = z(T, N, az.ORDER_JOKERS, dt=torch.uint8)
         self.T, self.N = T, N
 
     def put_obs(self, t: int, o: Obs):
@@ -100,7 +102,7 @@ class Rollout:
                 return x[idx]
             # Only the first n slots cross (states use ~40 of the 200 token slots), gathered into pinned memory so the
             # copy does not hold up the CPU (the allocator hands the block out again once it is done). They land in
-            # full-width rows: encode's [:, :T] views keep today's strides, hence today's kernels (bitwise).
+            # full-width rows so that encode's [:, :T] views keep the on-device strides, hence the same kernels (bitwise).
             full, x = x.shape[1:], x[:, :n]
             pin = torch.empty((len(idx_cpu), *x.shape[1:]), dtype=x.dtype, pin_memory=True)
             torch.index_select(x, 0, idx_cpu, out=pin)
@@ -121,11 +123,13 @@ class Rollout:
         )
 
 
-def gae(r: Rollout, last_value: torch.Tensor, gamma: float, lam: float, value: torch.Tensor | None = None):
+def gae(r: Rollout, last_value: torch.Tensor, gamma: float, lam: float, value: torch.Tensor | None = None, cut: torch.Tensor | None = None):
     """Generalized advantage estimates and returns over ``value`` [T, N]
     (default ``r.value``). ``r.done`` ends the recursion (episodes do not leak
     into the next one); truncated steps already carry ``gamma * V(final
-    state)`` in their reward."""
+    state)`` in their reward. ``cut`` [T, N]: steps whose action the policy
+    did not choose (explored); an earlier step's estimate stops at the value
+    of the state before them, as what follows is not the policy's doing."""
     value = r.value if value is None else value
     adv = torch.zeros_like(r.reward)
     last = torch.zeros_like(last_value)
@@ -135,16 +139,19 @@ def gae(r: Rollout, last_value: torch.Tensor, gamma: float, lam: float, value: t
         delta = r.reward[t] + gamma * nv * nonterm - value[t]
         last = delta + gamma * lam * nonterm * last
         adv[t] = last
+        if cut is not None:
+            last = last * ~cut[t]
     return adv, adv + value
 
 
 def mc_returns(r: Rollout, gamma: float):
     """The discounted returns of the steps whose episode ends inside the rollout,
     which no value function enters (a truncated one's keeps its bootstrap) ->
-    (mask [T, N], returns [n])."""
+    (mask [T, N], returns [T, N]; of the other steps: the part of the return
+    inside the rollout)."""
     ends = r.done.flip(0).cummax(0).values.flip(0) > 0
     zero = torch.zeros_like(r.reward)
-    return ends, gae(r, zero[0], gamma, 1.0, zero)[1][ends]
+    return ends, gae(r, zero[0], gamma, 1.0, zero)[1]
 
 
 class EpisodeStats:
@@ -171,7 +178,6 @@ class EpisodeStats:
             self.total += 1
 
     def summary(self) -> dict:
-        """All of ``FIELDS`` (``None`` before the first fresh episode)."""
         out = dict.fromkeys(self.FIELDS)
         out.update(episodes=self.total, snapshot_episodes=self.snapshot_eps, truncated=self.truncated)
         if not self.eps:
@@ -217,11 +223,16 @@ LOG_FIELDS = [
 # Kept only by ending in this rollout, so read them as critic vs head: both
 # biases carry the same offset, and the first updates after a start are void.
 CRITIC_FIELDS = ["critic_ev", "value_ev", "critic_bias", "value_bias"]
+# With env.order_label_rate, of the rollout's labelled played hands and the policy that played them: how many had a
+# gaining single joker move and how many had none; on the former, the median lead of the labelled moves' logit over
+# the best other op and the share where greedy play makes a labelled move to one of its slots; on the latter, the
+# mean probability of moving a joker.
+ORDER_FIELDS = ["order_pos", "order_zero", "order_lead", "order_hit", "order_stray"]
+EXPLORE_FIELDS = ["explored", "x_adv", "x_pos"]
+ORDER_CLIP = 0.5  # the ordering loss's own gradient-norm clip
 
 
 def _log_writer(f, path: Path, fields: list[str] = LOG_FIELDS) -> csv.DictWriter:
-    """A writer of ``fields`` rows appending to ``path`` (whose header, if
-    any, must match)."""
     if path.stat().st_size:
         with open(path, newline="") as r:
             header = next(csv.reader(r), [])
@@ -248,6 +259,52 @@ def _mean(v: list[float]) -> float:
     return float(np.mean(v)) if v else float("nan")
 
 
+def order_log(model: Net, roll: Rollout, batch: int) -> dict:
+    """``ORDER_FIELDS`` of a rollout (one pass without gradients over its labelled states, ``batch`` at a time)."""
+    kind, bits = roll.aux_kind.flatten(), roll.aux_dest.flatten(0, 1)
+    nt, no = roll.n_tokens.flatten(), roll.n_ops.flatten()
+    lead, hit, stray = [], [], []
+    with torch.no_grad():
+        labelled = (kind >= 0).nonzero().squeeze(1)
+        for idx in labelled.split(batch) if len(labelled) else ():
+            n_tok, n_op = int(nt[idx].max()), int(no[idx].max())
+            _loss, ld, ht, pm = model.order_aux(roll.obs(idx, None, n_tok, n_op), bits[idx], n_tok, n_op)
+            pos = kind[idx] == 1
+            lead.append(ld[pos])
+            hit.append(ht[pos].float())
+            stray.append(pm[~pos])
+    lead, hit, stray = (torch.cat(v) if v else torch.zeros(0) for v in (lead, hit, stray))
+    stat = lambda v, f: float(f(v)) if len(v) else math.nan  # noqa: E731
+    return {
+        "order_pos": int((kind == 1).sum()),
+        "order_zero": int((kind == 0).sum()),
+        "order_lead": stat(lead, torch.median),
+        "order_hit": stat(hit, torch.mean),
+        "order_stray": stat(stray, torch.mean),
+    }
+
+
+def add_order_grad(model: Net, parts: list, coef: float) -> None:
+    """``ppo.aux_order``: adds the gradient of the ordering loss (``Net.order_aux``) to ``.grad``, clipped to
+    ``ORDER_CLIP`` on its own. Only the order-gain input column of ``op_feat`` and the destination head receive
+    it. ``parts``: the states of a minibatch whose labels have a gaining move, per chunk (observations, destination
+    bits, their rows of the chunk's ``Net.encode`` output or None to encode them here); the loss is their mean."""
+    n = sum(len(bits) for _o, bits, _enc in parts)
+    if not n:
+        return
+    loss = coef * sum(model.order_aux(o, bits, enc=enc)[0].sum() for o, bits, enc in parts if len(bits)) / n
+    if not torch.isfinite(loss):
+        raise FloatingPointError("non-finite ordering loss")
+    params = [model.op_feat.weight, *model.dst_q.parameters(), *model.dst_k.parameters(), *model.dst_pos.parameters()]
+    grads = list(torch.autograd.grad(loss, params))
+    column = torch.zeros_like(grads[0])
+    column[:, GAIN] = grads[0][:, GAIN]
+    grads[0] = column
+    scale = (ORDER_CLIP / (torch.sqrt(sum((g * g).sum() for g in grads)) + 1e-6)).clamp(max=1.0)
+    for p, g in zip(params, grads):
+        p.grad.add_(g * scale)
+
+
 def train(cfg: Config, resume: str | None = None, max_updates: int | None = None) -> dict:
     """Trains (or resumes, from a checkpoint path) until ``ppo.total_steps``
     or ``max_updates`` more updates; returns the last log row."""
@@ -267,12 +324,17 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
     log_path.touch()
 
     torch.manual_seed(cfg.env.seed)
-    model = Net(cfg.model).to(device)
+    model = Net(cfg.model, ck["model"].get("fx") if ck is not None else None).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.ppo.lr, weight_decay=cfg.ppo.weight_decay, eps=1e-5)
-    critic = None  # not compiled: it would share (and fill) the policy encoder's Dynamo cache
+    critic = learner = None  # not compiled: it would share (and fill) the policy encoder's Dynamo cache
     if cfg.ppo.critic:  # built before a resumed RNG state is restored (its init draws from it)
-        critic = Critic(cfg.model).to(device).eval().requires_grad_(False)
-        critic.load_state_dict(ck["critic"] if ck is not None and "critic" in ck else critic_state(cfg.ppo.critic))
+        state = ck["critic"] if ck is not None and "critic" in ck else critic_state(cfg.ppo.critic)
+        critic = Critic(cfg.model, state.get("fx")).to(device).eval().requires_grad_(False)
+        critic.load_state_dict(state)
+        if cfg.ppo.critic_learn:  # copied before the float16 cast below
+            learner = Learner(critic)
+            if ck is not None and "critic_learner" in ck:
+                learner.load(ck["critic_learner"])
         if device.type == "cuda":
             critic.encoder.half()  # ~4x faster, values within ~1e-3 (its inputs are float16-rounded already)
     start_update, steps = 0, 0
@@ -300,15 +362,17 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
             extra["cuda_rng"] = torch.cuda.get_rng_state_all()
         if critic is not None:
             extra["critic"] = critic.state_dict()
+        if learner is not None:
+            extra["critic_learner"] = learner.state()
         save_checkpoint(run_dir / "last.pt", model, opt, cfg, update, steps, extra)
 
     def value_of(o: Obs) -> torch.Tensor:
-        """The advantages' value function: the critic's, else the policy's value head."""
         if critic is not None:
             return critic.value(o).float()
         cls, _tok, _ope, _lg = model.encode(o)
         return model.value(cls).squeeze(-1).float()
 
+    explore = (cfg.ppo.explore_redeem, cfg.ppo.explore_buy)
     fast = cfg.ppo.fast_rollout
     if fast and (device.type != "cuda" or amp):
         raise ValueError("ppo.fast_rollout needs a CUDA device and ppo.amp=false")
@@ -323,7 +387,8 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
     stats = EpisodeStats()
     B = N * T
     mb = B // cfg.ppo.minibatches
-    fields = LOG_FIELDS + (CRITIC_FIELDS if critic is not None else [])
+    labels = cfg.env.order_label_rate > 0
+    fields = LOG_FIELDS + (CRITIC_FIELDS if critic is not None else []) + (Learner.FIELDS if learner is not None else []) + (ORDER_FIELDS if labels else []) + (EXPLORE_FIELDS if any(explore) else [])
     print(f"[antezero] device={device} params={count_params(model):,} envs={N} rollout={T} updates={start_update}..{stop_at} of {n_updates}", flush=True)
 
     last: dict = {}
@@ -337,12 +402,17 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
             for g in opt.param_groups:
                 g["lr"] = lr
             top_stake = max(cfg.env.stakes)
-            # ------------------------------------------------------ rollout
             model.eval()
+            cells: dict[str, list[int]] = {}  # this update's fresh episodes per deck/stake: [won, played]
 
             def on_episodes(new_eps):
                 stats.add(new_eps)
                 top.extend(bool(x[5]) for x in new_eps if not x[10] and x[3] == top_stake)
+                for x in new_eps:
+                    if not x[10]:
+                        c = cells.setdefault(f"{x[2]}/{x[3]}", [0, 0])
+                        c[0] += bool(x[5])
+                        c[1] += 1
 
             if fast:
                 env.collect(roll, on_episodes)
@@ -350,7 +420,7 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                 o = obs_from_numpy(env, device)
                 roll.put_obs(t, o)
                 with autocast():
-                    out = model.act(o, explore=cfg.ppo.explore_redeem)
+                    out = model.act(o, explore=explore)
                 roll.op[t] = out["op"]
                 roll.card_seq[t] = out["card_seq"]
                 roll.dest[t] = out["dest"]
@@ -372,6 +442,8 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                     rew[torch.as_tensor(rows, device=device)] += cfg.ppo.gamma * v_fin
                 roll.reward[t] = rew
                 roll.done[t] = torch.as_tensor(done, device=device, dtype=torch.float32)
+                roll.aux_kind[t] = torch.as_tensor(np.asarray(env.aux_kind), device=device)
+                roll.aux_dest[t] = torch.as_tensor(np.asarray(env.aux_dest), device=device)
                 on_episodes(env.pop_episodes())
             with torch.no_grad(), autocast():
                 vals = []
@@ -401,27 +473,38 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                             roll.value[tt, nn_] = v.float()
                         if sweep:
                             c_val[tt, nn_] = critic.value(o, lens[k][0]).float()
-            adv, ret = gae(roll, last_value, cfg.ppo.gamma, cfg.ppo.gae_lambda, c_val)
+            adv, ret = gae(roll, last_value, cfg.ppo.gamma, cfg.ppo.gae_lambda, c_val, roll.explored)
             c_log = {}
             if critic is not None:
                 # Graded on value-free targets: the critic's own lambda-returns would favour it (staleness).
-                ends, mc = mc_returns(roll, cfg.ppo.gamma)
+                ends, part = mc_returns(roll, cfg.ppo.gamma)
+                mc = part[ends]
                 for k, v in (("critic", c_val), ("value", roll.value)):
                     e = v[ends] - mc
                     c_log[f"{k}_ev"], c_log[f"{k}_bias"] = (float(1 - e.var() / mc.var()), float(e.mean())) if len(mc) > 1 else (math.nan, math.nan)
+                if learner is not None:
+                    c_log.update(learner.step(roll, ends, part, (c_val, roll.value), cfg.ppo.gamma, cfg.env.r_win))
+                    if cfg.ppo.critic_learn == 2:  # the fitted copy values the next rollout
+                        if not all(bool(torch.isfinite(p).all()) for p in learner.net.parameters()):
+                            raise FloatingPointError("the online critic's weights are not finite")
+                        critic.load_state_dict(learner.net.state_dict())
             x_log = ""
-            if cfg.ppo.explore_redeem:  # explored redeems: count, mean normalised advantage (biased low until V knows vouchers)
-                x_adv = ((adv[roll.explored] - adv.mean()) / adv.std()).mean()
-                x_log = f" explored={int(roll.explored.sum())} x_adv={float(x_adv):+.3f}"
+            if any(explore):  # explored steps: count, mean normalised advantage, share better than expected
+                xa = (adv[roll.explored] - adv.mean()) / adv.std()
+                c_log.update(explored=int(roll.explored.sum()), x_adv=float(xa.mean()) if len(xa) else 0.0, x_pos=float((xa > 0).float().mean()) if len(xa) else 0.0)
+                x_log = f" explored={c_log['explored']} x_adv={c_log['x_adv']:+.3f} x_pos={c_log['x_pos']:.2f}"
+            if labels:
+                c_log.update(order_log(model, roll, mb // cfg.ppo.grad_accum))
             t_roll = time.perf_counter() - t0
             steps += B
 
-            # ------------------------------------------------------- update
             model.train()
             flat_adv, flat_ret = adv.flatten(), ret.flatten()
             flat_logp, flat_val, flat_x = roll.logp.flatten(), roll.value.flatten(), roll.explored.flatten()
             flat_nt, flat_no = roll.n_tokens.flatten().long(), roll.n_ops.flatten().long()
-            flat_sure = roll.sure.flatten().masked_fill(flat_x, -torch.inf)  # forced redeems are always trained on
+            flat_kind, flat_bits = roll.aux_kind.flatten(), roll.aux_dest.flatten(0, 1)
+            # Forced redeems and the hands a joker move would have gained on are always trained on.
+            flat_sure = roll.sure.flatten().masked_fill(flat_x | (flat_kind == 1), -torch.inf)
             A = cfg.ppo.grad_accum
             kb = max(A, int(mb * cfg.ppo.learn_frac) // A * A)  # samples of a minibatch that are trained on
             kept = kb / mb
@@ -441,13 +524,18 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                     idx = perm[k * kb : (k + 1) * kb]
                     a_mean, a_std = flat_adv[full[k]].mean(), flat_adv[full[k]].std() + 1e-8
                     opt.zero_grad(set_to_none=True)
-                    parts = []
+                    parts, gaining = [], []
                     finite = torch.ones((), dtype=torch.bool, device=device)
                     # Equal chunks of means: their summed gradients equal the whole minibatch's.
                     for c, c_cpu, (n_tok, n_op) in zip(idx.chunk(A), perm_cpu[k * kb : (k + 1) * kb].chunk(A), lens[k]):
                         o = roll.obs(c, c_cpu, n_tok, n_op)
                         with autocast():
-                            logp, ent, val = model.evaluate(o, flat_op[c], flat_seq[c], flat_dest[c], n_tok, n_op)
+                            enc = model.encode(o, n_tok, n_op)
+                            logp, ent, val = model.evaluate(o, flat_op[c], flat_seq[c], flat_dest[c], n_tok, n_op, enc)
+                        if cfg.ppo.aux_order:  # the ordering loss reads this pass's encodings of its states
+                            g = (flat_kind[c] == 1).nonzero().squeeze(1)
+                            if len(g):
+                                gaining.append((Obs(**{f: getattr(o, f)[g] for f in Obs.__dataclass_fields__}), flat_bits[c][g], tuple(x[g].detach() for x in enc[:3])))
                         logp, ent, val = logp.float(), ent.float(), val.float()
                         x = flat_x[c]
                         with torch.no_grad():
@@ -456,11 +544,16 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                             kl_terms = ((lr_.exp() - 1) - lr_)[~x]
                             kl = kl_terms.mean() if kl_terms.numel() else lr_.new_zeros(())
                         a = (flat_adv[c] - a_mean) / a_std
-                        ratio = (logp - flat_logp[c]).exp()
+                        drift = logp - flat_logp[c]
+                        # An explored step's old probability is ~0, so its ratio can overflow: it stays out of the
+                        # exponential, whose gradient would be NaN even through the branch `where` does not select.
+                        ratio = drift.masked_fill(x, 0.0).exp()
                         clipped = ratio.clamp(1 - cfg.ppo.clip, 1 + cfg.ppo.clip) * a
-                        # Explored redeems: no importance weight (it would be ~0), and no unclipped side
-                        # (shared weights carry their ratios far outside the band, which would amplify them).
-                        surr = torch.where(x, cfg.ppo.explore_weight * clipped, torch.min(ratio * a, clipped))
+                        # Explored steps: no importance weight (it would be ~0). Their log-probability moves with the
+                        # sign of the advantage, by at most the clip per update either way (a one-sided term would
+                        # raise every tried action whose returns are noisy).
+                        tried = cfg.ppo.explore_weight * drift.clamp(-cfg.ppo.clip, cfg.ppo.clip) * a
+                        surr = torch.where(x, tried, torch.min(ratio * a, clipped))
                         pl = -surr.mean()
                         if cfg.ppo.value_clip > 0:
                             v_old = flat_val[c]
@@ -479,10 +572,12 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                     if not finite:
                         raise FloatingPointError(f"non-finite loss at update {update + 1}")
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.ppo.max_grad_norm)
+                    if cfg.ppo.aux_order:
+                        add_order_grad(model, gaining, cfg.ppo.aux_order)
                     opt.step()
                     for v, s in zip((kls, clipfracs, pls, vls, ents), torch.stack(parts).mean(0).tolist()):
                         v.append(s)
-                # Judged per epoch: one noisy minibatch no longer cuts the update short.
+                # Judged per epoch, so one noisy minibatch does not cut the update short.
                 if cfg.ppo.target_kl and _mean(kls[-cfg.ppo.minibatches :]) > 1.5 * cfg.ppo.target_kl:
                     break
             dt = time.perf_counter() - t0
@@ -508,6 +603,9 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
             last = row
             log_w.writerow(row)
             log_f.flush()
+            if len(set(cfg.env.backs)) * len(cfg.env.stakes) > 1:
+                with open(run_dir / "cells.jsonl", "a") as f:
+                    f.write(json.dumps({"update": update + 1, **cells}) + "\n")
             if cfg.log_every and (update + 1) % cfg.log_every == 0:
                 s = row
                 num = lambda k, spec: "-" if s[k] is None else format(s[k], spec)  # noqa: E731

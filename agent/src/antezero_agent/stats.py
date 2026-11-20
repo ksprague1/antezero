@@ -1,5 +1,3 @@
-"""Small statistics helpers shared by training and evaluation."""
-
 from __future__ import annotations
 
 import math

@@ -43,39 +43,38 @@ def _shapes(n: int) -> dict[str, tuple[int, ...]]:
 
 
 class _Upload:
-    """Pinned staging and fixed device buffers for one env's observation (its first T
-    tokens). The device buffers are rewritten every step; stream order protects their
-    readers, and the action copy-back syncs every step before the staging is reused."""
+    """The device buffers are rewritten for every chunk; stream order protects their readers,
+    and the action copy-back syncs every step before the pinned stagings are reused."""
 
-    def __init__(self, n: int, device):
-        self.n = n
-        self.h, self.d = {}, {}
+    def __init__(self, n: int, device, floor: int = MAX_HAND, chunks: int = 1):
+        """``floor``: the fewest token slots sent (32, as the plain loop's encoder runs, keeps acting bitwise equal to it)."""
+        self.n, self.floor = n, floor
+        self.h, self.d = [{} for _ in range(chunks)], {}
         for k, s in _shapes(n).items():
             dt = torch.int32 if k in _INT32 else torch.float32
-            self.h[k] = torch.empty(int(np.prod(s)), dtype=dt, pin_memory=True)
+            for h in self.h:
+                h[k] = torch.empty(int(np.prod(s)), dtype=dt, pin_memory=True)
             self.d[k] = torch.empty(int(np.prod(s)), dtype=dt, device=device)
 
-    def __call__(self, env: az.VecEnv) -> int:
-        """Uploads ``env``'s observation; returns its max token count."""
-        t_max = int(np.asarray(env.n_tokens).max())
-        T = max(t_max, MAX_HAND, 1)
+    def __call__(self, env: az.VecEnv, rows=slice(None), c: int = 0) -> int:
+        t_max = int(np.asarray(env.n_tokens)[rows].max())
+        T = max(t_max, self.floor)
         for k in self.d:
             src = np.asarray(getattr(env, k))
             if k in ("tok_i", "tok_f"):
                 src = src[:, :T]
-            hv = self.h[k][: src.size].view(src.shape)
+            src = src[rows]
+            hv = self.h[c][k][: src.size].view(src.shape)
             np.copyto(hv.numpy(), src)
             self.d[k][: src.size].view(src.shape).copy_(hv, non_blocking=True)
         return t_max
 
-    def views(self, t_max: int, host: bool = False) -> dict[str, torch.Tensor]:
-        """The last upload (int32 / float32, T tokens): its device buffers, or (``host``) its pinned staging."""
-        T = max(t_max, MAX_HAND, 1)
-        buf = self.h if host else self.d
+    def views(self, t_max: int) -> dict[str, torch.Tensor]:
+        T = max(t_max, self.floor)
         out = {}
         for k, s in _shapes(self.n).items():
             s = (s[0], T, s[2]) if k in ("tok_i", "tok_f") else s
-            out[k] = buf[k][: int(np.prod(s))].view(s)
+            out[k] = self.d[k][: int(np.prod(s))].view(s)
         return out
 
 
@@ -84,13 +83,10 @@ def _obs(v: dict[str, torch.Tensor]) -> Obs:
 
 
 class _GraphAct:
-    """``Net.act`` (sampling) on an ``_Upload``'s buffers, replayed from CUDA graphs:
-    one per padded token count, captured on first use into a shared memory pool."""
-
-    def __init__(self, model: Net, up: _Upload, explore: float, critic=None):
+    def __init__(self, model: Net, up: _Upload, explore: tuple[float, ...], critic=None):
         self.m, self.up, self.explore, self.critic = model, up, explore, critic
         dev = up.d["tok_f"].device
-        self.spec = noise_shapes(up.n, explore)
+        self.spec = noise_shapes(up.n, *explore)
         self.qs = [torch.empty(s, device=dev) for s, _ in self.spec]
         self.graphs: dict[int, tuple[torch.cuda.CUDAGraph, dict]] = {}
         self.pool = torch.cuda.graph_pool_handle()
@@ -105,7 +101,7 @@ class _GraphAct:
         return out
 
     def __call__(self, t_max: int) -> dict:
-        T = max(t_max, MAX_HAND, 1)  # graphs depend on the padded count only
+        T = max(t_max, self.up.floor)  # graphs depend on the padded count only
         if T not in self.graphs:
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -125,9 +121,6 @@ class _GraphAct:
 
 
 class Collector:
-    """Fills a ``Rollout`` with ``T`` steps of ``cfg.env.num_envs`` games, like train.py's
-    loop (see the module docstring for ``mode``)."""
-
     def __init__(self, cfg: Config, model: Net, device, seed: int, mode: int, value_of, critic=None):
         """``value_of(obs) -> [B]``: the value truncated episodes bootstrap from. ``critic``: a frozen
         critic whose value of every state is stored with the rollout (``roll.c_val``)."""
@@ -139,12 +132,16 @@ class Collector:
         nb = N // halves
         self.parts = [slice(h * nb, (h + 1) * nb) for h in range(halves)]
         self.envs = [make_env(cfg, seed=seed + 7_000_001 * h, num_envs=nb) for h in range(halves)]
-        self.up = _Upload(nb, device)
-        self.act = _GraphAct(model, self.up, cfg.ppo.explore_redeem, critic)
-        self.acts = [torch.empty(3, nb, dtype=torch.int32, pin_memory=True) for _ in self.parts]
+        self.chunk = nb // cfg.ppo.act_chunks  # envs per policy batch (ppo.act_chunks)
+        self.up = _Upload(self.chunk, device, MAX_HAND if cfg.ppo.act_chunks == 1 else 1, cfg.ppo.act_chunks)
+        self.act = _GraphAct(model, self.up, (cfg.ppo.explore_redeem, cfg.ppo.explore_buy), critic)
+        self.a = torch.empty(3, nb, dtype=torch.int32, pin_memory=True)  # a half's actions, in the order they were picked
+        self.acts = [np.empty((3, nb), np.int32) for _ in self.parts]  # per half: one steps while the other is picked for
         T = cfg.ppo.rollout_len
         self.rew = torch.empty(T, N, dtype=torch.float32, pin_memory=True)
         self.done = torch.empty(T, N, dtype=torch.float32, pin_memory=True)
+        self.aux_kind = torch.empty(T, N, dtype=torch.int8, pin_memory=True)
+        self.aux_dest = torch.empty(T, N, az.ORDER_JOKERS, dtype=torch.uint8, pin_memory=True)
         self.pool = ThreadPoolExecutor(1) if halves > 1 else None
         self.roll, self.width = None, {}  # the rollout being filled; token slots last written per (step, half)
 
@@ -155,39 +152,55 @@ class Collector:
         return [obs_from_numpy(e, self.dev) for e in self.envs]
 
     def _pick(self, roll, t: int, h: int):
-        """Uploads half ``h``'s observation, stores it and the sampled actions at step ``t``."""
-        sl, env = self.parts[h], self.envs[h]
-        t_max = self.up(env)
-        out = self.act(t_max)
-        a = self.acts[h]
-        a.copy_(out["acts"], non_blocking=True)
-        # Rows in host memory (ppo.rollout_obs_on_cpu) are copied from the pinned staging, on the CPU while the GPU picks.
-        v, hv = self.up.views(t_max), self.up.views(t_max, host=True)
-        T = v["tok_i"].shape[1]
+        sl, env, a, m = self.parts[h], self.envs[h], self.acts[h], self.chunk
         if roll is not self.roll:
             self.roll, self.width = roll, {}
         W = self.width.get((t, h), az.MAX_TOKENS)  # the slots past the last write here are already zero
-        self.width[t, h] = T
-        for k in ("tok_i", "tok_f", "glob_i", "glob_f", "ops", "ops_f", "n_ops", "n_tokens", "n_hand"):
-            x = getattr(roll, k)[t, sl]
-            src = (hv if x.is_cpu else v)[k]
-            if k in ("tok_i", "tok_f"):
-                x[:, :T], x[:, T:W] = src, 0  # zeros past T: what the simulator writes there
-            else:
+        keys = ("tok_i", "tok_f", "glob_i", "glob_f", "ops", "ops_f", "n_ops", "n_tokens", "n_hand")
+        # ppo.act_chunks: the envs by token count, so that each batch pads to its own longest state. Every chunk is
+        # queued behind the last one (its own staging; stream order shares the device buffers and the graphs' outputs).
+        order = np.argsort(np.asarray(env.n_tokens), kind="stable") if m < a.shape[1] else None
+        idx = None if order is None else torch.from_numpy(order).to(self.dev)
+        for c in range(a.shape[1] // m):
+            rows, i = (slice(None), slice(None)) if order is None else (order[c * m : (c + 1) * m], idx[c * m : (c + 1) * m])
+            t_max = self.up(env, rows, c)
+            out = self.act(t_max)
+            self.a[:, c * m : (c + 1) * m].copy_(out["acts"], non_blocking=True)
+            v = self.up.views(t_max)
+            T = v["tok_i"].shape[1]
+            for k in keys:
+                x = getattr(roll, k)[t, sl]
+                if x.is_cpu:
+                    continue
+                src = v[k].to(x.dtype)  # indexed writes do not convert
+                if k in ("tok_i", "tok_f"):
+                    x[i, :T], x[i, T:W] = src, 0  # zeros past T: what the simulator writes there
+                else:
+                    x[i] = src
+            roll.op[t, sl][i], roll.card_seq[t, sl][i], roll.dest[t, sl][i] = out["op"], out["card_seq"], out["dest"]
+            roll.explored[t, sl][i], roll.logp[t, sl][i], roll.value[t, sl][i] = out["explored"], out["logp"].float(), out["value"].float()
+            roll.sure[t, sl][i] = out["sure"].float()
+            if "c_val" in out:
+                roll.c_val[t, sl][i] = out["c_val"]
+        # Rows in host memory (ppo.rollout_obs_on_cpu): straight from the simulator's arrays, on the CPU while the GPU picks.
+        for k in keys:  # T: the last chunk's, the longest
+            x, src = getattr(roll, k)[t, sl], torch.from_numpy(np.asarray(getattr(env, k)))
+            if x.is_cpu and k in ("tok_i", "tok_f"):
+                x[:, :T], x[:, T:W] = src[:, :T], 0
+            elif x.is_cpu:
                 x.copy_(src)
-        roll.op[t, sl], roll.card_seq[t, sl], roll.dest[t, sl] = out["op"], out["card_seq"], out["dest"]
-        roll.explored[t, sl], roll.logp[t, sl], roll.value[t, sl] = out["explored"], out["logp"].float(), out["value"].float()
-        roll.sure[t, sl] = out["sure"].float()
-        if "c_val" in out:
-            roll.c_val[t, sl] = out["c_val"]
+        self.width[t, h] = T
         torch.cuda.current_stream().synchronize()
-        return a[0].numpy(), a[1].numpy().view(np.uint32), a[2].numpy()
+        a[:, slice(None) if order is None else order] = self.a.numpy()
+        return a[0], a[1].view(np.uint32), a[2]
 
     def _store(self, t: int, h: int, res, boot: list, on_episodes) -> None:
         rew, done, trunc = res
         sl, env = self.parts[h], self.envs[h]
         self.rew[t, sl] = torch.from_numpy(rew)
         self.done[t, sl] = torch.from_numpy(done.astype(np.float32))
+        self.aux_kind[t, sl] = torch.from_numpy(np.asarray(env.aux_kind))
+        self.aux_dest[t, sl] = torch.from_numpy(np.asarray(env.aux_dest))
         if trunc.any():
             # Not a real end: bootstrap from the final state's value (added after the upload).
             rows = np.flatnonzero(trunc)
@@ -196,7 +209,6 @@ class Collector:
 
     @torch.no_grad()
     def collect(self, roll, on_episodes) -> None:
-        """Steps every env ``roll.T`` times; ``on_episodes(list)`` gets the finished episodes."""
         gamma, boot = self.cfg.ppo.gamma, []
         futs = [None] * len(self.parts)
         for t in range(roll.T):
@@ -213,6 +225,8 @@ class Collector:
                 self._store(roll.T - 1, h, f.result(), boot, on_episodes)
         roll.reward.copy_(self.rew, non_blocking=True)
         roll.done.copy_(self.done, non_blocking=True)
+        roll.aux_kind.copy_(self.aux_kind, non_blocking=True)
+        roll.aux_dest.copy_(self.aux_dest, non_blocking=True)
         for t, rows, v_fin in boot:
             roll.reward[t, torch.as_tensor(rows, device=self.dev)] += gamma * v_fin
         torch.cuda.current_stream().synchronize()  # the pinned buffers are rewritten next rollout

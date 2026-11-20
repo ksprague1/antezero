@@ -21,7 +21,6 @@ def tiny():
 
 
 def round_states(n=12):
-    """Round states from a few games of the tiny policy."""
     cfg = preset("smoke")
     env = make_env(cfg, num_envs=8, seed=11)
     m, out = tiny(), []
@@ -92,7 +91,6 @@ def test_eval_round_search_counts_every_game_once():
 
 
 def scripted(g):
-    """Best scored play, else progress, opening the first booster it can."""
     if g.phase == "round":
         d = g.encode(8)
         n = int(d["n_ops"])
@@ -173,7 +171,8 @@ def test_endgame_search_weighs_a_boss_reroll(monkeypatch):
     assert rs.endgame_at(g, "select_blind") and not rs.endgame_at(g, "move_joker 0 1")
     seen = []
     rec = rs.run([rs.play(g.clone(), 0, watch=lambda g, n, d, a, greedy, code, info: seen.append((g.phase, info, code)))])[0]
-    assert rec["illegal"] == 0 and rec["eg_gated"] >= 1 and seen[0][0] == "blind_select" and seen[0][1] is not None
+    first = next(s for s in seen if not s[2].startswith("move_joker"))  # the tiny policy may reorder its jokers first
+    assert rec["illegal"] == 0 and rec["eg_gated"] >= 1 and first[0] == "blind_select" and first[1] is not None
     assert "reroll_boss" in rs.run([_ops(rs, g)])[0]
 
 

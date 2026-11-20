@@ -6,7 +6,7 @@ import torch
 
 from antezero_agent import train as train_mod
 from antezero_agent.config import ModelConfig, preset
-from antezero_agent.critic import N_BINS, V_MAX, V_MIN, Critic, critic_state
+from antezero_agent.critic import N_BINS, V_MAX, V_MIN, Critic, Learner, critic_state
 from antezero_agent.model import obs_from_numpy
 from antezero_agent.runtime import make_env, read_checkpoint
 from antezero_agent.train import CRITIC_FIELDS, LOG_FIELDS, Rollout, mc_returns, train
@@ -30,7 +30,6 @@ def test_critic_value():
     o = obs_from_numpy(make_env(preset("smoke"), num_envs=4, play_candidates=4))
     v = c.value(o)
     assert v.shape == (4,) and ((v > V_MIN) & (v < V_MAX)).all() and c.v_head[-1].out_features == N_BINS
-    # Explicit token slots give the same values as the default (the longest list).
     assert torch.allclose(c.value(o, int(o.n_tokens.max())), v)
 
 
@@ -50,7 +49,7 @@ def test_critic_is_frozen_checkpointed_and_resumed(tmp_path):
     assert all(math.isfinite(row[k]) for k in CRITIC_FIELDS)
     ck_path = tmp_path / "smoke" / "last.pt"
     ck = read_checkpoint(ck_path)
-    assert all(torch.equal(ck["critic"][k], warm[k]) for k in warm)  # never trained
+    assert all(torch.equal(ck["critic"][k], warm[k]) for k in warm)
     assert critic_state(ck_path).keys() == warm.keys()  # a training checkpoint can start another run
     # A resumed run reads its own critic (the start path is not read again).
     cfg.ppo.critic = str(tmp_path / "missing.pt")
@@ -68,10 +67,10 @@ def test_critic_values_drive_the_advantages(tmp_path, monkeypatch):
     def run(c, name):
         seen = {}
 
-        def spy(r, last_value, gamma, lam, value=None):
+        def spy(r, last_value, gamma, lam, value=None, cut=None):
             if lam != 1.0:  # the advantages (mc_returns' pass has lambda 1)
                 seen.update(last=last_value.clone(), value=value.clone(), head=r.value.clone(), reward=r.reward.clone(), done=r.done.clone())
-            return real_gae(r, last_value, gamma, lam, value)
+            return real_gae(r, last_value, gamma, lam, value, cut)
 
         monkeypatch.setattr(train_mod, "gae", spy)
         monkeypatch.setattr(Critic, "value", lambda self, o, T=None: torch.full((o.batch,), c))
@@ -95,7 +94,69 @@ def test_mc_returns_are_value_free():
     ends, ret = mc_returns(r, 0.5)
     # Env 0 ends at step 1 (steps 0-1), env 1 at step 2 (steps 0-2); the steps after an end have no end in-window.
     assert ends.tolist() == [[True, True], [True, True], [False, True], [False, False]]
-    assert torch.allclose(ret, torch.tensor([1.25, 2.25, 0.5, 0.5, 1.0]))  # row-major: (t0 e0, t0 e1, t1 e0, t1 e1, t2 e1)
+    assert torch.allclose(ret[ends], torch.tensor([1.25, 2.25, 0.5, 0.5, 1.0]))  # row-major: (t0 e0, t0 e1, t1 e0, t1 e1, t2 e1)
+
+
+def test_learner_labels_each_state_with_its_episodes_return(monkeypatch):
+    """Every sampled state comes back once, when its episode ends, with the discounted return to that end and the
+    outcome, however many rollouts the episode spans."""
+    monkeypatch.setattr(Learner, "FRAC", 1.0)
+    torch.manual_seed(3)
+    T, N, K, gamma = 6, 3, 5, 0.9
+    done = (torch.rand(K * T, N) < 0.12).float()
+    win = torch.rand(K * T, N) < 0.5
+    reward = torch.where(done > 0, torch.where(win, 1.03, 0.02), 0.1 * torch.rand(K * T, N))
+    learner, got = Learner(Critic(ModelConfig(d_model=32, n_layers=1, n_heads=2))), {}
+    for k in range(K):
+        r = Rollout(T, N, torch.device("cpu"))
+        r.reward, r.done = reward[k * T : (k + 1) * T].clone(), done[k * T : (k + 1) * T].clone()
+        r.n_tokens[:] = 1
+        r.glob_f[..., 0] = torch.arange(k * T, (k + 1) * T)[:, None]  # the state's step and env, to recognise it by
+        r.glob_f[..., 1] = torch.arange(N)[None]
+        d = learner.collect(r, *mc_returns(r, gamma), (r.c_val, r.value), gamma, 1.0)
+        for g, n, G, w in zip(d["glob_f"][:, 0].tolist(), d["glob_f"][:, 1].tolist(), d["G"].tolist(), d["won"].tolist()):
+            assert (g, n) not in got
+            got[int(g), int(n)] = (G, w)
+    want = {}
+    for n in range(N):
+        for g in range(K * T):
+            end = next((j for j in range(g, K * T) if done[j, n] > 0), None)
+            if end is not None:
+                want[g, n] = (sum(gamma ** (j - g) * float(reward[j, n]) for j in range(g, end + 1)), bool(win[end, n]))
+    assert got.keys() == want.keys() and len(want) > 40
+    assert all(abs(got[k][0] - want[k][0]) < 1e-5 and got[k][1] == want[k][1] for k in want)
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+def test_critic_learns_during_training(tmp_path, mode, monkeypatch):
+    cfg = smoke_critic(tmp_path)
+    monkeypatch.setattr(Learner, "FRAC", 1.0)
+    cfg.ppo.critic_learn = mode
+    warm = critic_state(cfg.ppo.critic)
+    row = train(cfg, max_updates=1)
+    assert row["learn_states"] > 0 and all(math.isfinite(row[k]) for k in Learner.FIELDS)
+    ck = read_checkpoint(tmp_path / "smoke" / "last.pt")
+    learned = ck["critic_learner"]["model"]
+    assert any(not torch.equal(learned[k], warm[k]) for k in warm)
+    # Mode 1 only watches: the critic that values the rollouts stays the frozen one. Mode 2 hands it the copy's weights.
+    assert all(torch.equal(ck["critic"][k], warm[k] if mode == 1 else learned[k]) for k in warm)
+    assert train(cfg, resume=str(tmp_path / "smoke" / "last.pt"), max_updates=1)["learn_states"] > 0
+
+
+def test_a_broken_learner_never_values_a_rollout(tmp_path, monkeypatch):
+    cfg = smoke_critic(tmp_path)
+    cfg.ppo.critic_learn = 2
+    real = Learner.step
+
+    def step(self, *a):
+        out = real(self, *a)
+        with torch.no_grad():
+            next(self.net.parameters()).fill_(float("nan"))
+        return out
+
+    monkeypatch.setattr(Learner, "step", step)
+    with pytest.raises(FloatingPointError):
+        train(cfg, max_updates=1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ppo.fast_rollout needs CUDA")

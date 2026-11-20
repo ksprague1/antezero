@@ -114,7 +114,7 @@ def serve(a) -> None:
     critic = None
     ck = read_checkpoint(a.checkpoint)
     if "critic" in ck:
-        critic = Critic(cfg.model)
+        critic = Critic(cfg.model, ck["critic"].get("fx"))
         critic.load_state_dict(ck["critic"])
         critic.to(dev).eval()
     del ck
