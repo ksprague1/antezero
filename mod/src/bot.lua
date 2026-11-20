@@ -6,6 +6,9 @@
 -- oracle's conditions: seeded, everything unlocked, the fixed clock of
 -- core.lua. None of that is the player's: nothing is saved during the run,
 -- and their profile, unlocks and tutorial state are put back when it ends.
+-- With "Bot runs count" on, the profile (wins, losses, stats, stake
+-- progress) is kept and saved instead; unlocks and achievements still are
+-- not, since everything is unlocked while the bot plays.
 -- While the bot plays, input is limited to Esc, Run Info and Options, whose
 -- menus pause it.
 
@@ -26,15 +29,12 @@ local cfg = SMODS.current_mod.config
 
 local function now() return love.timer.getTime() end
 
-----------------------------------------------------------------------------
--- The player's state
-----------------------------------------------------------------------------
 local TABLES = function() return {G.P_CENTERS, G.P_BLINDS, G.P_TAGS, G.P_SEALS} end
 
 local function protect()
   if B.protected then return end
   local s = {flags = {}, locked = G.P_LOCKED, profile = copy_table(G.PROFILES[G.SETTINGS.profile]),
-             tutorial = {G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress}}
+             tutorial = {G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress}, count = cfg.count}
   for _, t in ipairs(TABLES()) do
     for _, v in pairs(t or {}) do
       if type(v) == 'table' then s.flags[v] = {v.unlocked, v.discovered, v.alerted} end
@@ -53,18 +53,27 @@ function B.release()
   local s = B.saved
   for v, f in pairs(s.flags) do v.unlocked, v.discovered, v.alerted = f[1], f[2], f[3] end
   G.P_LOCKED = s.locked
-  local live = G.PROFILES[G.SETTINGS.profile]
-  for k in pairs(live) do live[k] = nil end
-  for k, v in pairs(s.profile) do live[k] = v end
+  if not s.count then
+    local live = G.PROFILES[G.SETTINGS.profile]
+    for k in pairs(live) do live[k] = nil end
+    for k, v in pairs(s.profile) do live[k] = v end
+  end
   G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress = s.tutorial[1], s.tutorial[2]
   B.saved = nil
   AZB.guard_saves(false)
   B.protected = false
+  if s.count then
+    set_discover_tallies() -- the profile's collection score, counted while everything was discovered
+    G:save_progress()
+  end
 end
 
-----------------------------------------------------------------------------
--- The clock (core.lua's love.update)
-----------------------------------------------------------------------------
+local unlock_achievement_ = unlock_achievement
+function unlock_achievement(...)
+  if B.protected then return end
+  return unlock_achievement_(...)
+end
+
 function B.stepping()
   return B.protected and (B.active or B.pending) and not AZB.is_bridge()
 end
@@ -76,9 +85,6 @@ function B.steps(dt)
   return math.min(n, 16)
 end
 
-----------------------------------------------------------------------------
--- Starting a bot run
-----------------------------------------------------------------------------
 local rng
 local function random_seed()
   rng = rng or love.math.newRandomGenerator(os.time(), math.floor(now() * 1e6))
@@ -134,6 +140,8 @@ function Game:start_run(args)
   G.sort_id = 0
   G.playing_card = 0
   local r = start_run(self, args)
+  -- Vanilla records nothing for a seeded run; a seed the player typed stays seeded.
+  if B.saved.count and args.seed == B.auto_seed then G.GAME.seeded = false end
   B.runs = B.runs + 1
   B.run = {id = B.runs, seed = G.GAME.pseudorandom.seed, back = G.GAME.selected_back.effect.center.key, stake = G.GAME.stake}
   B.active, B.acc, B.seen, B.status, B.last, B.thinking, B.line = true, 0, now(), 'starting...', nil, nil, ''
@@ -162,9 +170,6 @@ end
 play_button('start_setup_run', function() return G.SETTINGS.current_setup == 'New Run' end)
 play_button('run_select_start_run', function() return true end)
 
-----------------------------------------------------------------------------
--- The toggle
-----------------------------------------------------------------------------
 local atlas = SMODS.Atlas({key = 'bot', path = 'bot.png', px = 16, py = 16})
 
 local function icon(size, cell)
@@ -175,7 +180,6 @@ end
 
 G.FUNCS.azb_toggle_bot = function() B.enabled = not B.enabled end
 
--- Off: dark with a grey bot. On: gold with a dark bot and a white edge.
 G.FUNCS.azb_bot_toggle = function(e)
   e.config.colour = B.enabled and G.C.GOLD or G.C.BLACK
   e.config.outline_colour = B.enabled and G.C.WHITE or G.C.UI.TEXT_INACTIVE
@@ -217,9 +221,6 @@ end
 with_toggle('can_start_run', function(e) return G.SETTINGS.current_setup == 'New Run' and e.config.button ~= nil end)
 with_toggle('run_select_can_change_page', function(e) return e.config.button == 'run_select_start_run' end)
 
-----------------------------------------------------------------------------
--- What the bot is doing (a strip at the top of the screen)
-----------------------------------------------------------------------------
 -- Built anew for every text: the game re-lays out a live text node only when
 -- its character count changes, which leaves the backdrop at the old width.
 function B.make_hud()
@@ -273,7 +274,6 @@ end
 
 function B.owns(id) return B.active and B.run ~= nil and B.run.id == id end
 
--- An action of the bot is about to be performed (endpoints.lua, az_act).
 function B.acting(a, note)
   local ok, text = pcall(describe, a)
   B.last = (ok and text or a.type) .. (note and note ~= '' and ('   ' .. note) or '')
@@ -300,9 +300,6 @@ function B.tick()
   end
 end
 
-----------------------------------------------------------------------------
--- Settings
-----------------------------------------------------------------------------
 local SPEEDS = {0.5, 1, 2, 4, 8, 16}
 
 G.FUNCS.azb_bot_speed = function(args) cfg.speed = SPEEDS[args.to_key] end
@@ -315,13 +312,12 @@ SMODS.current_mod.config_tab = function()
   end
   return {n = G.UIT.ROOT, config = {align = 'cm', padding = 0.1, colour = G.C.CLEAR}, nodes = {
     create_toggle({label = 'Search (stronger, pauses to think)', ref_table = cfg, ref_value = 'search'}),
+    create_toggle({label = 'Bot runs count', ref_table = cfg, ref_value = 'count',
+                   info = {'Wins, losses, stats and stake progress are saved', 'to your profile (not unlocks or achievements)'}}),
     create_option_cycle({label = 'Bot speed', scale = 0.8, options = names, opt_callback = 'azb_bot_speed', current_option = at}),
   }}
 end
 
-----------------------------------------------------------------------------
--- Input while the bot plays
-----------------------------------------------------------------------------
 local function locked() return B.active and not G.OVERLAY_MENU and not G.SETTINGS.paused end
 
 local function allowed(node)
@@ -357,9 +353,6 @@ function Controller:button_press(button)
   return button_press(self, button)
 end
 
-----------------------------------------------------------------------------
--- The agent's side
-----------------------------------------------------------------------------
 AZB.rpc.register({
   name = 'az_bot',
   description = "The bot run to play, if any; `status` is shown while it plays, `stop` ends the bot's part with that text",

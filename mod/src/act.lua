@@ -1,4 +1,4 @@
--- Runs, actions and injections: ports of H.start / H.act / H.inject from
+-- Ports of H.start / H.act / H.inject from
 -- sim/oracle/lua/harness.lua (same game entry points, same arguments, same
 -- timing protocol), with light precondition checks so that a bad request
 -- errors instead of wedging the game. Indices in action tables are 1-based,
@@ -43,7 +43,7 @@ function AZB.start(seed, back_key, stake)
   AZB.mark_action()
 end
 
-local S -- G.STATES, resolved lazily
+local S
 local function in_states(list)
   for _, s in ipairs(list) do
     if s == 'pack' then
@@ -80,7 +80,6 @@ function AZB.act_prepare(a)
   if k == 'skip_blind' and G.GAME.blind_on_deck ~= 'Small' and G.GAME.blind_on_deck ~= 'Big' then
     fail('cannot skip ' .. tostring(G.GAME.blind_on_deck))
   end
-  -- Index checks up front (nothing has been touched yet).
   if k == 'use' or k == 'sell_consumable' then area_card(G.consumeables, a.index)
   elseif k == 'sell_joker' then area_card(G.jokers, a.index)
   elseif k == 'buy' or k == 'buy_and_use' then area_card(G.shop_jokers, a.index)
@@ -99,7 +98,6 @@ function AZB.act_prepare(a)
   return false
 end
 
--- `use` without a `cards` field needs an extra unhighlight + settle.
 function AZB.act_needs_unhighlight(a)
   return a.type == 'use' and not a.cards
 end
@@ -110,7 +108,6 @@ function AZB.act_unhighlight()
   AZB.mark_action()
 end
 
--- Phase 2: rebase and press the button.
 function AZB.act_main(a)
   local k = a.type
   AZB.rebase()

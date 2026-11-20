@@ -145,7 +145,6 @@ function AZB.state_table()
   for k, v in pairs(g.pseudorandom) do
     if AZB.smods_only_rng(k) then extra_rng[k] = v else s.rng[k] = v end
   end
-  -- Bridge-only extras (ignored by canon::from_lua).
   s.az = {
     raw_state = AZB.state_name(G.STATE),
     booster = SMODS and SMODS.OPENED_BOOSTER and SMODS.OPENED_BOOSTER.config and SMODS.OPENED_BOOSTER.config.center_key or nil,

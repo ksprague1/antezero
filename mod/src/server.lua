@@ -1,5 +1,3 @@
--- The mod's JSON-RPC methods and where they are served.
---
 -- With BalatroBot loaded (the developer tools start the game with it) the
 -- methods are registered on its dispatcher. Without it, a normal game, this
 -- file serves the same protocol itself: JSON-RPC 2.0 over HTTP POST "/", one

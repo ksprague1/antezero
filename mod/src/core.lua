@@ -1,5 +1,3 @@
--- Config, profile/save guard, oracle-parity hooks and the settle monitor.
-
 local function env_flag(name, default)
   local v = os.getenv(name)
   if v == nil or v == "" then return default end
@@ -27,9 +25,6 @@ AZB.config = {
   quiet_frames = 3,
 }
 
-----------------------------------------------------------------------------
--- Sessions
-----------------------------------------------------------------------------
 -- Bridge session: the developer tools started the game with BalatroBot,
 -- whose settings fix the timestep for the whole process; saves are guarded
 -- and everything is unlocked from the start. In any other session the mod
@@ -38,9 +33,6 @@ AZB.config = {
 function AZB.is_bridge() return BB_SETTINGS ~= nil end
 function AZB.parity() return AZB.is_bridge() or (AZB.bot ~= nil and AZB.bot.protected) end
 
-----------------------------------------------------------------------------
--- Save guard
-----------------------------------------------------------------------------
 AZB.blocked_saves = {}
 
 local function guarding() return AZB.config.save_guard and AZB.parity() end
@@ -63,7 +55,6 @@ function AZB.install_save_guard()
   local real = G.SAVE_MANAGER and G.SAVE_MANAGER.channel
   if real and not AZB._real_save_channel then
     AZB._real_save_channel = real
-    -- Proxy: drop every save_* request, forward everything else ('kill').
     G.SAVE_MANAGER.channel = setmetatable({
       push = function(_, msg)
         local t = type(msg) == "table" and tostring(msg.type) or tostring(msg)
@@ -91,9 +82,6 @@ function AZB.install_save_guard()
   end
 end
 
-----------------------------------------------------------------------------
--- Oracle-parity hooks
-----------------------------------------------------------------------------
 function AZB.unlock_all()
   if not AZB.config.unlock_all then return end
   for _, t in ipairs({G.P_CENTERS, G.P_BLINDS, G.P_TAGS, G.P_SEALS}) do
@@ -301,9 +289,6 @@ if not AZB._used_hooked then
   end
 end
 
-----------------------------------------------------------------------------
--- State names
-----------------------------------------------------------------------------
 local state_names
 function AZB.state_name(s)
   if not state_names then
@@ -338,9 +323,7 @@ function AZB.is_pack_state(s)
     or s == S.BUFFOON_PACK or (S.SMODS_BOOSTER_OPENED ~= nil and s == S.SMODS_BOOSTER_OPENED)
 end
 
-----------------------------------------------------------------------------
--- Settle predicate (port of harness.lua blocking_pending/stable_state)
-----------------------------------------------------------------------------
+-- Settle predicate: ports of harness.lua blocking_pending/stable_state.
 function AZB.blocking_pending()
   local n = 0
   for _, ev in ipairs(G.E_MANAGER.queues.base) do
@@ -418,10 +401,6 @@ function AZB.diagnostics()
   }
 end
 
-----------------------------------------------------------------------------
--- Frame monitor: AZB.quiet counts consecutive quiet frames since the last
--- action. Waiters (deferred RPC responses) fire once quiet >= 3.
-----------------------------------------------------------------------------
 AZB.frame = 0
 AZB.quiet = 0
 AZB.skip_tick = false
@@ -448,7 +427,6 @@ end
 
 local function now() return love.timer.getTime() end
 
--- Queue `fn(ok, reason)` to run once the game settles (or times out).
 function AZB.when_settled(fn, timeout)
   AZB.waiters[#AZB.waiters + 1] = {fn = fn, deadline = now() + (timeout or 120), frames = 0}
 end

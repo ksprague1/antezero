@@ -95,8 +95,8 @@ local function can_use_with(c, m)
   return ok and res and true or false
 end
 
--- Port of Game::consumable_usable (area-independent parts are inside
--- can_use_consumeable itself).
+-- Port of consumable_usable in sim/src/actions.rs (area-independent parts
+-- are inside can_use_consumeable itself).
 local function usable_masks(c)
   local out = {}
   local key = c.config.center_key

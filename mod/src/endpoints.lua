@@ -1,6 +1,3 @@
--- The JSON-RPC methods (served by src/server.lua, or by BalatroBot with two
--- small robustness patches to its server).
-
 local R = AZB.rpc
 
 local function bad(send, msg)
@@ -12,7 +9,6 @@ local function err_text(e)
   return tostring(e)
 end
 
--- Respond with the state once settled (or a timeout report).
 local function respond_settled(send, timeout, extra)
   AZB.when_settled(function(ok, reason, frames)
     if reason == 'cancelled' then return send({message = 'the run ended', name = R.INVALID_STATE}) end
@@ -23,7 +19,6 @@ local function respond_settled(send, timeout, extra)
   end, timeout)
 end
 
--- Run `fn` on a settled game: immediately if already settled, else once it is.
 local function on_settled(send, timeout, fn)
   if AZB.is_settled() then return fn() end
   AZB.when_settled(function(ok)
@@ -117,7 +112,7 @@ local ENDPOINTS = {
         if not ok then return bad(send, err_text(e)) end
         finish()
       end
-      -- Run `step` once settled again (the harness's intermediate H.settle).
+      -- The harness's intermediate H.settle.
       local function after_settle(step)
         AZB.when_settled(function(ok)
           if ok then step() else
