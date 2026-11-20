@@ -545,6 +545,16 @@ def test_smoke_train_resume_and_run_protection(tmp_path):
         train(cfg, resume=str(ck), max_updates=1)
 
 
+def test_a_stop_file_ends_training_after_the_update(tmp_path):
+    cfg = preset("smoke")
+    cfg.run_dir, cfg.ppo.total_steps = str(tmp_path), 8 * 8 * 5
+    train(cfg, max_updates=1)
+    stop, ck = tmp_path / "smoke" / "STOP", tmp_path / "smoke" / "last.pt"
+    stop.touch()
+    assert train(cfg, resume=str(ck))["update"] == 2
+    assert not stop.exists() and read_checkpoint(ck)["update"] == 2
+
+
 def test_grad_accum_takes_the_same_steps(tmp_path):
     weights = []
     for accum in (1, 2, 4):  # 2, 4: chunks sorted by token count, each at its own lengths

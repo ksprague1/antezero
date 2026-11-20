@@ -12,7 +12,8 @@ the value of their final observation; only real game ends are terminal.
 
 A resumed run continues the model, optimizer, schedule, Torch RNG and stake
 curriculum; the environments restart on fresh seeds (their states are not
-saved).
+saved). A file named STOP in the run directory ends the run after the
+current update, with a checkpoint to resume from.
 """
 
 from __future__ import annotations
@@ -640,6 +641,9 @@ def train(cfg: Config, resume: str | None = None, max_updates: int | None = None
                 with open(run_dir / "eval.jsonl", "a") as f:
                     f.write(json.dumps({"update": completed, "steps": steps, **res}) + "\n")
                 print(f"[eval {completed}] {res['summary']}", flush=True)
+            if (run_dir / "STOP").exists():
+                (run_dir / "STOP").unlink()
+                break
         save(completed)
     return last
 
