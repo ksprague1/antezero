@@ -4,8 +4,8 @@ A Balatro agent: a bit-exact Rust simulator of the game (v1.0.1o), a
 transformer policy trained on it with PPO, and a mod that lets it play your
 real game.
 
-It was trained on Red Deck, White Stake only, where it wins about 91% of
-games without any search.
+It plays all 15 decks at all 8 stakes. Without any search it wins about 94%
+of games at White Stake and about 12% at Gold Stake.
 
 Not affiliated with LocalThunk or Playstack. You need your own copy of the
 game. The trained checkpoint is on the
@@ -22,13 +22,14 @@ releases page. A CUDA GPU is recommended.
 
 ```
 uv sync
-uv run python -m antezero_agent.bot --install antezero-v0.1.0.pt
+uv run python -m antezero_agent.bot --install antezero-v0.2.0.pt
 ```
 
 Then start Balatro, open New Run, switch on the bot toggle in the corner of
 the Play button, and press Play. Esc, Run Info and Options pause the bot.
-Bot runs never touch your saves, unlocks or stats. Search and the bot's speed
-are under Mods > AnteZero > Config.
+Bot runs leave your saves, unlocks and stats alone, unless you turn on "Bot
+runs count" (wins, losses, stats and stake progress are then kept). That
+setting, search and the bot's speed are under Mods > AnteZero > Config.
 
 ## Train and evaluate
 
@@ -46,29 +47,29 @@ uv run --with pytest pytest agent/tests bridge/tests -q
 
 ## Win rates
 
-Games won by the best checkpoint, playing its own choice with no search,
-over 1,024 games per cell (about ±3 points). Rows are decks, columns are
-stakes. Only the bold cell (Red Deck, White Stake) was trained on; the agent
-has never played any other deck or stake.
+Games won by the released checkpoint, playing its own choice with no search,
+over about 1,024 games per cell (about ±3 points; 122,880 games in all).
+Rows are decks, columns are stakes.
 
 <table>
 <tr><th rowspan="2">Deck</th><th colspan="8">Stake</th></tr>
 <tr><th>White</th><th>Red</th><th>Green</th><th>Black</th><th>Blue</th><th>Purple</th><th>Orange</th><th>Gold</th></tr>
-<tr><th>Red Deck</th><td align="right"><b>91%</b></td><td align="right">79%</td><td align="right">50%</td><td align="right">32%</td><td align="right">27%</td><td align="right">8%</td><td align="right">2%</td><td align="right">1%</td></tr>
-<tr><th>Blue Deck</th><td align="right">96%</td><td align="right">89%</td><td align="right">66%</td><td align="right">44%</td><td align="right">39%</td><td align="right">16%</td><td align="right">5%</td><td align="right">2%</td></tr>
-<tr><th>Yellow Deck</th><td align="right">92%</td><td align="right">82%</td><td align="right">57%</td><td align="right">44%</td><td align="right">31%</td><td align="right">10%</td><td align="right">3%</td><td align="right">1%</td></tr>
-<tr><th>Green Deck</th><td align="right">92%</td><td align="right">88%</td><td align="right">59%</td><td align="right">39%</td><td align="right">29%</td><td align="right">7%</td><td align="right">2%</td><td align="right">1%</td></tr>
-<tr><th>Black Deck</th><td align="right">63%</td><td align="right">41%</td><td align="right">15%</td><td align="right">11%</td><td align="right">7%</td><td align="right">2%</td><td align="right">1%</td><td align="right">0%</td></tr>
-<tr><th>Magic Deck</th><td align="right">90%</td><td align="right">79%</td><td align="right">47%</td><td align="right">30%</td><td align="right">25%</td><td align="right">7%</td><td align="right">2%</td><td align="right">1%</td></tr>
-<tr><th>Nebula Deck</th><td align="right">88%</td><td align="right">74%</td><td align="right">44%</td><td align="right">31%</td><td align="right">23%</td><td align="right">6%</td><td align="right">2%</td><td align="right">0%</td></tr>
-<tr><th>Ghost Deck</th><td align="right">87%</td><td align="right">72%</td><td align="right">44%</td><td align="right">27%</td><td align="right">22%</td><td align="right">5%</td><td align="right">2%</td><td align="right">0%</td></tr>
-<tr><th>Abandoned Deck</th><td align="right">86%</td><td align="right">71%</td><td align="right">40%</td><td align="right">26%</td><td align="right">21%</td><td align="right">7%</td><td align="right">2%</td><td align="right">0%</td></tr>
-<tr><th>Checkered Deck</th><td align="right">88%</td><td align="right">76%</td><td align="right">41%</td><td align="right">27%</td><td align="right">22%</td><td align="right">6%</td><td align="right">2%</td><td align="right">0%</td></tr>
-<tr><th>Zodiac Deck</th><td align="right">91%</td><td align="right">80%</td><td align="right">52%</td><td align="right">39%</td><td align="right">32%</td><td align="right">10%</td><td align="right">3%</td><td align="right">1%</td></tr>
-<tr><th>Painted Deck</th><td align="right">77%</td><td align="right">60%</td><td align="right">24%</td><td align="right">14%</td><td align="right">12%</td><td align="right">2%</td><td align="right">0%</td><td align="right">0%</td></tr>
-<tr><th>Anaglyph Deck</th><td align="right">86%</td><td align="right">61%</td><td align="right">35%</td><td align="right">25%</td><td align="right">15%</td><td align="right">5%</td><td align="right">1%</td><td align="right">0%</td></tr>
-<tr><th>Plasma Deck</th><td align="right">72%</td><td align="right">55%</td><td align="right">21%</td><td align="right">13%</td><td align="right">10%</td><td align="right">2%</td><td align="right">0%</td><td align="right">0%</td></tr>
-<tr><th>Erratic Deck</th><td align="right">85%</td><td align="right">74%</td><td align="right">41%</td><td align="right">29%</td><td align="right">21%</td><td align="right">4%</td><td align="right">1%</td><td align="right">0%</td></tr>
+<tr><th>Red Deck</th><td align="right">96%</td><td align="right">90%</td><td align="right">71%</td><td align="right">63%</td><td align="right">59%</td><td align="right">31%</td><td align="right">20%</td><td align="right">12%</td></tr>
+<tr><th>Blue Deck</th><td align="right">99%</td><td align="right">96%</td><td align="right">85%</td><td align="right">77%</td><td align="right">74%</td><td align="right">51%</td><td align="right">37%</td><td align="right">24%</td></tr>
+<tr><th>Yellow Deck</th><td align="right">97%</td><td align="right">96%</td><td align="right">81%</td><td align="right">78%</td><td align="right">73%</td><td align="right">49%</td><td align="right">37%</td><td align="right">21%</td></tr>
+<tr><th>Green Deck</th><td align="right">96%</td><td align="right">94%</td><td align="right">81%</td><td align="right">79%</td><td align="right">63%</td><td align="right">38%</td><td align="right">24%</td><td align="right">13%</td></tr>
+<tr><th>Black Deck</th><td align="right">83%</td><td align="right">67%</td><td align="right">43%</td><td align="right">41%</td><td align="right">31%</td><td align="right">13%</td><td align="right">8%</td><td align="right">3%</td></tr>
+<tr><th>Magic Deck</th><td align="right">95%</td><td align="right">90%</td><td align="right">74%</td><td align="right">69%</td><td align="right">59%</td><td align="right">36%</td><td align="right">23%</td><td align="right">15%</td></tr>
+<tr><th>Nebula Deck</th><td align="right">93%</td><td align="right">88%</td><td align="right">69%</td><td align="right">57%</td><td align="right">50%</td><td align="right">29%</td><td align="right">16%</td><td align="right">10%</td></tr>
+<tr><th>Ghost Deck</th><td align="right">93%</td><td align="right">91%</td><td align="right">69%</td><td align="right">63%</td><td align="right">56%</td><td align="right">35%</td><td align="right">21%</td><td align="right">12%</td></tr>
+<tr><th>Abandoned Deck</th><td align="right">94%</td><td align="right">86%</td><td align="right">66%</td><td align="right">61%</td><td align="right">52%</td><td align="right">28%</td><td align="right">16%</td><td align="right">11%</td></tr>
+<tr><th>Checkered Deck</th><td align="right">96%</td><td align="right">90%</td><td align="right">71%</td><td align="right">61%</td><td align="right">58%</td><td align="right">30%</td><td align="right">21%</td><td align="right">12%</td></tr>
+<tr><th>Zodiac Deck</th><td align="right">98%</td><td align="right">92%</td><td align="right">78%</td><td align="right">74%</td><td align="right">64%</td><td align="right">42%</td><td align="right">29%</td><td align="right">17%</td></tr>
+<tr><th>Painted Deck</th><td align="right">92%</td><td align="right">87%</td><td align="right">58%</td><td align="right">53%</td><td align="right">46%</td><td align="right">19%</td><td align="right">16%</td><td align="right">5%</td></tr>
+<tr><th>Anaglyph Deck</th><td align="right">94%</td><td align="right">85%</td><td align="right">62%</td><td align="right">58%</td><td align="right">49%</td><td align="right">25%</td><td align="right">16%</td><td align="right">8%</td></tr>
+<tr><th>Plasma Deck</th><td align="right">91%</td><td align="right">87%</td><td align="right">64%</td><td align="right">52%</td><td align="right">46%</td><td align="right">23%</td><td align="right">12%</td><td align="right">6%</td></tr>
+<tr><th>Erratic Deck</th><td align="right">95%</td><td align="right">88%</td><td align="right">67%</td><td align="right">58%</td><td align="right">52%</td><td align="right">29%</td><td align="right">17%</td><td align="right">10%</td></tr>
+<tr><th>All decks</th><td align="right">94%</td><td align="right">88%</td><td align="right">69%</td><td align="right">63%</td><td align="right">55%</td><td align="right">32%</td><td align="right">21%</td><td align="right">12%</td></tr>
 </table>
 
 ## More

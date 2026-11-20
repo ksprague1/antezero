@@ -9,7 +9,10 @@ agent/
     config.py      presets (smoke / cpu / base / large), all hyperparameters, validation
     model.py       entity transformer + factored action heads
     runtime.py     device, environment factory, checkpoints (shared by train / eval / play)
+    effects.py     what each card does, as fixed features of its token
     train.py       PPO over antezero_sim.VecEnv (parallel Rust envs)
+    collect.py     rollout collection: acting on CUDA graphs, in groups of similar length
+    critic.py      the decoupled critic and its learner
     eval.py        win rate (95% Wilson intervals) + endless survival, held-out seeds
     search.py      determinized lookahead (test-time policy improvement)
     round_search.py risk-gated within-round search over determinized worlds (batched)
@@ -105,6 +108,17 @@ arrangement it replaces.
 Card tokens of the deck and discard pile are ordered by their whole content,
 so no hidden order or id leaks through ties.
 
+**Item effects** (`effects.py`): an id alone has to be learned from games in
+which the item was owned, and a policy does not keep what it does not know.
+Each joker, consumable, voucher and booster pack therefore also carries 142
+fixed features that say what its text says: what it gives and how much,
+what it gains per event, when it acts, and what it names or needs (hand
+types, suits, ranks, enhancements, conditions such as few cards, money,
+discards left or its place among the jokers). They are added to the item's
+token through a linear layer that starts at zero. A checkpoint stores the
+table it was trained with, so rows can be corrected without changing what
+older checkpoints read; `model.effects=false` gives a table of zeros.
+
 **Action** (factored, exact probabilities):
 1. an *op head* scores the legal ops: select / skip / reroll boss, play,
    discard, use / sell / buy / buy-and-use / redeem / open / pick (each on its
@@ -143,6 +157,14 @@ the hidden assignment stays hidden. The free-form pointer keeps every other play
 out the other ops (`MAX_CANDIDATES` = 48). Cost: ~0.2 ms per round decision
 per core, ~0.8 ms when every play depends on chance.
 
+**Joker order** (`env.order_gain`, `ppo.aux_order`): each joker-move op
+carries what the best single move of that joker would add to the top
+candidate's score, on the candidates' first chance scenario. With
+`env.order_label_rate`, that share of played hands is labelled with the
+single moves that would have scored more, and `ppo.aux_order` adds a loss
+that raises those moves. On a trained model this cut the plays that lost
+score to joker order from 9.9% to 2.1%.
+
 **Network**: shared pre-LN transformer encoder (`base`: d=256, 6 layers, 8
 heads, ~6M parameters; `large`: d=512, 10 layers, ~36M; both train on a
 single device). Value head on CLS.
@@ -157,7 +179,12 @@ the head still trains, on the resulting returns. The shared head learns the
 sampled policy's value but prices counterfactual builds poorly (money at a
 third, vouchers at zero), and at lambda 0.99 ~91% of that mispricing enters
 a build action's advantage. Trained inside PPO the critic lost that pricing
-within a few dozen updates, so it is frozen and refreshed offline. The log's
+within a few dozen updates, so it is frozen and refreshed offline, or kept
+fitted by `ppo.critic_learn`: a copy is trained during the run on sampled
+states, each once, when its episode has ended, against the realised return,
+so no value estimate enters a target. Mode 1 only reports the copy's scores
+next to the frozen critic's; mode 2 hands its weights to the critic that
+values the rollouts. The log's
 `critic_ev`/`value_ev` (and `_bias`) grade both value functions on the same
 value-free returns, so staleness shows. Cost: one value pass per update.
 
@@ -204,6 +231,16 @@ Optional:
   hidden state resampled, so the hard late antes are trained far more often
   than a weak policy reaches them. These episodes are excluded from the
   win-rate statistics;
+- *practice starts* (`env.practice_prob`): episodes restart from an ante start
+  of antes 2-3 holding a gift the run did not choose: a joker (Eternal with
+  `env.practice_eternal`) or three levels of a hand type. On a converged
+  policy neither form changed how it used jokers;
+- *tried purchases* (`ppo.explore_redeem`, `ppo.explore_buy`): a share of the
+  sampled shop exits redeems a voucher, or buys a random joker, tarot or
+  planet, instead (and a sampled pack pick takes another card of the pack).
+  Such steps train on their own clipped term and are cut out of the
+  advantages of the steps before them. `explore_buy=0.05` cost a converged
+  policy about a point;
 - *stake curriculum* (`env.curriculum`): the next stake is added once the 95%
   Wilson lower bound of the win rate over the latest
   `curriculum_min_episodes` fresh episodes on the top stake reaches
@@ -257,25 +294,28 @@ rules (`b_challenge` is rejected).
 
 ## Best result
 
-`run29_B`: **90.85% of games won** on Red Deck, White Stake, playing greedily
-(no search), over 12,288 games on three held-out seed sets (95% interval
-about ±0.5 points). It is the `base` model (~6.3M parameters) after ~4.2
-billion env steps, trained in segments, each resumed from the previous one;
-the last segment ran with
+The released checkpoint plays all 15 decks at all 8 stakes greedily (no
+search); the root README has its win rates. It is the `base` model (~6.3M
+parameters) after ~8.7 billion env steps, trained in segments, each resumed
+from the previous one: Red Deck at White Stake to about 91%, then all decks
+at White Stake, then the stakes in three steps (to Green, to Purple, to
+Gold), then the item-effect table. The last segments ran with
 
 ```
 --set model.bf16_encoder=true env.num_envs=4096 env.w_blind=0.01 env.w_score=0.005
       env.snapshot_prob=0.2 env.snapshot_min_ante=5 env.allow_skip=false
+      env.order_label_rate=0.0625 ppo.aux_order=0.05
       ppo.gae_lambda=0.99 ppo.epochs=1 ppo.minibatches=256 ppo.learn_frac=0.5
       ppo.lr=2.5e-5 ppo.lr_final=2.5e-5 ppo.ent_coef=0.0007 ppo.ent_coef_final=0.0007
-      ppo.fast_rollout=2 ppo.recompute_logp=false ppo.rollout_obs_on_cpu=true
-      ppo.critic=CRITIC.pt
+      ppo.fast_rollout=2 ppo.act_chunks=4 ppo.recompute_logp=false ppo.rollout_obs_on_cpu=true
+      ppo.critic=CRITIC.pt ppo.critic_learn=2
 ```
 
-and the final weights are the plain average of its checkpoints over the last
-230 updates. Earlier segments used other settings, and the frozen critic was
-refit offline between segments, so the result cannot be reproduced from
-this repository alone.
+on a mix of all decks (Painted and Plasma three times, Anaglyph and Erratic
+twice) and all stakes (Black and Blue twice, Purple to Gold three times),
+and the final weights are the plain average of the checkpoints of the last
+140 updates. Earlier segments used other settings, and the critic was first
+fit offline, so the result cannot be reproduced from this repository alone.
 
 ## Compute
 
