@@ -87,9 +87,10 @@ def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, cr
             env.step(code, run=run["id"], note=note)
             free = free + 1 if code.startswith(FREE) else 0
             steps += 1
-    except (ActionRejected, RPCError) as e:  # the run ended under the action
+    except (ActionRejected, RPCError) as e:  # the run ended under the action, or the game refused it
         print(f"[{run['seed']}] {e}", flush=True)
-        return None
+        s = client.az_bot(run=run["id"])
+        return "stopped: the game refused the bot's action" if s["active"] and s["run"]["id"] == run["id"] else None
 
 
 def serve(a) -> None:

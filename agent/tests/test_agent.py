@@ -773,10 +773,10 @@ class _BotGame:
     ``meddle(game)`` runs before every dump the bot reads: the game changing
     under the bot."""
 
-    def __init__(self, run, leave_at=None, meddle=None, g=None):
+    def __init__(self, run, leave_at=None, meddle=None, g=None, refuse=False):
         self.g = g or az.Game(run["seed"], run["back"], run["stake"])
-        self.run, self.leave_at, self.meddle = run, leave_at, meddle
-        self.polls, self.notes, self.meddled = 0, [], 0
+        self.run, self.leave_at, self.meddle, self.refuse = run, leave_at, meddle, refuse
+        self.polls, self.notes, self.meddled, self.free = 0, [], 0, 0
 
     def az_bot(self, **params):
         self.polls += 1
@@ -791,15 +791,20 @@ class _BotGame:
         return self.g.state_json()
 
     def step(self, code, run, note):
+        from antezero_bridge.game_env import ActionRejected
+
         assert run == self.run["id"]
+        if self.refuse:
+            raise ActionRejected(code)
         self.notes.append(note)
         self.g.step(code)
+        self.free = self.free + 1 if code.startswith(("move", "sort")) else 0  # the bot's rearranges in a row
 
 
 @pytest.fixture
 def bot_game(monkeypatch):
-    """Makes a ``_BotGame`` whose bot must hold the game's state at every
-    decision."""
+    """Makes a ``_BotGame`` whose bot must hold the game's state, and its
+    count of rearranges in a row, at every decision."""
     from antezero_agent import bot
 
     monkeypatch.setattr(bot.time, "sleep", lambda s: None)
@@ -808,6 +813,7 @@ def bot_game(monkeypatch):
 
     def checked(model, cfg, sim, dev):
         assert sim.canonical() == games[-1].g.canonical()
+        assert sim.rearranges == games[-1].free
         return greedy(model, cfg, sim, dev)
 
     monkeypatch.setattr(bot, "greedy", checked)
@@ -834,6 +840,9 @@ def test_the_bot_plays_its_run_to_the_end_in_step_with_the_game(bot_game):
     # the player leaves the run: the bot stops without a result
     game = bot_game(run, leave_at=4)
     assert bot.play_run(game, game, run, net, cfg, "cpu", None, None) is None and len(game.notes) == 2
+    # the game refuses the bot's action: the bot hands the run back
+    game = bot_game(run, refuse=True)
+    assert bot.play_run(game, game, run, net, cfg, "cpu", None, None).startswith("stopped")
 
 
 def _in_a_shop_with_a_joker() -> az.Game:
