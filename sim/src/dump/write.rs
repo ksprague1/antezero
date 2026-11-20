@@ -413,7 +413,10 @@ fn card(c: &Card) -> Json {
 		Kind::Voucher(_) => "Voucher",
 		Kind::Booster(_) => "Booster",
 	};
-	let mut ability = vec![("set", set.into())];
+	let mut ability = vec![
+		("set", set.into()),
+		("queue_negative_removal", c.queue_negative_removal.into()),
+	];
 	match c.kind {
 		Kind::Joker(j) => {
 			let mut extra = Vec::new();

@@ -649,6 +649,7 @@ fn card(c: &Json) -> Result<Card, DumpError> {
 	let kind = named(c, "key", kind_of)?;
 	let mut card = Card::new(0, kind);
 	card.core = core(c)?;
+	card.queue_negative_removal = flag(ab, "queue_negative_removal")?;
 	match kind {
 		Kind::Joker(j) => {
 			for &field in JokerField::COMMON.iter().chain(JokerField::of(j)) {
