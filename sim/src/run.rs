@@ -183,6 +183,73 @@ pub struct Setup {
 	pub steamodded: bool,
 }
 
+impl Setup {
+	/// The rules of a run on `back` at `stake`: the stake's modifiers
+	/// (`Game:start_run`) and the deck's (`Back:apply_to_run`).
+	pub(crate) fn new(back: Back, stake: Stake) -> Setup {
+		let mut modifiers = Modifiers::default();
+		let mut params = StartingParams::default();
+		if stake >= Stake::Red {
+			modifiers.no_blind_reward[BlindSlot::Small] = true;
+		}
+		if stake >= Stake::Green {
+			modifiers.scaling = BlindScaling::Faster;
+		}
+		if stake >= Stake::Black {
+			modifiers.enable_eternals_in_shop = true;
+		}
+		if stake >= Stake::Blue {
+			params.discards -= 1.0;
+		}
+		if stake >= Stake::Purple {
+			modifiers.scaling = BlindScaling::Fastest;
+		}
+		if stake >= Stake::Orange {
+			modifiers.enable_perishables_in_shop = true;
+		}
+		if stake >= Stake::Gold {
+			modifiers.enable_rentals_in_shop = true;
+		}
+		match back {
+			Back::Red => params.discards += 1.0,
+			Back::Blue => params.hands += 1.0,
+			Back::Yellow => params.dollars += 10.0,
+			Back::Green => {
+				modifiers.no_interest = true;
+				modifiers.money_per_hand = Some(2.0);
+				modifiers.money_per_discard = Some(1.0);
+			}
+			Back::Black => {
+				params.hands -= 1.0;
+				params.joker_slots += 1.0;
+			}
+			Back::Nebula => params.consumable_slots -= 1.0,
+			Back::Abandoned => params.no_faces = true,
+			Back::Painted => {
+				params.joker_slots -= 1.0;
+				params.hand_size += 2.0;
+			}
+			Back::Plasma => params.ante_scaling = 2.0,
+			Back::Erratic => params.erratic_suits_and_ranks = true,
+			Back::Magic
+			| Back::Ghost
+			| Back::Checkered
+			| Back::Zodiac
+			| Back::Anaglyph
+			| Back::Challenge => {}
+		}
+		Setup {
+			back,
+			stake,
+			modifiers,
+			starting_params: params,
+			win_ante: 8,
+			endless: false,
+			steamodded: false,
+		}
+	}
+}
+
 /// The run's progress and economy (`G.GAME`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Run {
@@ -274,15 +341,7 @@ fn blank(seed: &str, back: Back, stake: Stake) -> Game {
 	Game {
 		rng: PseudoRandom::new(seed),
 		events: EventQueue::new(),
-		setup: Setup {
-			back,
-			stake,
-			modifiers: Modifiers::default(),
-			starting_params: StartingParams::default(),
-			win_ante: 8,
-			endless: false,
-			steamodded: false,
-		},
+		setup: Setup::new(back, stake),
 		flow: Flow::default(),
 		areas: Areas::default(),
 		run: Run::default(),
@@ -298,30 +357,8 @@ fn blank(seed: &str, back: Back, stake: Stake) -> Game {
 }
 
 fn start_run(g: &mut Game) {
-	let stake = g.setup.stake;
-	if stake >= Stake::Red {
-		g.setup.modifiers.no_blind_reward[BlindSlot::Small] = true;
-	}
-	if stake >= Stake::Green {
-		g.setup.modifiers.scaling = BlindScaling::Faster;
-	}
-	if stake >= Stake::Black {
-		g.setup.modifiers.enable_eternals_in_shop = true;
-	}
-	if stake >= Stake::Blue {
-		g.setup.starting_params.discards -= 1.0;
-	}
-	if stake >= Stake::Purple {
-		g.setup.modifiers.scaling = BlindScaling::Fastest;
-	}
-	if stake >= Stake::Orange {
-		g.setup.modifiers.enable_perishables_in_shop = true;
-	}
-	if stake >= Stake::Gold {
-		g.setup.modifiers.enable_rentals_in_shop = true;
-	}
 	apply_back(
-		&mut g.setup,
+		g.setup.back,
 		&mut g.history,
 		&mut g.round,
 		&mut g.shop,
@@ -410,42 +447,25 @@ fn deck_voucher(history: &mut History, round: &mut Round, events: &mut EventQueu
 	shop::apply_voucher(round, events, v, VoucherSource::Deck);
 }
 
-/// `Back:apply_to_run()`.
+/// What `Back:apply_to_run()` does to the run beyond its rules (see
+/// [`Setup::new`]): the deck's vouchers and cards.
 fn apply_back(
-	setup: &mut Setup, history: &mut History, round: &mut Round, shop: &mut Shop,
-	events: &mut EventQueue,
+	back: Back, history: &mut History, round: &mut Round, shop: &mut Shop, events: &mut EventQueue,
 ) {
-	let params = &mut setup.starting_params;
 	let deck_card =
 		|kind: Kind| Event::Create(NewCard::forced(kind, OwnedArea::Consumables, "deck"));
-	match setup.back {
-		Back::Red => params.discards += 1.0,
-		Back::Blue => params.hands += 1.0,
-		Back::Yellow => params.dollars += 10.0,
-		Back::Green => {
-			setup.modifiers.no_interest = true;
-			setup.modifiers.money_per_hand = Some(2.0);
-			setup.modifiers.money_per_discard = Some(1.0);
-		}
-		Back::Black => {
-			params.hands -= 1.0;
-			params.joker_slots += 1.0;
-		}
+	match back {
 		Back::Magic => {
 			deck_voucher(history, round, events, Voucher::CrystalBall);
 			for _ in 0..2 {
 				events.push(deck_card(Kind::Tarot(Tarot::Fool)));
 			}
 		}
-		Back::Nebula => {
-			deck_voucher(history, round, events, Voucher::Telescope);
-			params.consumable_slots -= 1.0;
-		}
+		Back::Nebula => deck_voucher(history, round, events, Voucher::Telescope),
 		Back::Ghost => {
 			events.push(deck_card(Kind::Spectral(Spectral::Hex)));
 			shop.spectral_rate = 2.0;
 		}
-		Back::Abandoned => params.no_faces = true,
 		Back::Checkered => events.push(Event::CheckeredDeck),
 		Back::Zodiac => {
 			for v in [
@@ -456,13 +476,17 @@ fn apply_back(
 				deck_voucher(history, round, events, v);
 			}
 		}
-		Back::Painted => {
-			params.joker_slots -= 1.0;
-			params.hand_size += 2.0;
-		}
-		Back::Plasma => params.ante_scaling = 2.0,
-		Back::Erratic => params.erratic_suits_and_ranks = true,
-		Back::Anaglyph | Back::Challenge => {}
+		Back::Red
+		| Back::Blue
+		| Back::Yellow
+		| Back::Green
+		| Back::Black
+		| Back::Abandoned
+		| Back::Painted
+		| Back::Plasma
+		| Back::Erratic
+		| Back::Anaglyph
+		| Back::Challenge => {}
 	}
 }
 
