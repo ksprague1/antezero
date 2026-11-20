@@ -7,7 +7,7 @@ use sim::game::Game as SimGame;
 use sim::inject::Inject;
 use sim::obs::{self, BuildPreview, Layout, Op, OpOptions};
 use sim::rng::Xorshift;
-use sim::{Action, CardMask, Stake, canon};
+use sim::{Action, CardMask, Stake, canon, json};
 
 use crate::rows::{
 	OPS_F_SHAPE, OPS_SHAPE, ObsOptions, ObsRow, TOK_F_SHAPE, TOK_I_SHAPE, op_options,
@@ -175,6 +175,43 @@ impl Game {
 				.ok_or_else(|| PyValueError::new_err("illegal factored action"))?;
 			apply(&mut self.g, a)
 		})
+	}
+
+	/// Replaces the run with the one in `state`, a state dump of the real
+	/// game (the mod's `az_state`, or `state_json`) taken at a decision
+	/// point; this game's settings (`endless`, `steamodded`, `allow_skip`)
+	/// stay, and no free rearranges have been made (see `rearranges`).
+	/// `ValueError` if the dump is not one the simulator can take.
+	fn load_state(&mut self, py: Python<'_>, state: &str) -> PyResult<()> {
+		let mut g = py
+			.detach(|| {
+				let dump = json::parse(state).map_err(|e| format!("state dump: {e}"))?;
+				SimGame::from_dump(&dump).map_err(|e| e.to_string())
+			})
+			.map_err(PyValueError::new_err)?;
+		g.set_tracing(false);
+		g.setup.endless = self.g.setup.endless;
+		g.setup.steamodded = self.g.setup.steamodded;
+		self.g = g;
+		Ok(())
+	}
+
+	/// The state dump the real game would give in this state (JSON, the
+	/// shape of the mod's `az_state`).
+	fn state_json(&mut self) -> String {
+		self.g.to_dump().to_string()
+	}
+
+	/// Free rearranges (hand and joker moves, sorts) since the last other
+	/// action: `encode` stops offering them at `sim::obs::MAX_REARRANGES`.
+	#[getter]
+	fn rearranges(&self) -> u8 {
+		self.g.flow.rearranges
+	}
+
+	#[setter]
+	fn set_rearranges(&mut self, n: u8) {
+		self.g.flow.rearranges = n;
 	}
 
 	/// Resamples the hidden state (deck order, face-down cards, future
