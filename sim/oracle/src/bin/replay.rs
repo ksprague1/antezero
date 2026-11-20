@@ -15,9 +15,9 @@ use std::process::ExitCode;
 
 use oracle::command::{Command, Start};
 use oracle::difftest::{self, Checks, Comparison};
-use oracle::json::{self, Json};
 use oracle::{Oracle, canon};
 use sim::game::Game;
+use sim::json::{self, Json};
 
 /// A recorded run: its start's code, then one command code per line.
 struct History<'text> {

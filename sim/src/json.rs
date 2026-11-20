@@ -1,7 +1,8 @@
-//! A small strict JSON parser for the harness' state dumps (numbers the
+//! A small strict JSON parser and writer for state dumps (numbers the
 //! harness cannot write as JSON are strings: `"inf"`, `"-inf"`, `"nan"`).
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Write};
 
 /// A parsed JSON value.
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +84,88 @@ impl Json {
 			None
 		}
 	}
+}
+
+impl From<f64> for Json {
+	fn from(n: f64) -> Json {
+		Json::Num(n)
+	}
+}
+
+impl From<bool> for Json {
+	fn from(b: bool) -> Json {
+		Json::Bool(b)
+	}
+}
+
+impl From<&str> for Json {
+	fn from(s: &str) -> Json {
+		Json::Str(s.to_string())
+	}
+}
+
+impl From<String> for Json {
+	fn from(s: String) -> Json {
+		Json::Str(s)
+	}
+}
+
+impl<T: Into<Json>> From<Option<T>> for Json {
+	/// `None` is `null` (Lua's `nil`).
+	fn from(v: Option<T>) -> Json {
+		v.map_or(Json::Null, Into::into)
+	}
+}
+
+impl fmt::Display for Json {
+	/// Compact JSON, with infinities and NaN written as the harness writes
+	/// them.
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Json::Null => f.write_str("null"),
+			Json::Bool(b) => write!(f, "{b}"),
+			Json::Num(n) if n.is_nan() => f.write_str(r#""nan""#),
+			Json::Num(n) if n.is_infinite() => {
+				f.write_str(if *n > 0.0 { r#""inf""# } else { r#""-inf""# })
+			}
+			Json::Num(n) => write!(f, "{n}"),
+			Json::Str(s) => write_string(f, s),
+			Json::Arr(items) => {
+				f.write_char('[')?;
+				for (i, v) in items.iter().enumerate() {
+					if i > 0 {
+						f.write_char(',')?;
+					}
+					write!(f, "{v}")?;
+				}
+				f.write_char(']')
+			}
+			Json::Obj(fields) => {
+				f.write_char('{')?;
+				for (i, (k, v)) in fields.iter().enumerate() {
+					if i > 0 {
+						f.write_char(',')?;
+					}
+					write_string(f, k)?;
+					write!(f, ":{v}")?;
+				}
+				f.write_char('}')
+			}
+		}
+	}
+}
+
+fn write_string(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
+	f.write_char('"')?;
+	for c in s.chars() {
+		match c {
+			'"' => f.write_str(r#"\""#)?,
+			'\\' => f.write_str(r"\\")?,
+			'\u{0}'..='\u{1f}' => write!(f, r"\u{:04x}", u32::from(c))?,
+			_ => f.write_char(c)?,
+		}
+	}
+	f.write_char('"')
 }
 
 /// Parses one JSON document (nothing but whitespace may follow it).
@@ -335,6 +418,19 @@ mod tests {
 		assert_eq!(j.get("e").as_str(), Some("x\"\\\né\u{1}😀"));
 		assert_eq!(parse("\"\\t\\r\\/é\"").unwrap(), Json::Str("\t\r/é".into()));
 		assert_eq!(parse("{}").unwrap(), Json::Obj(BTreeMap::new()));
+	}
+
+	#[test]
+	fn writes_what_it_parses() {
+		let text = r#"{"a":[1,-2500,"inf","-inf","nan",0.5,null,true],"b\"\\\u0001":"x\ny"}"#;
+		let j = parse(text).unwrap();
+		assert_eq!(
+			j.to_string(),
+			r#"{"a":[1,-2500,"inf","-inf","nan",0.5,null,true],"b\"\\\u0001":"x\u000ay"}"#
+		);
+		assert_eq!(parse(&j.to_string()).unwrap(), j);
+		let x = 0.1 + 0.2;
+		assert_eq!(parse(&Json::Num(x).to_string()).unwrap().as_f64(), Some(x));
 	}
 
 	#[test]

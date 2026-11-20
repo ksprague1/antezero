@@ -7,11 +7,11 @@ use std::fmt;
 
 use sim::actions::ActionError;
 use sim::game::{Game, Phase};
+use sim::json::{self, Json};
 
 use crate::Oracle;
 use crate::canon::{self, Diff, FrameOffset, TimelineDiff};
 use crate::command::{Command, Start};
-use crate::json::{self, Json};
 use crate::policy::Policy;
 
 /// What is compared besides the canonical state.

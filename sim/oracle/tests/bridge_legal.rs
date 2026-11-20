@@ -8,10 +8,10 @@ use std::path::Path;
 use oracle::command::Start;
 use oracle::difftest::{Checks, Comparison, compare};
 use oracle::policy::Policy;
-use oracle::{Oracle, json, lua_path};
+use oracle::{Oracle, lua_path};
 use sim::data::Back;
 use sim::game::{Game, Phase};
-use sim::{Stake, num};
+use sim::{Stake, json, num};
 
 /// Loads legal.lua with stand-ins for the two helpers it takes from the
 /// mod's core.lua (vanilla has no SMODS booster state).

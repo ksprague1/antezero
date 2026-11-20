@@ -9,9 +9,11 @@ pub use crate::areas::{Area, Areas, Hand, HandSort, Limit, Limits};
 pub use crate::blind::BlindScaling;
 use crate::card_mask::CardMask;
 use crate::data::{ALL_BLINDS, Back, BlindKind, HandType, TagKind};
+use crate::dump::{self, DumpError};
 use crate::enum_sets::HandSet;
 use crate::event_queue::EventQueue;
 use crate::inject::{self, Inject};
+use crate::json::Json;
 pub use crate::packs::{OpenPack, PackState};
 use crate::rng::PseudoRandom;
 pub use crate::round::{IdolCard, MailRank, Round};
@@ -76,6 +78,24 @@ pub enum State {
 }
 
 impl State {
+	/// Every state, in the order above.
+	pub const ALL: [State; 14] = [
+		State::SelectingHand,
+		State::HandPlayed,
+		State::DrawToHand,
+		State::GameOver,
+		State::Shop,
+		State::PlayTarot,
+		State::BlindSelect,
+		State::RoundEval,
+		State::TarotPack,
+		State::PlanetPack,
+		State::SpectralPack,
+		State::StandardPack,
+		State::BuffoonPack,
+		State::NewRound,
+	];
+
 	#[must_use]
 	pub fn is_pack(self) -> bool {
 		matches!(
@@ -119,6 +139,15 @@ pub enum BlindStatus {
 }
 
 impl BlindStatus {
+	/// Every status, in the order above.
+	pub const ALL: [BlindStatus; 5] = [
+		BlindStatus::Select,
+		BlindStatus::Upcoming,
+		BlindStatus::Current,
+		BlindStatus::Defeated,
+		BlindStatus::Skipped,
+	];
+
 	#[must_use]
 	pub fn name(self) -> &'static str {
 		match self {
@@ -525,6 +554,25 @@ impl Game {
 	#[must_use]
 	pub fn new_run(seed: &str, back: Back, stake: Stake) -> Game {
 		run::new_run(seed, back, stake)
+	}
+
+	/// The game in a state dump of the real game or the oracle (see
+	/// [`crate::dump`]), taken at a decision point.
+	///
+	/// # Errors
+	///
+	/// Returns the first part of the dump the simulator cannot take.
+	pub fn from_dump(dump: &Json) -> Result<Game, DumpError> {
+		dump::read(dump)
+	}
+
+	/// The state dump the game would give in this state, a decision point
+	/// (see [`crate::dump`]); refreshes the per-frame derived joker values
+	/// first, like the game does every frame.
+	#[must_use]
+	pub fn to_dump(&mut self) -> Json {
+		self.update_derived();
+		dump::write(self)
 	}
 
 	/// Checks an action without applying it.

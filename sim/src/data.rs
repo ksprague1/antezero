@@ -137,6 +137,27 @@ impl Rank {
 		self as u8
 	}
 
+	/// `base.value`: `"2"` to `"10"`, then `"Jack"`, `"Queen"`, `"King"` and
+	/// `"Ace"`.
+	#[must_use]
+	pub fn value(self) -> &'static str {
+		match self {
+			Rank::Two => "2",
+			Rank::Three => "3",
+			Rank::Four => "4",
+			Rank::Five => "5",
+			Rank::Six => "6",
+			Rank::Seven => "7",
+			Rank::Eight => "8",
+			Rank::Nine => "9",
+			Rank::Ten => "10",
+			Rank::Jack => "Jack",
+			Rank::Queen => "Queen",
+			Rank::King => "King",
+			Rank::Ace => "Ace",
+		}
+	}
+
 	/// The rank's position in [`Rank::ALL`].
 	#[inline]
 	#[must_use]

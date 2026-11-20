@@ -24,7 +24,12 @@ local function card_info(c)
     t.suit = c.base.suit
     t.bonus = c.ability.bonus
     t.perma_bonus = c.ability.perma_bonus
+    t.times_played = c.base.times_played
+    t.suit_nominal_original = c.base.suit_nominal_original
   end
+  t.base_cost = c.base_cost
+  t.extra_cost = c.extra_cost
+  t.added_to_deck = c.added_to_deck or false
   local ab = {}
   for kk, vv in pairs(c.ability) do
     local tv = type(vv)
@@ -56,6 +61,64 @@ function AZB.vanilla_voucher(v)
     if v.spawn == nil or v.spawn[k] then return k end
   end
   return nil
+end
+
+-- What a simulator built from the dump needs beyond the compared state
+-- (see `sim::dump`), as the harness's H.state adds it.
+local function sim_state(s, g)
+  local function true_keys(t, keep)
+    local out = {__array = true}
+    for k, v in pairs(t or {}) do if v and (not keep or keep(v)) then out[#out+1] = k end end
+    table.sort(out)
+    return out
+  end
+  s.back = g.selected_back.effect.center.key
+  s.stake = g.stake
+  s.win_ante = g.win_ante
+  s.sort_id = G.sort_id
+  s.win_notified = g.win_notified or false
+  s.dollar_buffer = g.dollar_buffer
+  s.rental_rate = g.rental_rate
+  s.perishable_rounds = g.perishable_rounds
+  s.joker_rate = g.joker_rate
+  s.joker_buffer = g.joker_buffer
+  s.consumeable_buffer = g.consumeable_buffer
+  s.consumeable_usage_total = g.consumeable_usage_total
+  s.planets_used = true_keys(g.consumeable_usage, function(v) return v.set == 'Planet' end)
+  s.shop_open = G.shop ~= nil
+  s.shop_free = g.shop_free or false
+  s.shop_d6ed = g.shop_d6ed or false
+  s.first_shop_buffoon = g.first_shop_buffoon or false
+  s.reroll_cost_increase = g.current_round.reroll_cost_increase
+  s.temp_reroll_cost = g.round_resets.temp_reroll_cost
+  s.temp_handsize = g.round_resets.temp_handsize
+  s.round_bonus = {next_hands = g.round_bonus.next_hands, discards = g.round_bonus.discards}
+  s.used_packs = {__array = true}
+  for i, p in ipairs(g.current_round.used_packs or {}) do s.used_packs[i] = p end
+  s.pack_interrupt = g.PACK_INTERRUPT and AZB.state_name(g.PACK_INTERRUPT)
+  s.facing_blind = g.facing_blind or false
+  s.last_blind_boss = (g.last_blind and g.last_blind.boss) or false
+  s.bosses_used = g.bosses_used
+  s.blind_selected = g.round_resets.blind and g.round_resets.blind.name
+  s.orbital_choices = {__array = true}
+  for ante, c in pairs(g.orbital_choices or {}) do
+    s.orbital_choices[#s.orbital_choices+1] = {ante = ante, Small = c.Small, Big = c.Big, Boss = c.Boss}
+  end
+  table.sort(s.orbital_choices, function(a, b) return a.ante < b.ante end)
+  s.idol_card = {rank = g.current_round.idol_card.rank, suit = g.current_round.idol_card.suit, id = g.current_round.idol_card.id}
+  s.mail_card = {rank = g.current_round.mail_card.rank, id = g.current_round.mail_card.id}
+  s.hand_real_limit = G.hand and G.hand.config.real_card_limit
+  s.joker_real_limit = G.jokers and G.jokers.config.real_card_limit
+  s.consumable_real_limit = G.consumeables and G.consumeables.config.real_card_limit
+  if g.blind then
+    s.blind.mult = g.blind.mult
+    s.blind.triggered = g.blind.triggered or false
+    s.blind.prepped = g.blind.prepped or false
+    s.blind.hands = true_keys(g.blind.hands)
+    s.blind.only_hand = g.blind.only_hand or nil
+    s.blind.discards_sub = g.blind.discards_sub
+    s.blind.hands_sub = g.blind.hands_sub
+  end
 end
 
 function AZB.state_table()
@@ -141,6 +204,7 @@ function AZB.state_table()
   for k, v in pairs(g.hands) do
     s.hands[k] = {level = v.level, chips = v.chips, mult = v.mult, played = v.played, played_this_round = v.played_this_round, visible = v.visible}
   end
+  sim_state(s, g)
   local extra_rng = {}
   for k, v in pairs(g.pseudorandom) do
     if AZB.smods_only_rng(k) then extra_rng[k] = v else s.rng[k] = v end
