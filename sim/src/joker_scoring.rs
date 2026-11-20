@@ -1,726 +1,754 @@
 //! Joker contexts of hand scoring: before, individual cards, repetitions,
 //! the joker pass (`main` / other jokers), after, and card destruction.
+//!
+//! `Card:calculate_joker` is an if-chain over the joker's name, so only
+//! the checks of the joker at hand ever run: here a joker's checks for a
+//! context are its `match` arms, in the chain's order.
 
-use crate::card::Kind;
-use crate::data::{ACE, Enhancement, HandType, Joker, KING, QUEEN, Rank, Suit, rank_nominal};
-use crate::ev::Ev;
-use crate::game::{Area, CardSet, Game};
-use crate::jokers::{CardArea, Ctx, Effect, Scoring, ret};
-use crate::rng::Key;
-use crate::{cards, flow, jokers, num};
+use crate::blind::CardDebuff;
+use crate::calculate_joker::{CardArea, Effect, Scoring, ScoringCtx};
+use crate::card::{Ability, Card, Kind};
+use crate::data::{Enhancement, HandType, Joker, Rank, Rarity, Suit};
+use crate::enum_sets::SuitSet;
+use crate::event::Event;
+use crate::event_queue::EventQueue;
+use crate::game::{Areas, Blind, CardSet, Game, HandLevels};
+use crate::joker_lifecycle::JokerEvent;
+use crate::playing_card::{PlayingCard, SuitTest};
+use crate::rng::{Key, PseudoRandom};
+use crate::round::Round;
+use crate::run::Run;
+use crate::{calculate_joker, card_lifecycle, flow, num, rng};
 
-#[expect(
-	clippy::too_many_lines,
-	reason = "one arm per context; the order of the checks is the Lua if-chain's"
-)]
+/// One `calculate_joker` call of hand scoring: the joker whose logic runs,
+/// whether a copy joker runs it, and the hand being scored.
+#[derive(Clone, Copy)]
+struct Call<'sc> {
+	/// The joker's index in the joker area.
+	index: usize,
+	joker: Joker,
+	/// A Blueprint or Brainstorm runs the logic of the joker it copies.
+	blueprinted: bool,
+	/// The hand being scored.
+	scoring: &'sc Scoring,
+}
+
+/// `copier` is the Blueprint or Brainstorm the joker's logic runs for, if
+/// it is being copied.
 pub(crate) fn calculate(
-	g: &mut Game, ji: usize, j: Joker, ctx: &Ctx, sc: Option<&Scoring>, blueprinted: bool,
+	g: &mut Game, ji: usize, j: Joker, ctx: ScoringCtx, sc: &Scoring, copier: Option<usize>,
 ) -> Option<Effect> {
 	use Joker as J;
-	let ab = g.jokers[ji].ab;
-	let prob = g.probabilities;
-	match *ctx {
-		Ctx::DestroyingCard { play_idx, full_len } => {
-			if blueprinted {
-				return None;
-			}
+	let call = Call {
+		index: ji,
+		joker: j,
+		blueprinted: copier.is_some(),
+		scoring: sc,
+	};
+	match ctx {
+		ScoringCtx::DestroyingCard { play_idx, full_len }
 			if j == J::SixthSense
+				&& !call.blueprinted
 				&& full_len == 1
-				&& g.play[play_idx].id_is(6)
-				&& g.hands_played_round == 0.0
-			{
-				if jokers::consumable_room(g) {
-					g.consumeable_buffer += 1.0;
-					g.events.push_before(0.0, Ev::Create {
-						set: CardSet::Spectral,
-						area: Area::Consumables,
-						forced: None,
-						append: "sixth",
-						rarity: None,
-						legendary: false,
-					});
-					g.events.status_extra();
-				}
-				ret!(remove: true);
+				&& g.areas.play[play_idx].has_rank(Rank::Six)
+				&& g.round.hands_played == 0.0 =>
+		{
+			if g.areas.consumable_room_after_queued() {
+				calculate_joker::queue_consumable(
+					&mut g.areas,
+					&mut g.events,
+					CardSet::Spectral,
+					"sixth",
+				);
+				g.events.status_extra();
 			}
-			None
+			Some(Effect {
+				remove: true,
+				..Effect::NONE
+			})
 		}
-		Ctx::DebuffedHand => {
-			if j == J::Matador && g.blind.triggered {
-				g.events.push(Ev::EaseDollars(8.0));
-				jokers::buffer_dollars(g, 8.0);
-				ret!(dollars: Some(8.0));
-			}
-			None
-		}
-		Ctx::Individual {
+		ScoringCtx::DebuffedHand if j == J::Matador && g.blind.triggered => Some(
+			calculate_joker::ease_and_pay(&mut g.run, &mut g.events, 8.0),
+		),
+		ScoringCtx::Individual {
 			area: CardArea::Play,
 			other,
+		} => individual_played(
+			&mut g.areas,
+			&mut g.run,
+			&mut g.rng,
+			&g.round,
+			&mut g.events,
+			call,
+			other,
+		),
+		ScoringCtx::Individual {
+			area: CardArea::Hand,
+			other,
+		} => individual_held(&g.areas, &mut g.run, &mut g.rng, &mut g.events, j, other),
+		ScoringCtx::Repetition {
+			area: CardArea::Play,
+			other,
+			..
 		} => {
-			let sc = sc.expect("individual context without scoring");
-			let par = g.pareidolia();
-			let smeared = g.smeared();
-			let oc = &g.play[other];
-			if j == J::Hiker {
-				g.play[other].ab.perma_bonus += 5.0;
-				ret!(extra: true);
-			}
-			if j == J::LuckyCat && oc.lucky_trigger && !blueprinted {
-				jokers::jab(g, ji).x_mult += 0.25;
-				ret!(extra: true);
-			}
-			if j == J::Wee && oc.id_is(2) && !blueprinted {
-				jokers::jab(g, ji).chips += 8.0;
-				ret!(extra: true);
-			}
-			if j == J::Photograph {
-				let first_face = sc
-					.scoring()
-					.iter()
-					.map(|&i| i as usize)
-					.find(|&i| g.play[i].is_face(false, par));
-				if Some(other) == first_face {
-					ret!(x_mult: Some(2.0));
-				}
-			}
-			if j == J::J8Ball && jokers::consumable_room(g) && g.play[other].id_is(8) {
-				let k = Key::from("8ball");
-				if g.rng.random(&k) < prob / 4.0 {
-					g.consumeable_buffer += 1.0;
-					ret!(extra: true, eight_ball: true);
-				}
-			}
-			let oc = &g.play[other];
-			if j == J::Idol
-				&& oc.get_id() == Some(g.idol_card.rank)
-				&& oc.is_suit(g.idol_card.suit, false, false, smeared)
-			{
-				ret!(x_mult: Some(2.0));
-			}
-			if j == J::ScaryFace && oc.is_face(false, par) {
-				ret!(chips: Some(30.0));
-			}
-			if j == J::Smiley && oc.is_face(false, par) {
-				ret!(mult: Some(5.0));
-			}
-			if j == J::Ticket && oc.enhancement == Enhancement::Gold {
-				jokers::buffer_dollars(g, 4.0);
-				ret!(dollars: Some(4.0));
-			}
-			if j == J::Scholar && oc.id_is(ACE) {
-				ret!(chips: Some(20.0), mult: Some(4.0));
-			}
-			if j == J::WalkieTalkie && (oc.id_is(10) || oc.id_is(4)) {
-				ret!(chips: Some(10.0), mult: Some(4.0));
-			}
-			if j == J::Business && oc.is_face(false, par) {
-				let k = Key::from("business");
-				if g.rng.random(&k) < prob / 2.0 {
-					jokers::buffer_dollars(g, 2.0);
-					ret!(dollars: Some(2.0));
-				}
-			}
-			let oc = &g.play[other];
-			if j == J::Fibonacci && matches!(oc.get_id(), Some(2 | 3 | 5 | 8 | ACE)) {
-				ret!(mult: Some(8.0));
-			}
-			if j == J::EvenSteven && matches!(oc.get_id(), Some(r) if r <= 10 && r % 2 == 0) {
-				ret!(mult: Some(4.0));
-			}
-			if j == J::OddTodd
-				&& matches!(oc.get_id(), Some(r) if (r <= 10 && r % 2 == 1) || r == ACE)
-			{
-				ret!(chips: Some(31.0));
-			}
-			let suit_mult = match j {
-				J::GreedyJoker => Some(Suit::Diamonds),
-				J::LustyJoker => Some(Suit::Hearts),
-				J::WrathfulJoker => Some(Suit::Spades),
-				J::GluttenousJoker => Some(Suit::Clubs),
+			let oc = &g.areas.play[other];
+			let repetitions = match j {
+				J::SockAndBuskin if oc.is_face(g.areas.pareidolia()) => Some(1),
+				J::HangingChad if sc.scoring().next() == Some(other) => Some(2),
+				J::Dusk if g.round.hands_left == 0.0 => Some(1),
+				J::Selzer => Some(1),
+				J::Hack if oc.effective_rank().is_some_and(|r| r <= Rank::Five) => Some(1),
 				_ => None,
 			};
-			if let Some(s) = suit_mult
-				&& oc.is_suit(s, false, false, smeared)
-			{
-				ret!(mult: Some(3.0));
-			}
-			if j == J::RoughGem && oc.is_suit(Suit::Diamonds, false, false, smeared) {
-				jokers::buffer_dollars(g, 1.0);
-				ret!(dollars: Some(1.0));
-			}
-			let oc = &g.play[other];
-			if j == J::OnyxAgate && oc.is_suit(Suit::Clubs, false, false, smeared) {
-				ret!(mult: Some(7.0));
-			}
-			if j == J::Arrowhead && oc.is_suit(Suit::Spades, false, false, smeared) {
-				ret!(chips: Some(50.0));
-			}
-			if j == J::Bloodstone && oc.is_suit(Suit::Hearts, false, false, smeared) {
-				let k = Key::from("bloodstone");
-				if g.rng.random(&k) < prob / 2.0 {
-					ret!(x_mult: Some(1.5));
-				}
-			}
-			let oc = &g.play[other];
-			if j == J::Ancient
-				&& g.ancient_suit
-					.is_some_and(|s| oc.is_suit(s, false, false, smeared))
-			{
-				ret!(x_mult: Some(1.5));
-			}
-			if j == J::Triboulet && (oc.id_is(QUEEN) || oc.id_is(KING)) {
-				ret!(x_mult: Some(2.0));
-			}
-			None
+			repetitions.map(|repetitions| Effect {
+				repetitions,
+				..Effect::NONE
+			})
 		}
-		Ctx::Individual {
+		ScoringCtx::Repetition {
 			area: CardArea::Hand,
-			other,
-		} => {
-			let par = g.pareidolia();
-			let oc = &g.hand[other];
-			if j == J::ShootTheMoon && oc.id_is(QUEEN) {
-				if oc.debuff {
-					ret!(extra: true);
-				}
-				ret!(h_mult: Some(13.0));
-			}
-			if j == J::Baron && oc.id_is(KING) {
-				if oc.debuff {
-					ret!(extra: true);
-				}
-				ret!(x_mult: Some(1.5));
-			}
-			if j == J::ReservedParking && oc.is_face(false, par) {
-				let k = Key::from("parking");
-				if g.rng.random(&k) < prob / 2.0 {
-					if g.hand[other].debuff {
-						ret!(extra: true);
-					}
-					jokers::buffer_dollars(g, 1.0);
-					ret!(dollars: Some(1.0));
-				}
-			}
-			if j == J::RaisedFist {
-				let mut temp_mult = 15.0;
-				let mut temp_id: Rank = 15;
-				let mut raised = None;
-				for (i, c) in g.hand.iter().enumerate() {
-					if temp_id >= c.rank && !c.is_stone() {
-						temp_mult = rank_nominal(c.rank);
-						temp_id = c.rank;
-						raised = Some(i);
-					}
-				}
-				if raised == Some(other) {
-					if g.hand[other].debuff {
-						ret!(extra: true);
-					}
-					ret!(h_mult: Some(2.0 * temp_mult));
-				}
-			}
-			None
-		}
-		Ctx::Repetition {
-			area: CardArea::Play,
-			other,
+			effects: true,
 			..
-		} => {
-			let sc = sc.expect("repetition without scoring");
-			let par = g.pareidolia();
-			let oc = &g.play[other];
-			if j == J::SockAndBuskin && oc.is_face(false, par) {
-				ret!(repetitions: 1);
-			}
-			if j == J::HangingChad && sc.scoring().first().map(|&i| i as usize) == Some(other) {
-				ret!(repetitions: 2);
-			}
-			if j == J::Dusk && g.hands_left == 0.0 {
-				ret!(repetitions: 1);
-			}
-			if j == J::Selzer {
-				ret!(repetitions: 1);
-			}
-			if j == J::Hack && matches!(oc.get_id(), Some(2..=5)) {
-				ret!(repetitions: 1);
-			}
-			None
-		}
-		Ctx::Repetition {
-			area: CardArea::Hand,
-			effects,
-			..
-		} => {
-			if j == J::Mime && effects {
-				ret!(repetitions: 1);
-			}
-			None
-		}
-		Ctx::OtherJoker { other } => {
-			if let (J::Baseball, Some(other)) = (j, other)
+		} if j == J::Mime => Some(Effect {
+			repetitions: 1,
+			..Effect::NONE
+		}),
+		ScoringCtx::OtherJoker { other: Some(other) }
+			if j == J::Baseball
 				&& other != ji
-				&& let Some(oj) = g.jokers[other].joker()
-				&& oj.rarity() == 2
-			{
-				g.events.push(Ev::Wait);
-				ret!(xmult_mod: Some(1.5));
-			}
-			None
+				&& g.areas.jokers[other]
+					.joker()
+					.is_some_and(|oj| oj.rarity() == Rarity::Uncommon) =>
+		{
+			g.events.push(Event::Wait);
+			Some(Effect::xmult_mod(1.5))
 		}
-		Ctx::Before => {
-			let sc = sc.expect("before without scoring");
-			joker_before(g, ji, j, sc, blueprinted)
+		ScoringCtx::Before => joker_before(g, call),
+		ScoringCtx::After => {
+			joker_after(&mut g.areas.jokers[ji], &mut g.events, j, call.blueprinted)
 		}
-		Ctx::After => {
-			if j == J::IceCream && !blueprinted {
-				if ab.chips - 5.0 <= 0.0 {
-					jokers::schedule_self_destruct(g, ji);
-					ret!(extra: true);
-				}
-				jokers::jab(g, ji).chips -= 5.0;
-				ret!(extra: true);
-			}
-			if j == J::Selzer && !blueprinted {
-				if ab.remaining - 1.0 <= 0.0 {
-					jokers::schedule_self_destruct(g, ji);
-					ret!(extra: true);
-				}
-				jokers::jab(g, ji).remaining -= 1.0;
-				ret!(extra: true);
-			}
-			None
-		}
-		Ctx::Main => {
-			let sc = sc.expect("main without scoring");
-			joker_main(g, ji, j, sc)
-		}
-		_ => unreachable!("lifecycle context {ctx:?}"),
+		ScoringCtx::Main => joker_main(g, call),
+		ScoringCtx::DestroyingCard { .. }
+		| ScoringCtx::DebuffedHand
+		| ScoringCtx::Repetition { .. }
+		| ScoringCtx::OtherJoker { .. } => None,
 	}
 }
 
-#[expect(
-	clippy::too_many_lines,
-	reason = "one check per joker, in the Lua if-chain's order"
-)]
-fn joker_before(
-	g: &mut Game, ji: usize, j: Joker, sc: &Scoring, blueprinted: bool,
+/// `context.individual` for the scored card `other` of the play area.
+fn individual_played(
+	areas: &mut Areas, run: &mut Run, rng: &mut PseudoRandom, round: &Round,
+	events: &mut EventQueue, call: Call<'_>, other: usize,
 ) -> Option<Effect> {
 	use Joker as J;
-	let prob = g.probabilities;
-	let ab = g.jokers[ji].ab;
-	let hands = sc.hands;
-	if j == J::Trousers
-		&& (hands.has(HandType::TwoPair) || hands.has(HandType::FullHouse))
-		&& !blueprinted
-	{
-		jokers::jab(g, ji).mult += 2.0;
-		ret!(extra: true);
-	}
-	if j == J::Space {
-		let k = Key::from("space");
-		if g.rng.random(&k) < prob / 4.0 {
-			ret!(level_up: true);
+	let Call {
+		index: ji,
+		joker: j,
+		blueprinted,
+		scoring: sc,
+	} = call;
+	let prob = run.probabilities;
+	let oc = &areas.play[other];
+	match j {
+		J::Hiker => {
+			areas.play[other].perma_bonus += 5.0;
+			Some(Effect::EXTRA)
 		}
-	}
-	if j == J::Square && g.play.len() == 4 && !blueprinted {
-		jokers::jab(g, ji).chips += 4.0;
-		ret!(extra: true);
-	}
-	if j == J::Runner && hands.has(HandType::Straight) && !blueprinted {
-		jokers::jab(g, ji).chips += 15.0;
-		ret!(extra: true);
-	}
-	if j == J::MidasMask && !blueprinted {
-		let par = g.pareidolia();
-		let mut any = false;
-		for &i in sc.scoring() {
-			let i = i as usize;
-			if g.play[i].is_face(false, par) {
-				any = true;
-				cards::set_enhancement(g, Area::Play, i, Enhancement::Gold);
-				g.events.push(Ev::Wait);
+		J::LuckyCat if oc.lucky_trigger && !blueprinted => {
+			areas.jokers[ji].ab.x_mult += 0.25;
+			Some(Effect::EXTRA)
+		}
+		J::Wee if oc.has_rank(Rank::Two) && !blueprinted => {
+			areas.jokers[ji].ab.chips += 8.0;
+			Some(Effect::EXTRA)
+		}
+		J::Photograph => {
+			let par = areas.pareidolia();
+			let first_face = sc.scoring().find(|&i| areas.play[i].is_face(par));
+			(first_face == Some(other)).then_some(Effect::x_mult(2.0))
+		}
+		J::J8Ball if areas.consumable_room_after_queued() && oc.has_rank(Rank::Eight) => {
+			let k = Key::from("8ball");
+			if rng.random(&k) < prob / 4.0 {
+				areas.consumable_buffer += 1.0;
+				Some(Effect {
+					extra: true,
+					eight_ball: true,
+					..Effect::NONE
+				})
+			} else {
+				None
 			}
 		}
-		if any {
-			ret!(extra: true);
+		J::Idol
+			if oc.effective_rank() == Some(round.idol_card.rank)
+				&& oc.is_suit(round.idol_card.suit, SuitTest::Scoring, areas.smeared()) =>
+		{
+			Some(Effect::x_mult(2.0))
 		}
-	}
-	if j == J::Vampire && !blueprinted {
-		let mut drained = 0;
-		for &i in sc.scoring() {
-			let i = i as usize;
-			let c = &g.play[i];
-			if c.enhancement != Enhancement::Base && !c.debuff && !c.vampired {
-				drained += 1;
-				g.play[i].vampired = true;
-				cards::set_enhancement(g, Area::Play, i, Enhancement::Base);
-				let id = g.play[i].id;
-				g.events.push(Ev::Unvampire { id });
+		J::ScaryFace if oc.is_face(areas.pareidolia()) => Some(Effect::chips(30.0)),
+		J::Smiley if oc.is_face(areas.pareidolia()) => Some(Effect::mult(5.0)),
+		J::Ticket if oc.enhancement == Enhancement::Gold => {
+			Some(calculate_joker::pay(run, events, 4.0))
+		}
+		J::Business if oc.is_face(areas.pareidolia()) => {
+			let k = Key::from("business");
+			if rng.random(&k) < prob / 2.0 {
+				Some(calculate_joker::pay(run, events, 2.0))
+			} else {
+				None
 			}
 		}
-		if drained > 0 {
-			jokers::jab(g, ji).x_mult += 0.1 * f64::from(drained);
-			ret!(extra: true);
-		}
+		_ => rank_joker(oc, j)
+			.or_else(|| suit_joker(oc, areas.smeared(), run, round.ancient_suit, rng, events, j)),
 	}
-	if j == J::TodoList && Some(sc.name) == ab.to_do {
-		g.events.push(Ev::EaseDollars(4.0));
-		jokers::buffer_dollars(g, 4.0);
-		ret!(dollars: Some(4.0));
-	}
-	if j == J::Dna && g.hands_played_round == 0.0 && g.play.len() == 1 {
-		let mut c = flow::copy_card(g, g.play[0].clone(), false);
-		cards::add_to_deck(g, &mut c, false);
-		g.hand.push(c);
-		g.events.push(Ev::Materialize);
-		ret!(playing_cards_created: true, extra: true);
-	}
-	if j == J::RideTheBus && !blueprinted {
-		let par = g.pareidolia();
-		let faces = sc
-			.scoring()
-			.iter()
-			.any(|&i| g.play[i as usize].is_face(false, par));
-		if faces {
-			let last = ab.mult;
-			jokers::jab(g, ji).mult = 0.0;
-			if last > 0.0 {
-				ret!(extra: true);
-			}
-		} else {
-			jokers::jab(g, ji).mult += 1.0;
-		}
-	}
-	if j == J::Obelisk && !blueprinted {
-		let mut reset = true;
-		let more_than = g.hands[sc.name as usize].played;
-		for h in HandType::PAIRS_ORDER {
-			let hl = &g.hands[h as usize];
-			if h != sc.name && hl.played >= more_than && hl.visible {
-				reset = false;
-			}
-		}
-		if reset {
-			if ab.x_mult > 1.0 {
-				jokers::jab(g, ji).x_mult = 1.0;
-				ret!(extra: true);
-			}
-		} else {
-			jokers::jab(g, ji).x_mult += 0.2;
-		}
-	}
-	if j == J::GreenJoker && !blueprinted {
-		jokers::jab(g, ji).mult += 1.0;
-		ret!(extra: true);
-	}
-	None
 }
 
-#[expect(
-	clippy::too_many_lines,
-	reason = "one check per joker, in the Lua if-chain's order"
-)]
-fn joker_main(g: &mut Game, ji: usize, j: Joker, sc: &Scoring) -> Option<Effect> {
+/// The jokers that pay for the rank of the scored card `oc`.
+fn rank_joker(oc: &PlayingCard, j: Joker) -> Option<Effect> {
 	use Joker as J;
-	let ab = g.jokers[ji].ab;
-	let hands = sc.hands;
-	let has_type = |h: Option<HandType>| -> bool {
-		match h {
-			None => true,
-			Some(h) => hands.has(h),
+	match j {
+		J::Scholar if oc.has_rank(Rank::Ace) => Some(Effect {
+			chips: Some(20.0),
+			mult: Some(4.0),
+			..Effect::NONE
+		}),
+		J::WalkieTalkie if oc.has_rank(Rank::Ten) || oc.has_rank(Rank::Four) => Some(Effect {
+			chips: Some(10.0),
+			mult: Some(4.0),
+			..Effect::NONE
+		}),
+		J::Fibonacci
+			if matches!(
+				oc.effective_rank(),
+				Some(Rank::Two | Rank::Three | Rank::Five | Rank::Eight | Rank::Ace)
+			) =>
+		{
+			Some(Effect::mult(8.0))
 		}
-	};
-	let jtype = joker_hand_type(j);
-	if j == J::LoyaltyCard {
-		let every = 5.0;
-		let rem = crate::rng::lua_mod(
-			every - 1.0 - (g.hands_played - ab.hands_played_at_create),
-			every + 1.0,
-		);
-		jokers::jab(g, ji).loyalty_remaining = rem;
-		#[expect(clippy::float_cmp, reason = "exact: both are whole numbers of hands")]
-		let due = rem == every;
-		if due {
-			ret!(xmult_mod: Some(4.0));
+		J::EvenSteven
+			if oc
+				.effective_rank()
+				.is_some_and(|r| r <= Rank::Ten && r.id() % 2 == 0) =>
+		{
+			Some(Effect::mult(4.0))
 		}
-	}
-	let ab = g.jokers[ji].ab;
-	if j != J::SeeingDouble && ab.x_mult > 1.0 && has_type(jtype) {
-		ret!(xmult_mod: Some(ab.x_mult));
-	}
-	let (t_mult, t_chips) = joker_t_values(j);
-	if t_mult > 0.0 && has_type(jtype) {
-		ret!(mult_mod: Some(t_mult));
-	}
-	if t_chips > 0.0 && has_type(jtype) {
-		ret!(chip_mod: Some(t_chips));
-	}
-	if j == J::Half && g.play.len() <= 3 {
-		ret!(mult_mod: Some(20.0));
-	}
-	if j == J::Abstract {
-		let x = num::float(
-			g.jokers
-				.iter()
-				.filter(|c| matches!(c.kind, Kind::Joker(_)))
-				.count(),
-		);
-		ret!(mult_mod: Some(x * 3.0));
-	}
-	if j == J::Acrobat && g.hands_left == 0.0 {
-		ret!(xmult_mod: Some(3.0));
-	}
-	if j == J::MysticSummit && g.discards_left == 0.0 {
-		ret!(mult_mod: Some(15.0));
-	}
-	if j == J::Misprint {
-		let k = Key::from("misprint");
-		let m = g.rng.random_range(&k, 0.0, 23.0);
-		ret!(mult_mod: Some(m));
-	}
-	if j == J::Banner && g.discards_left > 0.0 {
-		ret!(chip_mod: Some(g.discards_left * 30.0));
-	}
-	if j == J::Stuntman {
-		ret!(chip_mod: Some(250.0));
-	}
-	if j == J::Matador && g.blind.triggered {
-		g.events.push(Ev::EaseDollars(8.0));
-		jokers::buffer_dollars(g, 8.0);
-		ret!(dollars: Some(8.0));
-	}
-	if j == J::Supernova {
-		ret!(mult_mod: Some(g.hands[sc.name as usize].played));
-	}
-	if j == J::Ceremonial && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::Vagabond && jokers::consumable_room(g) && g.dollars <= 4.0 {
-		g.consumeable_buffer += 1.0;
-		g.events.push_before(0.0, Ev::Create {
-			set: CardSet::Tarot,
-			area: Area::Consumables,
-			forced: None,
-			append: "vag",
-			rarity: None,
-			legendary: false,
-		});
-		ret!(extra: true);
-	}
-	if j == J::Superposition && jokers::consumable_room(g) {
-		let aces = sc
-			.scoring()
-			.iter()
-			.filter(|&&i| g.play[i as usize].id_is(ACE))
-			.count();
-		if aces >= 1 && hands.has(HandType::Straight) {
-			g.consumeable_buffer += 1.0;
-			g.events.push_before(0.0, Ev::Create {
-				set: CardSet::Tarot,
-				area: Area::Consumables,
-				forced: None,
-				append: "sup",
-				rarity: None,
-				legendary: false,
-			});
-			ret!(extra: true);
+		J::OddTodd
+			if oc
+				.effective_rank()
+				.is_some_and(|r| (r <= Rank::Ten && r.id() % 2 == 1) || r == Rank::Ace) =>
+		{
+			Some(Effect::chips(31.0))
 		}
-	}
-	if j == J::Seance && jokers::consumable_room(g) && hands.has(HandType::StraightFlush) {
-		g.consumeable_buffer += 1.0;
-		g.events.push_before(0.0, Ev::Create {
-			set: CardSet::Spectral,
-			area: Area::Consumables,
-			forced: None,
-			append: "sea",
-			rarity: None,
-			legendary: false,
-		});
-		ret!(extra: true);
-	}
-	if j == J::FlowerPot {
-		let smeared = g.smeared();
-		let mut suits = [0u8; 4]; // H, D, S, C
-		let order = [Suit::Hearts, Suit::Diamonds, Suit::Spades, Suit::Clubs];
-		for &i in sc.scoring() {
-			let c = &g.play[i as usize];
-			if c.enhancement != Enhancement::Wild {
-				for (si, &s) in order.iter().enumerate() {
-					if c.is_suit(s, true, false, smeared) && suits[si] == 0 {
-						suits[si] += 1;
-						break;
-					}
-				}
-			}
+		J::Triboulet if oc.has_rank(Rank::Queen) || oc.has_rank(Rank::King) => {
+			Some(Effect::x_mult(2.0))
 		}
-		for &i in sc.scoring() {
-			let c = &g.play[i as usize];
-			if c.enhancement == Enhancement::Wild {
-				for (si, &s) in order.iter().enumerate() {
-					if c.is_suit(s, false, false, smeared) && suits[si] == 0 {
-						suits[si] += 1;
-						break;
-					}
-				}
-			}
-		}
-		if suits.iter().all(|&x| x > 0) {
-			ret!(xmult_mod: Some(3.0));
-		}
+		_ => None,
 	}
-	if j == J::SeeingDouble {
-		let smeared = g.smeared();
-		// Hearts, Diamonds, Spades, Clubs
-		let mut suits = [0u32; 4];
-		for &i in sc.scoring() {
-			let c = &g.play[i as usize];
-			if c.enhancement != Enhancement::Wild {
-				if c.is_suit(Suit::Hearts, false, false, smeared) {
-					suits[0] += 1;
-				}
-				if c.is_suit(Suit::Diamonds, false, false, smeared) {
-					suits[1] += 1;
-				}
-				if c.is_suit(Suit::Spades, false, false, smeared) {
-					suits[2] += 1;
-				}
-				if c.is_suit(Suit::Clubs, false, false, smeared) {
-					suits[3] += 1;
-				}
-			}
-		}
-		for &i in sc.scoring() {
-			let c = &g.play[i as usize];
-			if c.enhancement == Enhancement::Wild {
-				if c.is_suit(Suit::Clubs, false, false, smeared) && suits[3] == 0 {
-					suits[3] += 1;
-				} else if c.is_suit(Suit::Diamonds, false, false, smeared) && suits[1] == 0 {
-					suits[1] += 1;
-				} else if c.is_suit(Suit::Spades, false, false, smeared) && suits[2] == 0 {
-					suits[2] += 1;
-				} else if c.is_suit(Suit::Hearts, false, false, smeared) && suits[0] == 0 {
-					suits[0] += 1;
-				}
-			}
-		}
-		if (suits[0] > 0 || suits[1] > 0 || suits[2] > 0) && suits[3] > 0 {
-			ret!(xmult_mod: Some(2.0));
-		}
-	}
-	if j == J::Wee {
-		ret!(chip_mod: Some(ab.chips));
-	}
-	if j == J::Castle && ab.chips > 0.0 {
-		ret!(chip_mod: Some(ab.chips));
-	}
-	if j == J::BlueJoker && !g.deck.is_empty() {
-		ret!(chip_mod: Some(2.0 * num::float(g.deck.len())));
-	}
-	if j == J::Erosion && (g.starting_deck_size - num::float(g.playing_card_count())) > 0.0 {
-		ret!(mult_mod: Some(4.0 * (g.starting_deck_size - num::float(g.playing_card_count()))));
-	}
-	if j == J::Square {
-		ret!(chip_mod: Some(ab.chips));
-	}
-	if j == J::Runner {
-		ret!(chip_mod: Some(ab.chips));
-	}
-	if j == J::IceCream {
-		ret!(chip_mod: Some(ab.chips));
-	}
-	if j == J::Stone && ab.stone_tally > 0.0 {
-		ret!(chip_mod: Some(25.0 * ab.stone_tally));
-	}
-	if j == J::SteelJoker && ab.steel_tally > 0.0 {
-		ret!(xmult_mod: Some(1.0 + 0.2 * ab.steel_tally));
-	}
-	if j == J::Bull && (g.dollars + g.dollar_buffer) > 0.0 {
-		ret!(chip_mod: Some(2.0 * (g.dollars + g.dollar_buffer).max(0.0)));
-	}
-	if j == J::DriversLicense && ab.driver_tally >= 16.0 {
-		ret!(xmult_mod: Some(3.0));
-	}
-	if j == J::Blackboard {
-		let smeared = g.smeared();
-		if g.hand.iter().all(|c| {
-			c.is_suit(Suit::Clubs, false, true, smeared)
-				|| c.is_suit(Suit::Spades, false, true, smeared)
-		}) {
-			ret!(xmult_mod: Some(3.0));
-		}
-	}
-	if j == J::Stencil && (g.joker_limit.limit - num::float(g.jokers.len())) > 0.0 {
-		ret!(xmult_mod: Some(ab.x_mult));
-	}
-	if j == J::Swashbuckler && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::Joker {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::Trousers && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::RideTheBus && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::Flash && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::Popcorn && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::GreenJoker && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::FortuneTeller && g.consumable_usage_tarot > 0.0 {
-		ret!(mult_mod: Some(g.consumable_usage_tarot));
-	}
-	if j == J::GrosMichel {
-		ret!(mult_mod: Some(15.0));
-	}
-	if j == J::Cavendish {
-		ret!(xmult_mod: Some(3.0));
-	}
-	if j == J::RedCard && ab.mult > 0.0 {
-		ret!(mult_mod: Some(ab.mult));
-	}
-	if j == J::CardSharp && g.hands[sc.name as usize].played_this_round > 1.0 {
-		ret!(xmult_mod: Some(3.0));
-	}
-	if j == J::Bootstraps && ((g.dollars + g.dollar_buffer) / 5.0).floor() >= 1.0 {
-		ret!(mult_mod: Some(2.0 * ((g.dollars + g.dollar_buffer) / 5.0).floor()));
-	}
-	if j == J::Caino && ab.caino_xmult > 1.0 {
-		ret!(xmult_mod: Some(ab.caino_xmult));
-	}
-	None
 }
 
-/// `ability.type` (poker hand requirement) for a joker.
-fn joker_hand_type(j: Joker) -> Option<HandType> {
+/// The jokers that pay for the suit of the scored card `oc`.
+fn suit_joker(
+	oc: &PlayingCard, smeared: bool, run: &mut Run, ancient_suit: Suit, rng: &mut PseudoRandom,
+	events: &mut EventQueue, j: Joker,
+) -> Option<Effect> {
 	use Joker as J;
-	Some(match j {
-		J::Jolly | J::Sly | J::Duo => HandType::Pair,
-		J::Zany | J::Wily | J::Trio => HandType::ThreeOfAKind,
-		J::Mad | J::Clever => HandType::TwoPair,
-		J::Crazy | J::Devious | J::Order => HandType::Straight,
-		J::Droll | J::Crafty | J::Tribe => HandType::Flush,
-		J::Family => HandType::FourOfAKind,
-		_ => return None,
+	let scores = |suit: Suit| oc.is_suit(suit, SuitTest::Scoring, smeared);
+	match j {
+		J::GreedyJoker if scores(Suit::Diamonds) => Some(Effect::mult(3.0)),
+		J::LustyJoker if scores(Suit::Hearts) => Some(Effect::mult(3.0)),
+		J::WrathfulJoker if scores(Suit::Spades) => Some(Effect::mult(3.0)),
+		J::GluttenousJoker if scores(Suit::Clubs) => Some(Effect::mult(3.0)),
+		J::RoughGem if scores(Suit::Diamonds) => Some(calculate_joker::pay(run, events, 1.0)),
+		J::OnyxAgate if scores(Suit::Clubs) => Some(Effect::mult(7.0)),
+		J::Arrowhead if scores(Suit::Spades) => Some(Effect::chips(50.0)),
+		J::Bloodstone if scores(Suit::Hearts) => {
+			let k = Key::from("bloodstone");
+			(rng.random(&k) < run.probabilities / 2.0).then_some(Effect::x_mult(1.5))
+		}
+		J::Ancient if scores(ancient_suit) => Some(Effect::x_mult(1.5)),
+		_ => None,
+	}
+}
+
+/// `context.individual` for the card `other` held in hand. A debuffed card
+/// still triggers the jokers that pay for it, which then return only `extra`.
+fn individual_held(
+	areas: &Areas, run: &mut Run, rng: &mut PseudoRandom, events: &mut EventQueue, j: Joker,
+	other: usize,
+) -> Option<Effect> {
+	use Joker as J;
+	let oc = &areas.hand.cards[other];
+	let unless_debuffed = |e: Effect| Some(if oc.core.debuff { Effect::EXTRA } else { e });
+	match j {
+		J::ShootTheMoon if oc.has_rank(Rank::Queen) => unless_debuffed(Effect::h_mult(13.0)),
+		J::Baron if oc.has_rank(Rank::King) => unless_debuffed(Effect::x_mult(1.5)),
+		J::ReservedParking if oc.is_face(areas.pareidolia()) => {
+			let k = Key::from("parking");
+			if rng.random(&k) < run.probabilities / 2.0 {
+				if oc.core.debuff {
+					Some(Effect::EXTRA)
+				} else {
+					Some(calculate_joker::pay(run, events, 1.0))
+				}
+			} else {
+				None
+			}
+		}
+		J::RaisedFist => {
+			let mut lowest: Option<(usize, Rank)> = None;
+			for (i, c) in areas.hand.cards.iter().enumerate() {
+				if !c.is_stone() && lowest.is_none_or(|(_, low)| low >= c.rank) {
+					lowest = Some((i, c.rank));
+				}
+			}
+			match lowest {
+				Some((i, rank)) if i == other => {
+					unless_debuffed(Effect::h_mult(2.0 * rank.nominal()))
+				}
+				_ => None,
+			}
+		}
+		_ => None,
+	}
+}
+
+/// `context.before`: the jokers that react to the hand as it is played.
+fn joker_before(g: &mut Game, call: Call<'_>) -> Option<Effect> {
+	use Joker as J;
+	let Call {
+		index: ji,
+		joker: j,
+		blueprinted,
+		scoring: sc,
+	} = call;
+	let ab = g.areas.jokers[ji].ab;
+	let hands = sc.hands;
+	match j {
+		J::Trousers
+			if (hands.has(HandType::TwoPair) || hands.has(HandType::FullHouse)) && !blueprinted =>
+		{
+			g.areas.jokers[ji].ab.mult += 2.0;
+			Some(Effect::EXTRA)
+		}
+		J::Space => {
+			let k = Key::from("space");
+			(g.rng.random(&k) < g.run.probabilities / 4.0).then_some(Effect {
+				level_up: true,
+				..Effect::NONE
+			})
+		}
+		J::Square if g.areas.play.len() == 4 && !blueprinted => {
+			g.areas.jokers[ji].ab.chips += 4.0;
+			Some(Effect::EXTRA)
+		}
+		J::Runner if hands.has(HandType::Straight) && !blueprinted => {
+			g.areas.jokers[ji].ab.chips += 15.0;
+			Some(Effect::EXTRA)
+		}
+		J::MidasMask if !blueprinted => gild_faces(
+			&mut g.areas,
+			g.run.hands_played,
+			&g.blind,
+			&mut g.events,
+			sc,
+		)
+		.then_some(Effect::EXTRA),
+		J::Vampire if !blueprinted => {
+			let drained = drain_enhancements(
+				&mut g.areas,
+				g.run.hands_played,
+				&g.blind,
+				&mut g.events,
+				sc,
+			);
+			if drained > 0 {
+				g.areas.jokers[ji].ab.x_mult += 0.1 * f64::from(drained);
+				Some(Effect::EXTRA)
+			} else {
+				None
+			}
+		}
+		J::TodoList if Some(sc.name) == ab.to_do => Some(calculate_joker::ease_and_pay(
+			&mut g.run,
+			&mut g.events,
+			4.0,
+		)),
+		J::Dna if g.round.hands_played == 0.0 && g.areas.play.len() == 1 => {
+			let original = g.areas.play[0].clone();
+			let mut c = flow::copy_playing_card(&mut g.areas, g.shop.discount_percent, original);
+			card_lifecycle::add_to_deck(g, &mut c);
+			g.areas.hand.cards.push(c);
+			g.events.push(Event::Materialize);
+			Some(Effect {
+				playing_cards_created: true,
+				extra: true,
+				..Effect::NONE
+			})
+		}
+		J::RideTheBus if !blueprinted => {
+			let par = g.areas.pareidolia();
+			let faces = sc.scoring().any(|i| g.areas.play[i].is_face(par));
+			if faces {
+				g.areas.jokers[ji].ab.mult = 0.0;
+				(ab.mult > 0.0).then_some(Effect::EXTRA)
+			} else {
+				g.areas.jokers[ji].ab.mult += 1.0;
+				None
+			}
+		}
+		J::Obelisk if !blueprinted => {
+			if !played_most(&g.hands, sc.name) {
+				g.areas.jokers[ji].ab.x_mult += 0.2;
+				None
+			} else if ab.x_mult > 1.0 {
+				g.areas.jokers[ji].ab.x_mult = 1.0;
+				Some(Effect::EXTRA)
+			} else {
+				None
+			}
+		}
+		J::GreenJoker if !blueprinted => {
+			g.areas.jokers[ji].ab.mult += 1.0;
+			Some(Effect::EXTRA)
+		}
+		_ => None,
+	}
+}
+
+/// Midas Mask: every scoring face card turns Gold. Whether there was one.
+fn gild_faces(
+	areas: &mut Areas, hands_played: f64, blind: &Blind, events: &mut EventQueue, sc: &Scoring,
+) -> bool {
+	let par = areas.pareidolia();
+	let debuff = CardDebuff::new(blind, &areas.jokers);
+	let mut any = false;
+	for i in sc.scoring() {
+		if areas.play[i].is_face(par) {
+			any = true;
+			card_lifecycle::set_enhancement(
+				&mut areas.play[i],
+				hands_played,
+				debuff,
+				Enhancement::Gold,
+			);
+			events.push(Event::Wait);
+		}
+	}
+	any
+}
+
+/// Vampire: strips the enhancement of every scoring card that has one;
+/// returns how many.
+fn drain_enhancements(
+	areas: &mut Areas, hands_played: f64, blind: &Blind, events: &mut EventQueue, sc: &Scoring,
+) -> u32 {
+	let debuff = CardDebuff::new(blind, &areas.jokers);
+	let mut drained = 0;
+	for i in sc.scoring() {
+		let c = &mut areas.play[i];
+		if c.enhancement != Enhancement::Base && !c.core.debuff && !c.vampired {
+			drained += 1;
+			c.vampired = true;
+			card_lifecycle::set_enhancement(c, hands_played, debuff, Enhancement::Base);
+			let id = c.core.id;
+			events.push(Event::Joker(JokerEvent::Unvampire { id }));
+		}
+	}
+	drained
+}
+
+/// Obelisk's reset test: no other visible hand has been played as often as
+/// `name`.
+fn played_most(hands: &HandLevels, name: HandType) -> bool {
+	let more_than = hands[name].played;
+	HandType::PAIRS_ORDER.into_iter().all(|h| {
+		let hl = &hands[h];
+		h == name || hl.played < more_than || !hl.visible
 	})
 }
 
-/// `(t_mult, t_chips)`.
-fn joker_t_values(j: Joker) -> (f64, f64) {
+/// `context.after`: Ice Cream and Seltzer run down, and go when they run out.
+fn joker_after(
+	joker: &mut Card, events: &mut EventQueue, j: Joker, blueprinted: bool,
+) -> Option<Effect> {
+	let ab = &mut joker.ab;
+	match j {
+		Joker::IceCream if !blueprinted => {
+			if ab.chips - 5.0 <= 0.0 {
+				calculate_joker::schedule_self_destruct(events, joker.core.id);
+			} else {
+				ab.chips -= 5.0;
+			}
+			Some(Effect::EXTRA)
+		}
+		Joker::Selzer if !blueprinted => {
+			if ab.extra - 1.0 <= 0.0 {
+				calculate_joker::schedule_self_destruct(events, joker.core.id);
+			} else {
+				ab.extra -= 1.0;
+			}
+			Some(Effect::EXTRA)
+		}
+		_ => None,
+	}
+}
+
+/// Advances Loyalty Card's countdown, refreshed every hand; returns whether
+/// this is the hand that pays.
+fn tick_loyalty(loyalty: &mut Card, hands_played: f64) -> bool {
+	let every = 5.0;
+	let rem = rng::lua_mod(
+		every - 1.0 - (hands_played - loyalty.core.hands_played_at_create),
+		every + 1.0,
+	);
+	loyalty.ab.loyalty_remaining = rem;
+	rem == every
+}
+
+/// Flower Pot: the scoring cards cover all four suits (Wild cards fill the
+/// suits the others leave open).
+fn all_suits_scored(areas: &Areas, sc: &Scoring) -> bool {
+	let smeared = areas.smeared();
+	let order = [Suit::Hearts, Suit::Diamonds, Suit::Spades, Suit::Clubs];
+	let mut seen = SuitSet::default();
+	for wild in [false, true] {
+		let test = if wild {
+			SuitTest::Scoring
+		} else {
+			SuitTest::IgnoreDebuff
+		};
+		for i in sc.scoring() {
+			let c = &areas.play[i];
+			if (c.enhancement == Enhancement::Wild) == wild
+				&& let Some(s) = order
+					.into_iter()
+					.find(|&s| c.is_suit(s, test, smeared) && !seen.contains(s))
+			{
+				seen.insert(s);
+			}
+		}
+	}
+	seen.count() == num::index32(Suit::ALL.len())
+}
+
+/// Seeing Double: a scoring Club and a scoring card of another suit (Wild
+/// cards fill the first suit still open, Clubs first).
+fn club_and_other_scored(areas: &Areas, sc: &Scoring) -> bool {
+	let smeared = areas.smeared();
+	let mut seen = SuitSet::default();
+	for i in sc.scoring() {
+		let c = &areas.play[i];
+		if c.enhancement != Enhancement::Wild {
+			for s in Suit::ALL {
+				if c.is_suit(s, SuitTest::Scoring, smeared) {
+					seen.insert(s);
+				}
+			}
+		}
+	}
+	for i in sc.scoring() {
+		let c = &areas.play[i];
+		if c.enhancement == Enhancement::Wild
+			&& let Some(s) = [Suit::Clubs, Suit::Diamonds, Suit::Spades, Suit::Hearts]
+				.into_iter()
+				.find(|&s| c.is_suit(s, SuitTest::Scoring, smeared) && !seen.contains(s))
+		{
+			seen.insert(s);
+		}
+	}
+	seen.contains(Suit::Clubs)
+		&& [Suit::Hearts, Suit::Diamonds, Suit::Spades]
+			.into_iter()
+			.any(|s| seen.contains(s))
+}
+
+/// `context.joker_main`: the joker's own effect in the joker pass.
+fn joker_main(g: &mut Game, call: Call<'_>) -> Option<Effect> {
+	use Joker as J;
+	let Call {
+		index: ji,
+		joker: j,
+		scoring: sc,
+		..
+	} = call;
+	if j == J::LoyaltyCard && tick_loyalty(&mut g.areas.jokers[ji], g.run.hands_played) {
+		return Some(Effect::xmult_mod(4.0));
+	}
+	let ab = g.areas.jokers[ji].ab;
+	let hands = sc.hands;
+	let needs = hand_joker(j);
+	let has_type = needs.is_none_or(|(h, _)| hands.has(h));
+	if j != J::SeeingDouble && ab.x_mult > 1.0 && has_type {
+		return Some(Effect::xmult_mod(ab.x_mult));
+	}
+	if let Some((_, pay)) = needs
+		&& has_type
+	{
+		match pay {
+			HandPay::Mult(m) => return Some(Effect::mult_mod(m)),
+			HandPay::Chips(c) => return Some(Effect::chip_mod(c)),
+			HandPay::XMult => {}
+		}
+	}
+	own_effect(g, j, &ab, sc)
+}
+
+/// The joker pass effect of `j` (ability `ab`) that the general rules of
+/// [`joker_main`] leave to the joker itself.
+fn own_effect(g: &mut Game, j: Joker, ab: &Ability, sc: &Scoring) -> Option<Effect> {
+	use Joker as J;
+	let money = g.run.dollars + g.run.dollar_buffer;
+	match j {
+		J::Half if g.areas.play.len() <= 3 => Some(Effect::mult_mod(20.0)),
+		J::Abstract => {
+			let owned = g
+				.areas
+				.jokers
+				.iter()
+				.filter(|c| matches!(c.kind, Kind::Joker(_)));
+			Some(Effect::mult_mod(num::float(owned.count()) * 3.0))
+		}
+		J::Acrobat if g.round.hands_left == 0.0 => Some(Effect::xmult_mod(3.0)),
+		J::MysticSummit if g.round.discards_left == 0.0 => Some(Effect::mult_mod(15.0)),
+		J::Misprint => {
+			let k = Key::from("misprint");
+			Some(Effect::mult_mod(g.rng.random_range(&k, 0.0, 23.0)))
+		}
+		J::Banner if g.round.discards_left > 0.0 => {
+			Some(Effect::chip_mod(g.round.discards_left * 30.0))
+		}
+		J::Stuntman => Some(Effect::chip_mod(250.0)),
+		J::Matador if g.blind.triggered => Some(calculate_joker::ease_and_pay(
+			&mut g.run,
+			&mut g.events,
+			8.0,
+		)),
+		J::Supernova => Some(Effect::mult_mod(g.hands[sc.name].played)),
+		J::Vagabond if g.run.dollars <= 4.0 => {
+			create_consumable(&mut g.areas, &mut g.events, CardSet::Tarot, "vag")
+		}
+		J::Superposition
+			if sc.scoring().any(|i| g.areas.play[i].has_rank(Rank::Ace))
+				&& sc.hands.has(HandType::Straight) =>
+		{
+			create_consumable(&mut g.areas, &mut g.events, CardSet::Tarot, "sup")
+		}
+		J::Seance if sc.hands.has(HandType::StraightFlush) => {
+			create_consumable(&mut g.areas, &mut g.events, CardSet::Spectral, "sea")
+		}
+		J::FlowerPot if all_suits_scored(&g.areas, sc) => Some(Effect::xmult_mod(3.0)),
+		J::SeeingDouble if club_and_other_scored(&g.areas, sc) => Some(Effect::xmult_mod(2.0)),
+		J::BlueJoker if !g.areas.deck.is_empty() => {
+			Some(Effect::chip_mod(2.0 * num::float(g.areas.deck.len())))
+		}
+		J::Erosion => {
+			let missing = g.run.starting_deck_size - num::float(g.areas.playing_card_count());
+			if missing > 0.0 {
+				Some(Effect::mult_mod(4.0 * missing))
+			} else {
+				None
+			}
+		}
+		J::Bull if money > 0.0 => Some(Effect::chip_mod(2.0 * money.max(0.0))),
+		J::Blackboard => {
+			let smeared = g.areas.smeared();
+			if g.areas.hand.cards.iter().all(|c| c.is_black(smeared)) {
+				Some(Effect::xmult_mod(3.0))
+			} else {
+				None
+			}
+		}
+		J::Stencil if g.areas.joker_room() => Some(Effect::xmult_mod(ab.x_mult)),
+		J::FortuneTeller if g.history.consumable_usage_tarot > 0.0 => {
+			Some(Effect::mult_mod(g.history.consumable_usage_tarot))
+		}
+		J::GrosMichel => Some(Effect::mult_mod(15.0)),
+		J::Cavendish => Some(Effect::xmult_mod(3.0)),
+		J::CardSharp if g.hands[sc.name].played_this_round > 1.0 => Some(Effect::xmult_mod(3.0)),
+		J::Bootstraps => {
+			let fives = (money / 5.0).floor();
+			if fives >= 1.0 {
+				Some(Effect::mult_mod(2.0 * fives))
+			} else {
+				None
+			}
+		}
+		_ => stored_value(j, ab),
+	}
+}
+
+/// A joker of the joker pass that creates a consumable of `set` (its key
+/// `append`), if the consumable area has room.
+fn create_consumable(
+	areas: &mut Areas, events: &mut EventQueue, set: CardSet, append: &'static str,
+) -> Option<Effect> {
+	if !areas.consumable_room_after_queued() {
+		return None;
+	}
+	calculate_joker::queue_consumable(areas, events, set, append);
+	Some(Effect::EXTRA)
+}
+
+/// The jokers whose main effect is a value kept on the card.
+fn stored_value(j: Joker, ab: &Ability) -> Option<Effect> {
 	use Joker as J;
 	match j {
-		J::Jolly => (8.0, 0.0),
-		J::Zany | J::Crazy => (12.0, 0.0),
-		J::Mad | J::Droll => (10.0, 0.0),
-		J::Sly => (0.0, 50.0),
-		J::Wily | J::Devious => (0.0, 100.0),
-		J::Clever | J::Crafty => (0.0, 80.0),
-		_ => (0.0, 0.0),
+		J::Wee | J::Square | J::Runner | J::IceCream => Some(Effect::chip_mod(ab.chips)),
+		J::Castle if ab.chips > 0.0 => Some(Effect::chip_mod(ab.chips)),
+		J::Stone if ab.stone_tally > 0.0 => Some(Effect::chip_mod(25.0 * ab.stone_tally)),
+		J::SteelJoker if ab.steel_tally > 0.0 => {
+			Some(Effect::xmult_mod(1.0 + 0.2 * ab.steel_tally))
+		}
+		J::DriversLicense if ab.driver_tally >= 16.0 => Some(Effect::xmult_mod(3.0)),
+		J::Joker => Some(Effect::mult_mod(ab.mult)),
+		J::Ceremonial
+		| J::Swashbuckler
+		| J::Trousers
+		| J::RideTheBus
+		| J::Flash
+		| J::Popcorn
+		| J::GreenJoker
+		| J::RedCard
+			if ab.mult > 0.0 =>
+		{
+			Some(Effect::mult_mod(ab.mult))
+		}
+		J::Caino if ab.caino_xmult > 1.0 => Some(Effect::xmult_mod(ab.caino_xmult)),
+		_ => None,
 	}
+}
+
+/// What a joker pays for the poker hand it needs: its `t_mult`, its
+/// `t_chips`, or the `x_mult` kept in its ability.
+#[derive(Clone, Copy)]
+enum HandPay {
+	Mult(f64),
+	Chips(f64),
+	XMult,
+}
+
+/// `ability.type`, the poker hand a joker needs in the play, and what it
+/// pays for it.
+fn hand_joker(j: Joker) -> Option<(HandType, HandPay)> {
+	use HandType as H;
+	use Joker as J;
+	Some(match j {
+		J::Jolly => (H::Pair, HandPay::Mult(8.0)),
+		J::Sly => (H::Pair, HandPay::Chips(50.0)),
+		J::Duo => (H::Pair, HandPay::XMult),
+		J::Zany => (H::ThreeOfAKind, HandPay::Mult(12.0)),
+		J::Wily => (H::ThreeOfAKind, HandPay::Chips(100.0)),
+		J::Trio => (H::ThreeOfAKind, HandPay::XMult),
+		J::Mad => (H::TwoPair, HandPay::Mult(10.0)),
+		J::Clever => (H::TwoPair, HandPay::Chips(80.0)),
+		J::Crazy => (H::Straight, HandPay::Mult(12.0)),
+		J::Devious => (H::Straight, HandPay::Chips(100.0)),
+		J::Order => (H::Straight, HandPay::XMult),
+		J::Droll => (H::Flush, HandPay::Mult(10.0)),
+		J::Crafty => (H::Flush, HandPay::Chips(80.0)),
+		J::Tribe => (H::Flush, HandPay::XMult),
+		J::Family => (H::FourOfAKind, HandPay::XMult),
+		_ => return None,
+	})
 }

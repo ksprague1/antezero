@@ -49,7 +49,6 @@ def block(text: str, header_re: str) -> str:
 
 
 def render(text: str) -> str:
-    """``_codes.py`` for the contents of ``data_gen.rs``."""
     lines = [
         '"""Index -> game key tables generated from sim/src/data_gen.rs by',
         "bridge/scripts/gen_codes.py. Do not edit by hand.",

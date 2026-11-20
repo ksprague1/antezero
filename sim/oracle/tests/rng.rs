@@ -2,36 +2,39 @@
 //! need the game's `lua51.dll` (and scripts), so they only run when asked
 //! for: `cargo test -p oracle --test rng -- --include-ignored`.
 
-use oracle::Oracle;
+use oracle::{Oracle, lua_path, lua_str};
 use sim::rng::{LuaRandom, PseudoRandom, pseudohash, round13};
 
+/// The comma-separated numbers the oracle printed.
 fn parse(s: &str) -> Vec<f64> {
+	if s.is_empty() {
+		return Vec::new();
+	}
 	s.split(',')
-		.filter(|x| !x.is_empty())
 		.map(|x| x.parse::<f64>().expect("the oracle prints numbers"))
 		.collect()
 }
 
-fn raw() -> Oracle {
+fn bare() -> Oracle {
 	assert!(
 		oracle::dll_available(),
 		"the RNG tests need the game's lua51.dll (see oracle/src/lib.rs)"
 	);
-	Oracle::raw().expect("lua51.dll loads")
+	Oracle::new_bare().expect("lua51.dll loads")
 }
 
 #[test]
 #[ignore = "needs the game's lua51.dll; run with --include-ignored"]
-#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 fn math_random_matches_luajit() {
-	let o = raw();
+	const SEEDS: usize = 3000;
+	let mut o = bare();
 	// Seeds spanning the ranges the game uses (pseudoseed outputs are in [0,1)).
 	let out = o
-		.eval(
+		.eval(&format!(
 			r"
-            local t = {}
+            local t = {{}}
             local s = 0.123456789
-            for i = 1, 3000 do
+            for i = 1, {SEEDS} do
                 s = (s * 7.31 + 0.137) % 1
                 local seed = (i % 7 == 0) and (s * 1000 - 500) or s
                 math.randomseed(seed)
@@ -43,10 +46,10 @@ fn math_random_matches_luajit() {
             end
             return table.concat(t, ',')
         ",
-		)
+		))
 		.unwrap();
 	let v = parse(&out);
-	assert_eq!(v.len(), 3000 * 5);
+	assert_eq!(v.len(), SEEDS * 5);
 	for c in v.chunks(5) {
 		let mut r = LuaRandom::new(c[0]);
 		assert_eq!(r.random(), c[1], "seed {}", c[0]);
@@ -58,15 +61,15 @@ fn math_random_matches_luajit() {
 
 #[test]
 #[ignore = "needs the game's lua51.dll; run with --include-ignored"]
-#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 fn round13_matches_string_format() {
-	let o = raw();
+	const VALUES: usize = 200_000;
+	let mut o = bare();
 	let out = o
-		.eval(
+		.eval(&format!(
 			r#"
-            local t = {}
+            local t = {{}}
             math.randomseed(42)
-            for i = 1, 200000 do
+            for i = 1, {VALUES} do
                 local x = math.random()
                 if i % 3 == 0 then x = (2.134453429141 + x*1.72431234)%1 end
                 if i % 11 == 0 then x = math.floor(x*1e13)/1e13 + 0.5e-13 end
@@ -75,33 +78,27 @@ fn round13_matches_string_format() {
             end
             return table.concat(t, ',')
         "#,
-		)
+		))
 		.unwrap();
 	let v = parse(&out);
-	let mut n = 0;
+	assert_eq!(v.len(), VALUES * 2);
 	for c in v.chunks(2) {
 		assert_eq!(round13(c[0]), c[1], "x = {:e}", c[0]);
-		n += 1;
 	}
-	assert_eq!(n, 200_000);
 }
 
 #[test]
 #[ignore = "needs the game's lua51.dll; run with --include-ignored"]
-#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 fn pseudohash_and_pseudoseed_match_game_code() {
-	let o = raw();
+	const REPS: usize = 40;
+	let mut o = bare();
 	let src = oracle::default_src().join("functions/misc_functions.lua");
 	assert!(
 		src.exists(),
 		"the game scripts are missing ({})",
 		src.display()
 	);
-	o.exec(&format!(
-		"dofile({})",
-		oracle::lua_str(&src.display().to_string().replace('\\', "/"))
-	))
-	.unwrap();
+	o.exec(&format!("dofile({})", lua_path(&src))).unwrap();
 	let keys = [
 		"boss",
 		"shuffle",
@@ -131,14 +128,16 @@ fn pseudohash_and_pseudoseed_match_game_code() {
 		"8NJHJ5M2",
 		"seedwith spaces",
 	];
+	let lua_keys = keys.map(lua_str).join(",");
 	for seed in seeds {
+		let seed_lua = lua_str(seed);
 		let code = format!(
 			r"
-            G = {{GAME = {{pseudorandom = {{seed = '{seed}'}}}}}}
-            G.GAME.pseudorandom.hashed_seed = pseudohash('{seed}')
-            local keys = {{{}}}
+            G = {{GAME = {{pseudorandom = {{seed = {seed_lua}}}}}}}
+            G.GAME.pseudorandom.hashed_seed = pseudohash({seed_lua})
+            local keys = {{{lua_keys}}}
             local t = {{string.format('%.17g', G.GAME.pseudorandom.hashed_seed)}}
-            for rep = 1, 40 do
+            for rep = 1, {REPS} do
                 for _, k in ipairs(keys) do
                     t[#t+1] = string.format('%.17g', pseudoseed(k))
                 end
@@ -146,16 +145,13 @@ fn pseudohash_and_pseudoseed_match_game_code() {
             for _, k in ipairs(keys) do t[#t+1] = string.format('%.17g', pseudohash(k)) end
             return table.concat(t, ',')
         ",
-			keys.iter()
-				.map(|k| format!("'{k}'"))
-				.collect::<Vec<_>>()
-				.join(",")
 		);
 		let v = parse(&o.eval(&code).unwrap());
+		assert_eq!(v.len(), 1 + (REPS + 1) * keys.len(), "seed {seed}");
 		let mut pr = PseudoRandom::new(seed);
 		assert_eq!(pr.hashed_seed(), v[0], "hashed seed {seed}");
 		let mut i = 1;
-		for _ in 0..40 {
+		for _ in 0..REPS {
 			for k in keys {
 				assert_eq!(pr.seed_str(k), v[i], "seed {seed} key {k}");
 				i += 1;

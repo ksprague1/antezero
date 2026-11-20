@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+/// A parsed JSON value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Json {
 	Null,
@@ -24,8 +25,10 @@ impl Json {
 		}
 	}
 
+	/// The number, also one the harness wrote as `"inf"`, `"-inf"` or
+	/// `"nan"`.
 	#[must_use]
-	pub fn num(&self) -> Option<f64> {
+	pub fn as_f64(&self) -> Option<f64> {
 		match self {
 			Json::Num(n) => Some(*n),
 			Json::Str(s) if s == "inf" => Some(f64::INFINITY),
@@ -36,7 +39,7 @@ impl Json {
 	}
 
 	#[must_use]
-	pub fn str(&self) -> Option<&str> {
+	pub fn as_str(&self) -> Option<&str> {
 		if let Json::Str(s) = self {
 			Some(s)
 		} else {
@@ -44,18 +47,36 @@ impl Json {
 		}
 	}
 
+	/// A flag the harness dumps: `null` (Lua's `nil`) is false.
+	///
+	/// # Panics
+	///
+	/// If the value is neither a boolean nor `null`.
 	#[must_use]
-	pub fn bool(&self) -> bool {
-		matches!(self, Json::Bool(true))
+	pub fn as_flag(&self) -> bool {
+		match self {
+			Json::Bool(b) => *b,
+			Json::Null => false,
+			other => panic!("expected a flag (a boolean or null), got {other:?}"),
+		}
+	}
+
+	/// A list the harness dumps: `null` (Lua's `nil`) is empty.
+	///
+	/// # Panics
+	///
+	/// If the value is neither an array nor `null`.
+	#[must_use]
+	pub fn as_list(&self) -> &[Json] {
+		match self {
+			Json::Arr(a) => a,
+			Json::Null => &[],
+			other => panic!("expected an array or null, got {other:?}"),
+		}
 	}
 
 	#[must_use]
-	pub fn arr(&self) -> &[Json] {
-		if let Json::Arr(a) = self { a } else { &[] }
-	}
-
-	#[must_use]
-	pub fn obj(&self) -> Option<&BTreeMap<String, Json>> {
+	pub fn as_object(&self) -> Option<&BTreeMap<String, Json>> {
 		if let Json::Obj(m) = self {
 			Some(m)
 		} else {
@@ -70,20 +91,17 @@ impl Json {
 ///
 /// Returns what is malformed and at which byte.
 pub fn parse(s: &str) -> Result<Json, String> {
-	let mut p = Parser {
-		b: s.as_bytes(),
-		i: 0,
-	};
+	let mut p = Parser { src: s, i: 0 };
 	let v = p.value()?;
 	p.ws();
-	if p.i != p.b.len() {
+	if p.i != s.len() {
 		return Err(p.err("trailing characters"));
 	}
 	Ok(v)
 }
 
-struct Parser<'a> {
-	b: &'a [u8],
+struct Parser<'src> {
+	src: &'src str,
 	i: usize,
 }
 
@@ -92,14 +110,20 @@ impl Parser<'_> {
 		format!("{what} at byte {}", self.i)
 	}
 
+	fn bytes(&self) -> &[u8] {
+		self.src.as_bytes()
+	}
+
 	fn ws(&mut self) {
-		while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
+		while self.i < self.src.len()
+			&& matches!(self.bytes()[self.i], b' ' | b'\t' | b'\n' | b'\r')
+		{
 			self.i += 1;
 		}
 	}
 
 	fn peek(&self) -> Result<u8, String> {
-		self.b
+		self.bytes()
 			.get(self.i)
 			.copied()
 			.ok_or_else(|| self.err("unexpected end"))
@@ -107,18 +131,61 @@ impl Parser<'_> {
 
 	fn expect(&mut self, c: u8) -> Result<(), String> {
 		if self.peek()? != c {
-			return Err(self.err(&format!("expected {:?}", c as char)));
+			return Err(self.err(&format!("expected {:?}", char::from(c))));
 		}
 		self.i += 1;
 		Ok(())
 	}
 
 	fn literal(&mut self, word: &str, v: Json) -> Result<Json, String> {
-		if !self.b[self.i..].starts_with(word.as_bytes()) {
+		if !self.src[self.i..].starts_with(word) {
 			return Err(self.err("bad literal"));
 		}
 		self.i += word.len();
 		Ok(v)
+	}
+
+	/// Skips the ASCII digits at the cursor; returns how many there were.
+	fn digits(&mut self) -> usize {
+		let start = self.i;
+		while self.bytes().get(self.i).is_some_and(u8::is_ascii_digit) {
+			self.i += 1;
+		}
+		self.i - start
+	}
+
+	/// A number: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+	fn number(&mut self) -> Result<Json, String> {
+		let start = self.i;
+		if self.peek()? == b'-' {
+			self.i += 1;
+		}
+		match self.bytes().get(self.i) {
+			Some(b'0') => self.i += 1,
+			Some(b'1'..=b'9') => {
+				self.digits();
+			}
+			_ => return Err(self.err("bad number")),
+		}
+		if self.bytes().get(self.i) == Some(&b'.') {
+			self.i += 1;
+			if self.digits() == 0 {
+				return Err(self.err("bad number"));
+			}
+		}
+		if matches!(self.bytes().get(self.i), Some(b'e' | b'E')) {
+			self.i += 1;
+			if matches!(self.bytes().get(self.i), Some(b'+' | b'-')) {
+				self.i += 1;
+			}
+			if self.digits() == 0 {
+				return Err(self.err("bad number"));
+			}
+		}
+		let text = &self.src[start..self.i];
+		text.parse::<f64>()
+			.map(Json::Num)
+			.map_err(|e| format!("bad number {text:?} at byte {start}: {e}"))
 	}
 
 	fn value(&mut self) -> Result<Json, String> {
@@ -175,47 +242,42 @@ impl Parser<'_> {
 					}
 				}
 			}
-			b'-' | b'0'..=b'9' => {
-				let st = self.i;
-				while self.i < self.b.len()
-					&& matches!(
-						self.b[self.i],
-						b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
-					) {
-					self.i += 1;
-				}
-				let t = std::str::from_utf8(&self.b[st..self.i])
-					.expect("the loop accepted ASCII bytes only");
-				t.parse::<f64>()
-					.map(Json::Num)
-					.map_err(|e| format!("bad number {t:?} at byte {st}: {e}"))
-			}
+			b'-' | b'0'..=b'9' => self.number(),
 			_ => Err(self.err("unexpected character")),
 		}
 	}
 
+	/// The four hex digits of a `\u` escape.
 	fn hex4(&mut self) -> Result<u32, String> {
 		let h = self
-			.b
+			.bytes()
 			.get(self.i..self.i + 4)
-			.and_then(|h| std::str::from_utf8(h).ok())
 			.ok_or_else(|| self.err("short \\u escape"))?;
-		let v = u32::from_str_radix(h, 16).map_err(|_| self.err("bad \\u escape"))?;
+		let v = h
+			.iter()
+			.try_fold(0, |v, &b| Some(v * 16 + char::from(b).to_digit(16)?))
+			.ok_or_else(|| self.err("bad \\u escape"))?;
 		self.i += 4;
 		Ok(v)
 	}
 
 	fn string(&mut self) -> Result<String, String> {
 		self.expect(b'"')?;
-		let mut out = Vec::new();
+		let mut out = String::new();
+		// Unescaped text is copied in runs; a run ends at an ASCII byte (`"`
+		// or `\`), which is a char boundary.
+		let mut run = self.i;
 		loop {
 			let c = self.peek().map_err(|_| self.err("unterminated string"))?;
-			self.i += 1;
 			match c {
 				b'"' => {
-					return String::from_utf8(out).map_err(|_| self.err("invalid UTF-8 in string"));
+					out.push_str(&self.src[run..self.i]);
+					self.i += 1;
+					return Ok(out);
 				}
 				b'\\' => {
+					out.push_str(&self.src[run..self.i]);
+					self.i += 1;
 					let e = self.peek()?;
 					self.i += 1;
 					let ch = match e {
@@ -230,7 +292,7 @@ impl Parser<'_> {
 						b'u' => {
 							let hi = self.hex4()?;
 							let code = if (0xd800..0xdc00).contains(&hi) {
-								if !self.b[self.i..].starts_with(b"\\u") {
+								if !self.src[self.i..].starts_with("\\u") {
 									return Err(self.err("unpaired surrogate"));
 								}
 								self.i += 2;
@@ -246,10 +308,11 @@ impl Parser<'_> {
 						}
 						_ => return Err(self.err("bad escape")),
 					};
-					out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+					out.push(ch);
+					run = self.i;
 				}
 				0..0x20 => return Err(self.err("control character in string")),
-				_ => out.push(c),
+				_ => self.i += 1,
 			}
 		}
 	}
@@ -261,13 +324,15 @@ mod tests {
 
 	#[test]
 	fn parses_harness_output() {
-		let j = parse(r#" {"a":[1,-2.5e3,"inf"],"b":{"c":true,"d":null},"e":"x\"\\\n\u00e9\u0001\ud83d\ude00","f":[]} "#).unwrap();
-		assert_eq!(j.get("a").arr().len(), 3);
-		assert_eq!(j.get("a").arr()[1].num(), Some(-2500.0));
-		assert_eq!(j.get("a").arr()[2].num(), Some(f64::INFINITY));
-		assert!(j.get("b").get("c").bool());
+		let j = parse(r#" {"a":[1,-2.5e3,"inf",0,-0.5,1E+2],"b":{"c":true,"d":null},"e":"x\"\\\n\u00e9\u0001\ud83d\ude00","f":[]} "#).unwrap();
+		assert_eq!(j.get("a").as_list().len(), 6);
+		assert_eq!(j.get("a").as_list()[1].as_f64(), Some(-2500.0));
+		assert_eq!(j.get("a").as_list()[2].as_f64(), Some(f64::INFINITY));
+		assert_eq!(j.get("a").as_list()[4].as_f64(), Some(-0.5));
+		assert_eq!(j.get("a").as_list()[5].as_f64(), Some(100.0));
+		assert!(j.get("b").get("c").as_flag());
 		assert_eq!(j.get("b").get("d"), &Json::Null);
-		assert_eq!(j.get("e").str(), Some("x\"\\\né\u{1}😀"));
+		assert_eq!(j.get("e").as_str(), Some("x\"\\\né\u{1}😀"));
 		assert_eq!(parse("\"\\t\\r\\/é\"").unwrap(), Json::Str("\t\r/é".into()));
 		assert_eq!(parse("{}").unwrap(), Json::Obj(BTreeMap::new()));
 	}
@@ -288,9 +353,16 @@ mod tests {
 			"\"abc",
 			"\"\\x\"",
 			"\"\\u12\"",
+			"\"\\u+041\"",
 			"\"\\ud800\"",
 			"\"a\nb\"",
+			"01",
 			"01x",
+			"1.",
+			"-.5",
+			"1.e5",
+			"1e",
+			"+1",
 			"{1:2}",
 			"-",
 		] {

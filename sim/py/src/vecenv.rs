@@ -1,5 +1,7 @@
-//! `VecEnv`: many simulator games stepped in parallel (rayon), writing
-//! observations straight into preallocated numpy arrays.
+//! `VecEnv`: many auto-resetting games stepped in parallel, with the reward
+//! shaping and the reservoirs of ante starts the episodes restart from.
+
+use std::ops::{Index, IndexMut, RangeInclusive};
 
 use numpy::ndarray::Dimension;
 use numpy::{
@@ -9,65 +11,65 @@ use numpy::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use sim::data::Back;
-use sim::game::{BlindStatus, Game as SimGame, Phase};
-use sim::num;
+use sim::data::{ALL_JOKERS, ALL_PLANETS, Back};
+use sim::game::{BlindSlot, BlindStatus, Game as SimGame, Phase};
+use sim::inject::Inject;
 use sim::obs::{self, BuildPreview, Op};
+use sim::rng::splitmix64;
+use sim::{Action, CardMask, Stake, num};
 
-use crate::rows::{ObsRow, Rows, check_candidates};
+use crate::game::{Game, parse_back};
+use crate::rows::{
+	OPS_F_SHAPE, OPS_SHAPE, ObsOptions, Rows, TOK_F_SHAPE, TOK_I_SHAPE, op_options, row_len,
+};
 
 const SEED_CHARS: &[u8] = b"123456789ABCDEFGHIJKLMNPQRSTUVWXYZ";
 
 /// Seed string `n` in the game's seed alphabet (8 characters).
-fn seed_string(mut n: u64) -> String {
+fn seed_string(n: u64) -> String {
 	// Spread consecutive indices over the seed space.
-	n = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (n >> 29);
-	(0..8)
-		.map(|_| {
-			let c = SEED_CHARS[num::pick(n, SEED_CHARS.len())] as char;
-			n /= SEED_CHARS.len() as u64;
-			c
-		})
-		.collect()
-}
-
-fn mix(n: u64) -> u64 {
-	let mut z = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
-	z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-	z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-	z ^ (z >> 31)
+	let mut n = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (n >> 29);
+	let radix = num::index64(SEED_CHARS.len());
+	let mut seed = String::with_capacity(8);
+	for _ in 0..8 {
+		seed.push(char::from(SEED_CHARS[num::pick(n, SEED_CHARS.len())]));
+		n /= radix;
+	}
+	seed
 }
 
 /// Uniform in [0, 1) from a hash.
 #[expect(
 	clippy::cast_precision_loss,
-	reason = "both operands have at most 25 bits, which an f32 holds exactly"
+	reason = "`splitmix64(n) >> 40` is below 2^24, which an f32 holds exactly"
 )]
 fn unit(n: u64) -> f32 {
-	(mix(n) >> 40) as f32 / (1u64 << 24) as f32
+	(splitmix64(n) >> 40) as f32 / 16_777_216.0
 }
 
 /// The shaping potential `w_blind * progress + w_score * fraction of the
 /// current blind's chips scored`, with progress = the run position in blinds
-/// (3 per finished ante plus this ante's defeated blinds). Counting blinds
-/// cleared instead paid for skipping blinds and for Hieroglyph/Petroglyph
-/// (which add an ante of blinds to beat), and policies learned both. The
+/// (the blinds of every finished ante plus this ante's defeated ones). The
 /// lost blind's fraction is kept at game over: if losing dropped it,
 /// delaying a loss would pay (stalling).
+// Counting blinds cleared instead would pay for skipping blinds and for
+// Hieroglyph/Petroglyph (which add an ante of blinds to beat), and policies
+// exploit both.
 pub(crate) fn potential(g: &SimGame, w_blind: f32, w_score: f32) -> f32 {
-	let in_round = matches!(g.phase, Phase::Round | Phase::GameOver);
+	let in_round = matches!(g.flow.phase, Phase::Round | Phase::GameOver);
 	let round = if in_round && g.blind.chips > 0.0 {
-		num::feat((g.chips / g.blind.chips).min(1.0))
+		num::feat((g.round.chips / g.blind.chips).min(1.0))
 	} else {
 		0.0
 	};
 	let defeated = num::id(
-		g.blind_states
+		g.blind_select
+			.states
 			.iter()
 			.filter(|&&s| s == BlindStatus::Defeated)
 			.count(),
 	);
-	let progress = 3 * (g.ante - 1).max(0) + defeated;
+	let progress = num::id(BlindSlot::ALL.len()) * (g.run.ante - 1).max(0) + defeated;
 	w_blind * num::feat(f64::from(progress)) + w_score * round
 }
 
@@ -78,8 +80,9 @@ pub(crate) fn potential(g: &SimGame, w_blind: f32, w_score: f32) -> f32 {
 /// terminal states: with `Phi(terminal) = 0` a lost game would hand back all
 /// its progress, every loss would return the same, and a policy that never
 /// wins would get no learning signal. So the episode return is the true
-/// return plus `gamma^T * Phi(s_T)`, the (discounted) blinds cleared. With
-/// `terminal_phi = false` Phi *is* zeroed there (classic shaping: exactly P(win)).
+/// return plus `gamma^T * Phi(s_T)`, the discounted shaping potential of the
+/// final state. With `terminal_phi = false` Phi *is* zeroed there (classic
+/// shaping: exactly P(win)).
 #[derive(Clone, Copy, Debug)]
 struct Reward {
 	gamma: f32,
@@ -96,16 +99,17 @@ impl Reward {
 		potential(g, self.w_blind, self.w_score)
 	}
 
-	/// The true (unshaped) reward of a transition.
 	fn true_reward(&self, blinds_before: u32, won_before: bool, g: &SimGame) -> f32 {
 		let mut r = 0.0;
 		if g.run_won() && !won_before {
 			r += self.r_win;
 		} else if won_before {
 			r += self.r_endless
-				* num::feat(f64::from(g.blinds_cleared.saturating_sub(blinds_before)));
+				* num::feat(f64::from(
+					g.run.blinds_cleared.saturating_sub(blinds_before),
+				));
 		}
-		if g.phase == Phase::GameOver || g.is_stuck() {
+		if g.flow.phase == Phase::GameOver || g.is_stuck() {
 			r -= self.r_loss;
 		}
 		r
@@ -113,28 +117,94 @@ impl Reward {
 }
 
 #[derive(Clone, Copy)]
-#[expect(
-	clippy::struct_excessive_bools,
-	reason = "independent switches of the Python constructor"
-)]
 struct Cfg {
 	endless: bool,
 	max_ante: i32,
 	step_limit: u32,
 	reward: Reward,
-	candidates: usize,
-	deck_tokens: bool,
-	previews: bool,
+	obs: ObsOptions,
+	/// The share of played hands that get a joker-order label.
+	order_label_rate: f32,
 	snapshot_prob: f32,
 	snapshot_min_ante: i32,
-	allow_skip: bool,
+	practice_prob: f32,
+	practice_eternal: bool,
 }
 
-/// Snapshots kept for restarts. Ante starts are offered with probability
-/// `OFFER` and replace a random entry once full, so the pool follows the
-/// current policy's state distribution.
+/// Applies the env's settings to a game it is about to run.
+fn configure(g: &mut SimGame, cfg: &Cfg) {
+	g.set_tracing(false);
+	g.setup.endless = cfg.endless;
+}
+
+/// Snapshots kept for restarts, per pool (a pool follows the current
+/// policy's state distribution).
 const RESERVOIR: usize = 4096;
+/// The probability that an ante start is offered to its reservoir, where it
+/// replaces a random entry once the reservoir is full.
 const OFFER: f32 = 0.25;
+/// The antes whose starts the practice pool takes: later ante starts mostly
+/// have no joker slot free for a gift.
+const PRACTICE_ANTES: RangeInclusive<i32> = 2..=3;
+/// The planets of the nine hand types every run can play.
+const GIFT_PLANETS: usize = 9;
+const GIFT_LEVELS: f64 = 3.0;
+/// Keeps the label sampling apart from the snapshot offers (the same hash
+/// otherwise).
+const LABEL_SALT: u64 = 0x6f72_6465_725f_6c62;
+
+/// Run `slot`'s seed index after `resets` resets of a `VecEnv` of `n_slots`
+/// envs started from `base_seed`.
+fn run_number(base_seed: u64, resets: u64, n_slots: u64, slot: usize) -> u64 {
+	base_seed
+		.wrapping_mul(1_000_003)
+		.wrapping_add(resets * n_slots + num::index64(slot))
+}
+
+/// A pool of ante starts that episodes restart from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pool {
+	/// Late ante starts (`snapshot_min_ante` on), restarted from as they are.
+	Late,
+	/// Early ante starts (`PRACTICE_ANTES`), restarted from with a gift.
+	Practice,
+}
+
+/// The snapshots kept for restarts.
+#[derive(Default)]
+struct Reservoirs {
+	late: Vec<SimGame>,
+	practice: Vec<SimGame>,
+}
+
+impl Index<Pool> for Reservoirs {
+	type Output = Vec<SimGame>;
+
+	fn index(&self, pool: Pool) -> &Vec<SimGame> {
+		match pool {
+			Pool::Late => &self.late,
+			Pool::Practice => &self.practice,
+		}
+	}
+}
+
+impl IndexMut<Pool> for Reservoirs {
+	fn index_mut(&mut self, pool: Pool) -> &mut Vec<SimGame> {
+		match pool {
+			Pool::Late => &mut self.late,
+			Pool::Practice => &mut self.practice,
+		}
+	}
+}
+
+/// Where an episode's game came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+	/// A new run, or a game handed in by `set_game`.
+	Fresh,
+	/// A snapshot of the pool, with its hidden state resampled.
+	Snapshot(Pool),
+}
 
 struct Slot {
 	g: SimGame,
@@ -145,69 +215,147 @@ struct Slot {
 	phi: f32,
 	resets: u64,
 	invalid: u64,
-	from_snapshot: bool,
-	/// The observation of the last state before an auto-reset, if the
-	/// episode was truncated (to bootstrap from).
-	fin: Option<ObsRow>,
+	origin: Origin,
 	/// Recent build previews (reused while the build is unchanged).
-	pv: Vec<BuildPreview>,
+	previews: Vec<BuildPreview>,
 }
 
-/// What the step of every env shares.
 struct StepCtx<'a> {
 	cfg: Cfg,
 	backs: &'a [Back],
-	stakes: &'a [u8],
+	stakes: &'a [Stake],
 	base_seed: u64,
 	n_slots: u64,
-	reservoir: &'a [SimGame],
-	/// Probability of offering an ante start to the reservoir.
+	reservoirs: &'a Reservoirs,
+	/// Probability of offering an ante start to its reservoir.
 	p_offer: f32,
 }
 
+/// One env's choice: an op index, a card mask and a destination.
+#[derive(Clone, Copy)]
+struct Choice {
+	op: i32,
+	cards: u32,
+	dest: i32,
+}
+
+/// One step's choices of every env.
+#[derive(Clone, Copy)]
+struct Choices<'a> {
+	op: &'a [i32],
+	cards: &'a [u32],
+	dest: &'a [i32],
+}
+
+impl Choices<'_> {
+	fn of(self, i: usize) -> Choice {
+		Choice {
+			op: self.op[i],
+			cards: self.cards[i],
+			dest: self.dest[i],
+		}
+	}
+}
+
 impl Slot {
-	/// Applies the choice `(op, cards, dest)` of env `i`. If the episode ended, the env is reset; a truncated
-	/// episode's last observation is written to `row` first and kept in `fin`.
+	fn new(g: SimGame, reward: &Reward) -> Slot {
+		Slot {
+			phi: reward.potential(&g),
+			g,
+			ops: Vec::with_capacity(obs::MAX_OPS),
+			steps: 0,
+			ret: 0.0,
+			resets: 0,
+			invalid: 0,
+			origin: Origin::Fresh,
+			previews: Vec::new(),
+		}
+	}
+
+	/// Starts the slot's next episode on `g`.
+	fn install(&mut self, g: SimGame, origin: Origin, reward: &Reward) {
+		self.g = g;
+		self.origin = origin;
+		self.steps = 0;
+		self.ret = 0.0;
+		self.phi = reward.potential(&self.g);
+	}
+
+	/// Uniform in [0, 1) from a hash of `seed`, the env `i`, its game count
+	/// and its step count: no RNG is consumed.
+	fn roll(&self, seed: u64, i: usize) -> f32 {
+		let n = splitmix64(seed ^ num::index64(i));
+		unit(n ^ (self.resets << 20) ^ u64::from(self.steps))
+	}
+
+	/// Applies the choice of env `i`. If the episode ended, the env is reset;
+	/// a truncated episode's last observation is written to `final_row`
+	/// first.
 	fn step(
-		&mut self, i: usize, (op, cards, dest): (i32, u32, i32), ctx: &StepCtx<'_>,
-		row: &mut Rows<'_>,
+		&mut self, i: usize, choice: Choice, ctx: &StepCtx<'_>, final_row: &mut Rows<'_>,
 	) -> StepOut {
 		let (cfg, rw) = (ctx.cfg, ctx.cfg.reward);
 		let mut res = StepOut::default();
-		let blinds_before = self.g.blinds_cleared;
+		let blinds_before = self.g.run.blinds_cleared;
 		let won_before = self.g.run_won();
-		// A negative destination is out of range (it only
-		// matters for reordering ops).
-		let to = u32::try_from(dest).unwrap_or(u32::MAX);
-		let a = usize::try_from(op)
+		let was_ante_start = ante_start(&self.g, cfg.endless);
+		let a = usize::try_from(choice.op)
 			.ok()
 			.and_then(|k| self.ops.get(k))
-			.and_then(|o| obs::decode(&self.g, o, cards, to));
+			.and_then(|o| {
+				let cards = CardMask::from_bits(choice.cards);
+				obs::decode(&self.g, o, cards, u8::try_from(choice.dest).ok())
+			});
+		if let Some(Action::Play(mask)) = a
+			&& cfg.order_label_rate > 0.0
+			&& self.roll(ctx.base_seed ^ LABEL_SALT, i) < cfg.order_label_rate
+		{
+			res.label = obs::order_label(&self.g, mask);
+		}
 		let a = if let Some(a) = a {
 			Some(a)
 		} else {
 			self.invalid += 1;
 			obs::fallback(&self.g, &self.ops)
 		};
-		// The known no-action state (the game's own pack softlock) is terminal via
-		// `is_stuck`; any other one is a simulator bug: dump it and truncate the
+		// The known state without a legal action (the game's own pack softlock) is
+		// terminal via `is_stuck`. Any other one is a simulator bug, as is an
+		// offered action the game then rejects: dump the state and truncate the
 		// episode rather than kill a long training run.
-		let dead_end = a.is_none();
-		match a {
-			Some(a) => {
-				self.g.step(a).expect("decoded action rejected");
-				self.steps += 1;
+		let dead_end = if let Some(a) = a {
+			match self.g.step(a) {
+				Ok(()) => {
+					self.steps += 1;
+					false
+				}
+				Err(e) => {
+					eprintln!(
+						"[vecenv] {a:?} was offered and then rejected ({e}), episode truncated. ops: {:?}\n{:#?}",
+						self.ops, self.g
+					);
+					true
+				}
 			}
-			None => eprintln!(
+		} else {
+			eprintln!(
 				"[vecenv] dead end: no legal action, episode truncated. ops: {:?}\n{:#?}",
 				self.ops, self.g
-			),
-		}
+			);
+			true
+		};
 		let g = &self.g;
 		let r_true = rw.true_reward(blinds_before, won_before, g);
 		let terminal = g.is_terminal();
-		let trunc = !terminal
-			&& (dead_end || self.steps >= cfg.step_limit || (cfg.endless && g.ante > cfg.max_ante));
+		let end = if terminal {
+			Some(End::Terminal)
+		} else if dead_end
+			|| self.steps >= cfg.step_limit
+			|| (cfg.endless && g.run.ante > cfg.max_ante)
+		{
+			Some(End::Truncated)
+		} else {
+			None
+		};
 		let phi = if terminal && !rw.terminal_phi {
 			0.0
 		} else {
@@ -216,64 +364,47 @@ impl Slot {
 		res.reward = r_true + rw.gamma * phi - self.phi;
 		self.phi = phi;
 		self.ret += r_true;
-		res.done = terminal || trunc;
-		res.truncated = trunc;
-		if !terminal
-			&& !trunc
+		res.end = end;
+		if end.is_none()
 			&& ctx.p_offer > 0.0
-			&& snapshot_point(g, &cfg)
-			&& unit(mix(ctx.base_seed ^ i as u64) ^ (self.resets << 20) ^ u64::from(self.steps))
-				< ctx.p_offer
+			&& let Some(pool) = snapshot_pool(g, &cfg, self.origin, !was_ante_start)
+			&& self.roll(ctx.base_seed, i) < ctx.p_offer
 		{
-			res.snapshot = Some(Box::new(g.clone()));
+			res.snapshot = Some(Snapshot {
+				pool,
+				game: Box::new(g.clone()),
+			});
 		}
-		if terminal || trunc {
+		if let Some(end) = end {
 			res.episode = Some(Episode {
 				slot: i,
 				seed: g.rng.seed().to_string(),
-				back: g.back.key().to_string(),
-				stake: g.stake,
-				ante: g.ante,
+				back: g.setup.back,
+				stake: g.setup.stake.into(),
+				ante: g.run.ante,
 				won: g.run_won(),
-				blinds_cleared: g.blinds_cleared,
+				blinds_cleared: g.run.blinds_cleared,
 				steps: self.steps,
 				ret: self.ret,
-				truncated: trunc,
-				from_snapshot: self.from_snapshot,
+				truncated: end == End::Truncated,
+				from_snapshot: self.origin != Origin::Fresh,
 			});
-			if trunc {
-				row.write(
-					&mut self.g,
-					cfg.candidates,
-					cfg.deck_tokens,
-					cfg.previews,
-					&mut self.ops,
-					&mut self.pv,
-				);
-				self.fin = Some(ObsRow::of(row));
+			if end == End::Truncated {
+				final_row.write(&mut self.g, cfg.obs, &mut self.ops, &mut self.previews);
 			}
 			self.resets += 1;
-			let run = ctx
-				.base_seed
-				.wrapping_mul(1_000_003)
-				.wrapping_add(self.resets * ctx.n_slots + i as u64);
-			let (g, snap) = start(run, ctx.backs, ctx.stakes, cfg, ctx.reservoir);
-			self.g = g;
-			self.from_snapshot = snap;
-			self.steps = 0;
-			self.ret = 0.0;
-			self.phi = rw.potential(&self.g);
+			let n = run_number(ctx.base_seed, self.resets, ctx.n_slots, i);
+			let (g, origin) = start(n, ctx.backs, ctx.stakes, &cfg, ctx.reservoirs);
+			self.install(g, origin, &rw);
 		}
 		res
 	}
 }
 
-/// A finished episode.
 struct Episode {
-	/// The env slot it ran in.
 	slot: usize,
 	seed: String,
-	back: String,
+	back: Back,
 	stake: u8,
 	ante: i32,
 	/// The run was won (not the game's `won` flag, which is also set when
@@ -292,7 +423,7 @@ struct Episode {
 type EpisodeTuple = (
 	usize,
 	String,
-	String,
+	&'static str,
 	u8,
 	i32,
 	bool,
@@ -303,18 +434,32 @@ type EpisodeTuple = (
 	bool,
 );
 
-/// Per-slot result of a step.
+/// How an episode ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+	/// The run was won (outside endless mode) or lost.
+	Terminal,
+	/// It was cut off (step limit, ante limit or a dead end): bootstrap from
+	/// the final state.
+	Truncated,
+}
+
+/// An ante start to offer the reservoir of its pool.
+struct Snapshot {
+	pool: Pool,
+	game: Box<SimGame>,
+}
+
 #[derive(Default)]
 struct StepOut {
 	/// The shaped reward.
 	reward: f32,
-	/// The episode ended (terminal or truncated).
-	done: bool,
-	truncated: bool,
-	/// The finished episode.
+	end: Option<End>,
 	episode: Option<Episode>,
-	/// A snapshot to offer the reservoir.
-	snapshot: Option<Box<SimGame>>,
+	snapshot: Option<Snapshot>,
+	/// The joker-order label of the play taken (`obs::order_label`), if
+	/// sampled.
+	label: Option<[u8; obs::ORDER_JOKERS]>,
 }
 
 /// `step`'s result arrays: (reward, done, truncated).
@@ -323,9 +468,6 @@ type StepArrays<'py> = (
 	Bound<'py, PyArray1<bool>>,
 	Bound<'py, PyArray1<bool>>,
 );
-
-/// One step's choices of every env: (op index, card mask, destination).
-type Choices<'a> = (&'a [i32], &'a [u32], &'a [i32]);
 
 /// One set of observation arrays, a row per env (see `Rows`).
 struct ObsArrays {
@@ -338,6 +480,11 @@ struct ObsArrays {
 	n_ops: Py<PyArray1<i32>>,
 	n_tokens: Py<PyArray1<i32>>,
 	n_hand: Py<PyArray1<i32>>,
+}
+
+/// The shape of `n` envs' rows of the shape `row`.
+fn rows_of(n: usize, row: [usize; 2]) -> [usize; 3] {
+	[n, row[0], row[1]]
 }
 
 /// Exclusive access to an array (they are exposed to Python, which could
@@ -363,7 +510,6 @@ fn slice<'a, T: Element, D: Dimension>(
 		.map_err(|e| PyValueError::new_err(format!("observation array is not contiguous: {e}")))
 }
 
-/// Exclusive borrows of an `ObsArrays`.
 struct ObsGuards<'py> {
 	tok_i: PyReadwriteArray<'py, i32, numpy::Ix3>,
 	tok_f: PyReadwriteArray<'py, f32, numpy::Ix3>,
@@ -379,26 +525,26 @@ struct ObsGuards<'py> {
 impl ObsArrays {
 	fn zeros(py: Python<'_>, n: usize) -> ObsArrays {
 		ObsArrays {
-			tok_i: PyArray3::zeros(py, [n, obs::MAX_TOKENS, obs::TOK_INT], false).unbind(),
-			tok_f: PyArray3::zeros(py, [n, obs::MAX_TOKENS, obs::TOK_FLOAT], false).unbind(),
-			glob_i: PyArray2::zeros(py, [n, obs::GLOB_INT], false).unbind(),
-			glob_f: PyArray2::zeros(py, [n, obs::GLOB_FLOAT], false).unbind(),
-			ops: PyArray3::zeros(py, [n, obs::MAX_OPS, obs::OP_INT], false).unbind(),
-			ops_f: PyArray3::zeros(py, [n, obs::MAX_OPS, obs::OP_FLOAT], false).unbind(),
-			n_ops: PyArray1::zeros(py, [n], false).unbind(),
-			n_tokens: PyArray1::zeros(py, [n], false).unbind(),
-			n_hand: PyArray1::zeros(py, [n], false).unbind(),
+			tok_i: PyArray3::zeros(py, rows_of(n, TOK_I_SHAPE), /* is_fortran= */ false).unbind(),
+			tok_f: PyArray3::zeros(py, rows_of(n, TOK_F_SHAPE), /* is_fortran= */ false).unbind(),
+			glob_i: PyArray2::zeros(py, [n, obs::GLOB_INT], /* is_fortran= */ false).unbind(),
+			glob_f: PyArray2::zeros(py, [n, obs::GLOB_FLOAT], /* is_fortran= */ false).unbind(),
+			ops: PyArray3::zeros(py, rows_of(n, OPS_SHAPE), /* is_fortran= */ false).unbind(),
+			ops_f: PyArray3::zeros(py, rows_of(n, OPS_F_SHAPE), /* is_fortran= */ false).unbind(),
+			n_ops: PyArray1::zeros(py, [n], /* is_fortran= */ false).unbind(),
+			n_tokens: PyArray1::zeros(py, [n], /* is_fortran= */ false).unbind(),
+			n_hand: PyArray1::zeros(py, [n], /* is_fortran= */ false).unbind(),
 		}
 	}
 
 	fn borrow<'py>(&self, py: Python<'py>, n: usize) -> PyResult<ObsGuards<'py>> {
 		Ok(ObsGuards {
-			tok_i: borrow(&self.tok_i, py, &[n, obs::MAX_TOKENS, obs::TOK_INT])?,
-			tok_f: borrow(&self.tok_f, py, &[n, obs::MAX_TOKENS, obs::TOK_FLOAT])?,
+			tok_i: borrow(&self.tok_i, py, &rows_of(n, TOK_I_SHAPE))?,
+			tok_f: borrow(&self.tok_f, py, &rows_of(n, TOK_F_SHAPE))?,
 			glob_i: borrow(&self.glob_i, py, &[n, obs::GLOB_INT])?,
 			glob_f: borrow(&self.glob_f, py, &[n, obs::GLOB_FLOAT])?,
-			ops: borrow(&self.ops, py, &[n, obs::MAX_OPS, obs::OP_INT])?,
-			ops_f: borrow(&self.ops_f, py, &[n, obs::MAX_OPS, obs::OP_FLOAT])?,
+			ops: borrow(&self.ops, py, &rows_of(n, OPS_SHAPE))?,
+			ops_f: borrow(&self.ops_f, py, &rows_of(n, OPS_F_SHAPE))?,
 			n_ops: borrow(&self.n_ops, py, &[n])?,
 			n_tokens: borrow(&self.n_tokens, py, &[n])?,
 			n_hand: borrow(&self.n_hand, py, &[n])?,
@@ -409,31 +555,37 @@ impl ObsArrays {
 impl ObsGuards<'_> {
 	/// The rows of every env (the shapes were checked, so there is one per
 	/// env).
-	fn rows(&mut self) -> PyResult<Vec<Rows<'_>>> {
+	fn rows(&mut self) -> PyResult<impl IndexedParallelIterator<Item = Rows<'_>>> {
 		let rows = slice(&mut self.tok_i)?
-			.chunks_mut(obs::MAX_TOKENS * obs::TOK_INT)
-			.zip(slice(&mut self.tok_f)?.chunks_mut(obs::MAX_TOKENS * obs::TOK_FLOAT))
-			.zip(slice(&mut self.glob_i)?.chunks_mut(obs::GLOB_INT))
-			.zip(slice(&mut self.glob_f)?.chunks_mut(obs::GLOB_FLOAT))
-			.zip(slice(&mut self.ops)?.chunks_mut(obs::MAX_OPS * obs::OP_INT))
-			.zip(slice(&mut self.ops_f)?.chunks_mut(obs::MAX_OPS * obs::OP_FLOAT))
-			.zip(slice(&mut self.n_ops)?.iter_mut())
-			.zip(slice(&mut self.n_tokens)?.iter_mut())
-			.zip(slice(&mut self.n_hand)?.iter_mut())
+			.par_chunks_mut(row_len(TOK_I_SHAPE))
+			.zip(slice(&mut self.tok_f)?.par_chunks_mut(row_len(TOK_F_SHAPE)))
+			.zip(slice(&mut self.glob_i)?.par_chunks_mut(obs::GLOB_INT))
+			.zip(slice(&mut self.glob_f)?.par_chunks_mut(obs::GLOB_FLOAT))
+			.zip(slice(&mut self.ops)?.par_chunks_mut(row_len(OPS_SHAPE)))
+			.zip(slice(&mut self.ops_f)?.par_chunks_mut(row_len(OPS_F_SHAPE)))
+			.zip(slice(&mut self.n_ops)?.par_iter_mut())
+			.zip(slice(&mut self.n_tokens)?.par_iter_mut())
+			.zip(slice(&mut self.n_hand)?.par_iter_mut())
 			.map(
-				|((((((((ti, tf), gi), gf), oa), of), n_ops), n_tokens), n_hand)| Rows {
-					ti,
-					tf,
-					gi,
-					gf,
-					oa,
-					of,
-					n_ops,
-					n_tokens,
+				|(
+					(((((((tok_i, tok_f), glob_i), glob_f), ops), ops_f), n_ops), n_tokens),
 					n_hand,
+				)| {
+					Rows {
+						obs: obs::ObsMut {
+							tok_i,
+							tok_f,
+							glob_i,
+							glob_f,
+						},
+						ops,
+						ops_f,
+						n_ops,
+						n_tokens,
+						n_hand,
+					}
 				},
-			)
-			.collect();
+			);
 		Ok(rows)
 	}
 }
@@ -445,72 +597,165 @@ impl ObsGuards<'_> {
 /// in place by `step`, `observe` and `set_game`; finished envs are reset
 /// automatically. When an episode is truncated, the observation of its last
 /// state is in the `final_*` arrays (same layout, valid for the truncated
-/// rows of the last `step` only). Do not resize the arrays or use them from
-/// other threads while a call is running.
+/// rows of the last `step` only). `aux_kind` and `aux_dest` hold the
+/// joker-order labels of the last `step`'s actions. Do not resize the arrays
+/// or use them from other threads while a call is running.
 #[pyclass(module = "antezero_sim")]
 pub struct VecEnv {
 	slots: Vec<Slot>,
 	backs: Vec<Back>,
-	stakes: Vec<u8>,
+	stakes: Vec<Stake>,
 	base_seed: u64,
 	cfg: Cfg,
 	pool: rayon::ThreadPool,
 	episodes: Vec<Episode>,
-	reservoir: Vec<SimGame>,
+	reservoirs: Reservoirs,
 	offered: u64,
 	cur: ObsArrays,
 	fin: ObsArrays,
+	aux_kind: Py<PyArray1<i8>>,
+	aux_dest: Py<PyArray2<u8>>,
 }
 
-fn make_game(n: u64, backs: &[Back], stakes: &[u8], cfg: Cfg) -> SimGame {
+fn make_game(n: u64, backs: &[Back], stakes: &[Stake], cfg: &Cfg) -> SimGame {
 	let h = n.wrapping_mul(0xd6e8_feb8_6659_fd93);
 	let back = backs[num::pick(h, backs.len())];
 	let stake = stakes[num::pick(h >> 20, stakes.len())];
 	let mut g = SimGame::new_run(&seed_string(n), back, stake);
-	g.set_tracing(false);
-	g.endless = cfg.endless;
-	g.allow_skip = cfg.allow_skip;
+	configure(&mut g, cfg);
 	g
 }
 
-/// A fresh run, or (with probability `snapshot_prob`) a reservoir
-/// snapshot whose hidden state is resampled.
+/// A fresh run, or a reservoir snapshot whose hidden state is resampled: a
+/// late ante start (with probability `snapshot_prob`) or an early one with a
+/// gift (with probability `practice_prob`).
 fn start(
-	n: u64, backs: &[Back], stakes: &[u8], cfg: Cfg, reservoir: &[SimGame],
-) -> (SimGame, bool) {
-	if cfg.snapshot_prob > 0.0 && !reservoir.is_empty() && unit(n ^ 0x5eed) < cfg.snapshot_prob {
-		let mut g = reservoir[num::pick(mix(n ^ 0xa11), reservoir.len())].clone();
+	n: u64, backs: &[Back], stakes: &[Stake], cfg: &Cfg, reservoirs: &Reservoirs,
+) -> (SimGame, Origin) {
+	let u = unit(n ^ 0x5eed);
+	let pool = if u < cfg.snapshot_prob {
+		Some(Pool::Late)
+	} else if u < cfg.snapshot_prob + cfg.practice_prob {
+		Some(Pool::Practice)
+	} else {
+		None
+	};
+	if let Some(pool) = pool.filter(|&pool| !reservoirs[pool].is_empty()) {
+		let from = &reservoirs[pool];
+		let mut g = from[num::pick(splitmix64(n ^ 0xa11), from.len())].clone();
 		g.resample_hidden(&seed_string(n));
-		g.set_tracing(false);
-		g.endless = cfg.endless;
-		g.allow_skip = cfg.allow_skip;
-		return (g, true);
+		configure(&mut g, cfg);
+		if pool == Pool::Practice {
+			gift(&mut g, n, cfg.practice_eternal);
+		}
+		return (g, Origin::Snapshot(pool));
 	}
-	(make_game(n, backs, stakes, cfg), false)
+	(make_game(n, backs, stakes, cfg), Origin::Fresh)
 }
 
-/// Whether `g` is the start of an ante worth restarting from.
-fn snapshot_point(g: &SimGame, cfg: &Cfg) -> bool {
-	g.phase == Phase::BlindSelect
-		&& g.blind_states[0] == BlindStatus::Select
-		&& g.ante >= cfg.snapshot_min_ante
+/// Something to practise with that the run did not choose: a joker (half
+/// the time, if a slot is free and it holds none of the kind; Eternal if
+/// `eternal` and the joker can be), or `GIFT_LEVELS` levels of one hand type.
+fn gift(g: &mut SimGame, n: u64, eternal: bool) {
+	let h = splitmix64(n ^ 0x61f7);
+	let joker = ALL_JOKERS[num::pick(h >> 1, ALL_JOKERS.len())];
+	if h & 1 == 0 && g.areas.joker_room() && !g.areas.jokers.iter().any(|c| c.is_joker(joker)) {
+		g.inject(Inject::Joker {
+			joker,
+			edition: None,
+			eternal,
+		});
+	} else {
+		let planet = ALL_PLANETS[num::pick(splitmix64(h), GIFT_PLANETS)];
+		g.hands.level_up(planet.hand(), GIFT_LEVELS);
+	}
+}
+
+/// Whether `g` is at the start of an ante, before its first blind is chosen.
+fn ante_start(g: &SimGame, endless: bool) -> bool {
+	g.flow.phase == Phase::BlindSelect
+		&& g.blind_select.states[BlindSlot::Small] == BlindStatus::Select
 		&& !g.is_terminal()
-		&& (cfg.endless || !g.run_won())
+		&& (endless || !g.run_won())
 }
 
-/// Applies actions (if any) and re-encodes all observations in parallel.
-fn run(env: &mut VecEnv, py: Python<'_>, acts: Option<Choices<'_>>) -> PyResult<Vec<StepOut>> {
-	let mut guards = env.cur.borrow(py, env.slots.len())?;
-	let mut rows = guards.rows()?;
+/// The pool the ante start `g` belongs to, if any. `origin`: where its
+/// episode's game came from; `arrived`: the last action led here. Practice
+/// episodes feed neither pool, and only fresh runs feed the practice pool,
+/// once per ante: a practice start holds one gift, a late start none, and
+/// what a run does before choosing its blind does not weigh the pool.
+fn snapshot_pool(g: &SimGame, cfg: &Cfg, origin: Origin, arrived: bool) -> Option<Pool> {
+	if !ante_start(g, cfg.endless) {
+		None
+	} else if cfg.snapshot_prob > 0.0 && g.run.ante >= cfg.snapshot_min_ante {
+		(origin != Origin::Snapshot(Pool::Practice)).then_some(Pool::Late)
+	} else if cfg.practice_prob > 0.0 && arrived && PRACTICE_ANTES.contains(&g.run.ante) {
+		(origin == Origin::Fresh).then_some(Pool::Practice)
+	} else {
+		None
+	}
+}
+
+/// Checks the sampling settings of a new `VecEnv`: the label rate and the
+/// restart probabilities.
+///
+/// # Errors
+///
+/// Returns a `ValueError` if a share is outside [0, 1], the two restart
+/// probabilities add up to more than 1, or late snapshots would start in the
+/// practice antes.
+fn check_rates(
+	order_label_rate: f32, snapshot_prob: f32, snapshot_min_ante: i32, practice_prob: f32,
+) -> PyResult<()> {
+	let bad = |msg: String| Err(PyValueError::new_err(msg));
+	if !(0.0..=1.0).contains(&snapshot_prob) || !(0.0..=1.0).contains(&order_label_rate) {
+		return bad(format!(
+			"snapshot_prob and order_label_rate must be in [0, 1], got {snapshot_prob} and {order_label_rate}"
+		));
+	}
+	// Both are f32 thresholds: 0.8 + 0.2 may exceed 1 by a rounding step.
+	if !(0.0..=1.0).contains(&practice_prob) || snapshot_prob + practice_prob > 1.0 + 1e-6 {
+		return bad(format!(
+			"practice_prob must be in [0, 1 - snapshot_prob], got {practice_prob}"
+		));
+	}
+	if practice_prob > 0.0 && snapshot_prob > 0.0 && snapshot_min_ante <= *PRACTICE_ANTES.end() {
+		return bad(format!(
+			"practice_prob needs snapshot_min_ante above {}, got {snapshot_min_ante}",
+			PRACTICE_ANTES.end()
+		));
+	}
+	Ok(())
+}
+
+/// Steps every env with its choice (or none, to only observe) and writes the
+/// observations and, of a step, the labels. Every array is borrowed before
+/// any env changes, so a failed borrow leaves the envs as they were.
+fn step_all(
+	env: &mut VecEnv, py: Python<'_>, choices: Option<Choices<'_>>,
+) -> PyResult<Vec<StepOut>> {
+	let n = env.slots.len();
+	let mut cur = env.cur.borrow(py, n)?;
+	let mut fin = env.fin.borrow(py, n)?;
+	let mut aux_kind = borrow(&env.aux_kind, py, &[n])?;
+	let mut aux_dest = borrow(&env.aux_dest, py, &[n, obs::ORDER_JOKERS])?;
+	let rows = cur.rows()?;
+	let final_rows = fin.rows()?;
+	let (dests, _) = slice(&mut aux_dest)?.as_chunks_mut::<{ obs::ORDER_JOKERS }>();
+	let labels = slice(&mut aux_kind)?.iter_mut().zip(dests);
 	let cfg = env.cfg;
 	let ctx = StepCtx {
 		cfg,
 		backs: &env.backs,
 		stakes: &env.stakes,
 		base_seed: env.base_seed,
-		n_slots: env.slots.len() as u64,
-		reservoir: &env.reservoir,
-		p_offer: if cfg.snapshot_prob > 0.0 { OFFER } else { 0.0 },
+		n_slots: num::index64(n),
+		reservoirs: &env.reservoirs,
+		p_offer: if cfg.snapshot_prob > 0.0 || cfg.practice_prob > 0.0 {
+			OFFER
+		} else {
+			0.0
+		},
 	};
 	let slots = &mut env.slots;
 	let pool = &env.pool;
@@ -518,48 +763,40 @@ fn run(env: &mut VecEnv, py: Python<'_>, acts: Option<Choices<'_>>) -> PyResult<
 		pool.install(|| {
 			slots
 				.par_iter_mut()
-				.zip(rows.par_iter_mut())
+				.zip(rows)
+				.zip(final_rows)
 				.enumerate()
-				.map(|(i, (s, row))| {
-					let res = match acts {
-						Some((op, cards, dest)) => s.step(i, (op[i], cards[i], dest[i]), &ctx, row),
+				.map(|(i, ((s, mut row), mut final_row))| {
+					let res = match choices {
+						Some(c) => s.step(i, c.of(i), &ctx, &mut final_row),
 						None => StepOut::default(),
 					};
-					row.write(
-						&mut s.g,
-						cfg.candidates,
-						cfg.deck_tokens,
-						cfg.previews,
-						&mut s.ops,
-						&mut s.pv,
-					);
+					row.write(&mut s.g, cfg.obs, &mut s.ops, &mut s.previews);
 					res
 				})
 				.collect()
 		})
 	});
-	drop(rows);
-	drop(guards);
-	// Truncated episodes: final observations.
-	if env.slots.iter().any(|s| s.fin.is_some()) {
-		let mut guards = env.fin.borrow(py, env.slots.len())?;
-		for (s, mut row) in env.slots.iter_mut().zip(guards.rows()?) {
-			if let Some(f) = s.fin.take() {
-				row.copy_from(&f);
-			}
+	if choices.is_some() {
+		for (r, (kind, dest)) in out.iter().zip(labels) {
+			*kind = r
+				.label
+				.map_or(-1, |label| i8::from(label != [0; obs::ORDER_JOKERS]));
+			*dest = r.label.unwrap_or_default();
 		}
 	}
 	for r in &mut out {
 		if let Some(ep) = r.episode.take() {
 			env.episodes.push(ep);
 		}
-		if let Some(g) = r.snapshot.take() {
+		if let Some(Snapshot { pool, game }) = r.snapshot.take() {
 			env.offered += 1;
-			if env.reservoir.len() < RESERVOIR {
-				env.reservoir.push(*g);
+			let reservoir = &mut env.reservoirs[pool];
+			if reservoir.len() < RESERVOIR {
+				reservoir.push(*game);
 			} else {
-				let k = num::pick(mix(env.offered ^ env.base_seed), RESERVOIR);
-				env.reservoir[k] = *g;
+				let k = num::pick(splitmix64(env.offered ^ env.base_seed), RESERVOIR);
+				reservoir[k] = *game;
 			}
 		}
 	}
@@ -568,12 +805,15 @@ fn run(env: &mut VecEnv, py: Python<'_>, acts: Option<Choices<'_>>) -> PyResult<
 
 #[pymethods]
 impl VecEnv {
-	/// `VecEnv(num_envs, backs=["b_red"], stakes=[1], seed=0, endless=False,
-	/// max_ante=16, step_limit=5000, gamma=0.999, r_win=1.0, r_endless=0.0,
-	/// r_loss=0.0, w_blind=0.04, w_score=0.02, threads=0, play_candidates=0,
-	/// deck_tokens=False, snapshot_prob=0.0, snapshot_min_ante=2, allow_skip=True,
-	/// build_previews=True, terminal_phi=True)`. `build_previews`: capacity previews in shops,
-	/// packs and blind select (see `sim::obs::BuildPreview`).
+	/// `build_previews`: capacity previews in shops, packs and blind select
+	/// (see `sim::obs::BuildPreview`). `order_gain`: the gain column of the
+	/// joker-move ops (`sim::obs::order_gain`). `order_label_rate`: the share
+	/// of played hands that get a joker-order label (see `aux_kind`).
+	/// `practice_prob`: the share of episodes that restart from an ante start
+	/// of antes 2-3 holding a gift (a joker or three levels of a hand type);
+	/// late snapshots need `snapshot_min_ante` above those antes then.
+	/// `practice_eternal`: a gifted joker is Eternal where the game allows the
+	/// sticker, sellable otherwise.
 	///
 	/// Episodes end when the run is lost, or won unless `endless`; they are
 	/// truncated (not terminal: bootstrap from `final_*`) after `step_limit`
@@ -585,16 +825,17 @@ impl VecEnv {
 	)]
 	#[expect(
 		clippy::needless_pass_by_value,
-		reason = "pyo3 hands arguments over by value"
+		reason = "pyo3 extracts `backs` as an owned `Vec<String>`, which is only read"
 	)]
 	#[new]
-	#[pyo3(signature = (num_envs, backs = vec!["b_red".to_string()], stakes = vec![1], seed = 0, endless = false, max_ante = 16, step_limit = 5000, gamma = 0.999, r_win = 1.0, r_endless = 0.0, r_loss = 0.0, w_blind = 0.04, w_score = 0.02, threads = 0, play_candidates = 0, deck_tokens = false, snapshot_prob = 0.0, snapshot_min_ante = 2, allow_skip = true, build_previews = true, terminal_phi = true))]
+	#[pyo3(signature = (num_envs, backs = vec!["b_red".to_string()], stakes = vec![1], seed = 0, endless = false, max_ante = 16, step_limit = 5000, gamma = 0.999, r_win = 1.0, r_endless = 0.0, r_loss = 0.0, w_blind = 0.04, w_score = 0.02, threads = 0, play_candidates = 0, deck_tokens = false, snapshot_prob = 0.0, snapshot_min_ante = 2, allow_skip = true, build_previews = true, terminal_phi = true, order_gain = true, order_label_rate = 0.0, practice_prob = 0.0, practice_eternal = false))]
 	fn new(
 		py: Python<'_>, num_envs: usize, backs: Vec<String>, stakes: Vec<u8>, seed: u64,
 		endless: bool, max_ante: i32, step_limit: u32, gamma: f32, r_win: f32, r_endless: f32,
 		r_loss: f32, w_blind: f32, w_score: f32, threads: usize, play_candidates: usize,
 		deck_tokens: bool, snapshot_prob: f32, snapshot_min_ante: i32, allow_skip: bool,
-		build_previews: bool, terminal_phi: bool,
+		build_previews: bool, terminal_phi: bool, order_gain: bool, order_label_rate: f32,
+		practice_prob: f32, practice_eternal: bool,
 	) -> PyResult<VecEnv> {
 		let bad = |msg: String| Err(PyValueError::new_err(msg));
 		if num_envs == 0 {
@@ -602,11 +843,16 @@ impl VecEnv {
 		}
 		let backs: Vec<Back> = backs
 			.iter()
-			.map(|b| crate::game::parse_back(b))
+			.map(|b| parse_back(b))
 			.collect::<PyResult<_>>()?;
-		if backs.is_empty() || stakes.is_empty() || stakes.iter().any(|s| !(1..=8).contains(s)) {
-			return bad("need at least one back and stakes in 1..=8".into());
+		if backs.is_empty() || stakes.is_empty() {
+			return bad("need at least one back and one stake".into());
 		}
+		let stakes: Vec<Stake> = stakes
+			.into_iter()
+			.map(Stake::try_from)
+			.collect::<Result<_, _>>()
+			.map_err(|e| PyValueError::new_err(e.to_string()))?;
 		if step_limit == 0 || max_ante < 1 {
 			return bad(format!(
 				"step_limit and max_ante must be positive, got {step_limit} and {max_ante}"
@@ -621,12 +867,12 @@ impl VecEnv {
 		{
 			return bad("rewards and shaping weights must be finite".into());
 		}
-		if !(0.0..=1.0).contains(&snapshot_prob) {
-			return bad(format!(
-				"snapshot_prob must be in [0, 1], got {snapshot_prob}"
-			));
-		}
-		check_candidates(play_candidates)?;
+		check_rates(
+			order_label_rate,
+			snapshot_prob,
+			snapshot_min_ante,
+			practice_prob,
+		)?;
 		let reward = Reward {
 			gamma,
 			r_win,
@@ -641,40 +887,35 @@ impl VecEnv {
 			max_ante,
 			step_limit,
 			reward,
-			candidates: play_candidates,
-			deck_tokens,
-			previews: build_previews,
+			obs: ObsOptions {
+				ops: op_options(play_candidates, allow_skip)?,
+				deck_tokens,
+				previews: build_previews,
+				order_gain,
+			},
+			order_label_rate,
 			snapshot_prob,
 			snapshot_min_ante,
-			allow_skip,
+			practice_prob,
+			practice_eternal,
 		};
 		let pool = rayon::ThreadPoolBuilder::new()
 			.num_threads(threads)
 			.build()
 			.map_err(|e| PyValueError::new_err(e.to_string()))?;
+		let n_slots = num::index64(num_envs);
 		let slots: Vec<Slot> = py.detach(|| {
 			pool.install(|| {
 				(0..num_envs)
 					.into_par_iter()
 					.map(|i| {
-						let n = seed.wrapping_mul(1_000_003).wrapping_add(i as u64);
-						let g = make_game(n, &backs, &stakes, cfg);
-						Slot {
-							phi: reward.potential(&g),
-							g,
-							ops: Vec::with_capacity(obs::MAX_OPS),
-							steps: 0,
-							ret: 0.0,
-							resets: 0,
-							invalid: 0,
-							from_snapshot: false,
-							fin: None,
-							pv: Vec::new(),
-						}
+						let g = make_game(run_number(seed, 0, n_slots, i), &backs, &stakes, &cfg);
+						Slot::new(g, &reward)
 					})
 					.collect()
 			})
 		});
+		let aux_shape = [num_envs, obs::ORDER_JOKERS];
 		let mut env = VecEnv {
 			slots,
 			backs,
@@ -683,10 +924,12 @@ impl VecEnv {
 			cfg,
 			pool,
 			episodes: Vec::new(),
-			reservoir: Vec::new(),
+			reservoirs: Reservoirs::default(),
 			offered: 0,
 			cur: ObsArrays::zeros(py, num_envs),
 			fin: ObsArrays::zeros(py, num_envs),
+			aux_kind: PyArray1::from_vec(py, vec![-1; num_envs]).unbind(),
+			aux_dest: PyArray2::zeros(py, aux_shape, /* is_fortran= */ false).unbind(),
 		};
 		env.observe(py)?;
 		Ok(env)
@@ -705,12 +948,12 @@ impl VecEnv {
 	/// Number of snapshots available for restarts.
 	#[getter]
 	fn reservoir_size(&self) -> usize {
-		self.reservoir.len()
+		self.reservoirs.late.len() + self.reservoirs.practice.len()
 	}
 
 	/// Re-encodes every observation.
 	fn observe(&mut self, py: Python<'_>) -> PyResult<()> {
-		run(self, py, None)?;
+		step_all(self, py, None)?;
 		Ok(())
 	}
 
@@ -722,22 +965,26 @@ impl VecEnv {
 	/// `final_*` arrays.
 	#[expect(
 		clippy::needless_pass_by_value,
-		reason = "pyo3 hands arguments over by value"
+		reason = "pyo3 extracts a read-only array as an owned borrow guard"
 	)]
 	fn step<'py>(
 		&mut self, py: Python<'py>, op: PyReadonlyArray1<'py, i32>,
 		cards: PyReadonlyArray1<'py, u32>, dest: PyReadonlyArray1<'py, i32>,
 	) -> PyResult<StepArrays<'py>> {
 		let n = self.slots.len();
-		let (op, cards, dest) = (op.as_slice()?, cards.as_slice()?, dest.as_slice()?);
-		if op.len() != n || cards.len() != n || dest.len() != n {
+		let choices = Choices {
+			op: op.as_slice()?,
+			cards: cards.as_slice()?,
+			dest: dest.as_slice()?,
+		};
+		if choices.op.len() != n || choices.cards.len() != n || choices.dest.len() != n {
 			return Err(PyValueError::new_err(format!("expected {n} actions")));
 		}
-		let res = run(self, py, Some((op, cards, dest)))?;
+		let res = step_all(self, py, Some(choices))?;
 		let rew = PyArray1::from_vec(py, res.iter().map(|r| r.reward).collect());
-		let done = PyArray1::from_vec(py, res.iter().map(|r| r.done).collect());
-		let trunc = PyArray1::from_vec(py, res.iter().map(|r| r.truncated).collect());
-		Ok((rew, done, trunc))
+		let done = PyArray1::from_vec(py, res.iter().map(|r| r.end.is_some()).collect());
+		let truncated = res.iter().map(|r| r.end == Some(End::Truncated)).collect();
+		Ok((rew, done, PyArray1::from_vec(py, truncated)))
 	}
 
 	/// Finished episodes since the last call: `(slot, seed, back, stake,
@@ -749,7 +996,7 @@ impl VecEnv {
 			(
 				e.slot,
 				e.seed,
-				e.back,
+				e.back.key(),
 				e.stake,
 				e.ante,
 				e.won,
@@ -763,9 +1010,8 @@ impl VecEnv {
 		self.episodes.drain(..).map(as_tuple).collect()
 	}
 
-	/// Current antes of all envs.
 	fn antes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i32>> {
-		PyArray1::from_vec(py, self.slots.iter().map(|s| s.g.ante).collect())
+		PyArray1::from_vec(py, self.slots.iter().map(|s| s.g.run.ante).collect())
 	}
 
 	/// Number of composite actions that were illegal and replaced by a
@@ -774,25 +1020,21 @@ impl VecEnv {
 		self.slots.iter().map(|s| s.invalid).sum()
 	}
 
-	/// A snapshot of env `i` as a `Game`.
-	fn game(&self, i: usize) -> PyResult<crate::game::Game> {
+	/// A snapshot of env `i` as a `Game` (with the env's `allow_skip`).
+	fn game(&self, i: usize) -> PyResult<Game> {
 		let s = self
 			.slots
 			.get(i)
 			.ok_or_else(|| PyValueError::new_err("index out of range"))?;
-		Ok(crate::game::Game::from(s.g.clone()))
+		let mut game = Game::from(s.g.clone());
+		game.allow_skip = self.cfg.obs.ops.allow_skip;
+		Ok(game)
 	}
 
 	/// Replaces env `i`'s game (e.g. for evaluation on fixed seeds) with a
-	/// copy of `game` that follows this env's `endless` setting. The game
-	/// must not be over.
-	#[expect(
-		clippy::needless_pass_by_value,
-		reason = "pyo3 hands arguments over by value"
-	)]
-	fn set_game(
-		&mut self, py: Python<'_>, i: usize, game: PyRef<'_, crate::game::Game>,
-	) -> PyResult<()> {
+	/// copy of `game` that follows this env's `endless` and `allow_skip`
+	/// settings. The game must not be over.
+	fn set_game(&mut self, py: Python<'_>, i: usize, game: &Game) -> PyResult<()> {
 		if game.g.is_terminal() {
 			return Err(PyValueError::new_err(
 				"set_game needs a game that is not over",
@@ -802,14 +1044,9 @@ impl VecEnv {
 			.slots
 			.get_mut(i)
 			.ok_or_else(|| PyValueError::new_err("index out of range"))?;
-		s.g = game.g.clone();
-		s.g.set_tracing(false);
-		s.g.endless = self.cfg.endless;
-		s.g.allow_skip = self.cfg.allow_skip;
-		s.steps = 0;
-		s.ret = 0.0;
-		s.from_snapshot = false;
-		s.phi = self.cfg.reward.potential(&s.g);
+		let mut g = game.g.clone();
+		configure(&mut g, &self.cfg);
+		s.install(g, Origin::Fresh, &self.cfg.reward);
 		self.observe(py)
 	}
 
@@ -856,6 +1093,24 @@ impl VecEnv {
 	#[getter]
 	fn n_hand(&self, py: Python<'_>) -> Py<PyArray1<i32>> {
 		self.cur.n_hand.clone_ref(py)
+	}
+
+	/// Per env, the joker-order label of the action of the last `step`
+	/// (aligned with the observation it was chosen on, also when that step
+	/// ended the episode): -1 = none (not a sampled play, or not a state
+	/// `sim::obs::order_label` covers), 0 = no single joker move would have
+	/// gained, 1 = one would (see `aux_dest`).
+	#[getter]
+	fn aux_kind(&self, py: Python<'_>) -> Py<PyArray1<i8>> {
+		self.aux_kind.clone_ref(py)
+	}
+
+	/// `[num_envs, ORDER_JOKERS]`: for labels of kind 1, bit `to` of entry
+	/// `from` is set when moving joker `from` to slot `to` first would have
+	/// scored within 0.1% of the best single move.
+	#[getter]
+	fn aux_dest(&self, py: Python<'_>) -> Py<PyArray2<u8>> {
+		self.aux_dest.clone_ref(py)
 	}
 
 	#[getter]

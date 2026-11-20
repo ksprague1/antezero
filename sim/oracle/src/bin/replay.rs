@@ -9,158 +9,139 @@
 //! that Lua code in the oracle before step `n` and prints its `H.log` and the
 //! simulator's event log after it.
 
+use std::env::{self, VarError};
+use std::fs;
 use std::process::ExitCode;
 
-use oracle::canon::{self, Diff, TimelineDiff};
-use oracle::diff::{self, Checks, Inject, Mismatch, action_to_lua, inject_to_lua, start_to_lua};
-use oracle::{Oracle, json};
-use sim::actions::Action;
-use sim::data::Back;
+use oracle::command::{Command, Start};
+use oracle::difftest::{self, Checks, Comparison};
+use oracle::json::{self, Json};
+use oracle::{Oracle, canon};
 use sim::game::Game;
 
-/// A history line: an action or an injection.
-enum Line {
-	Act(Action),
-	Inject(Inject),
+/// A recorded run: its start's code, then one command code per line.
+struct History<'text> {
+	start: Start<'text>,
+	/// Each line's text and what it parses to.
+	steps: Vec<(&'text str, Command)>,
 }
 
-#[expect(
-	clippy::many_single_char_names,
-	reason = "the short names of a diff: key, sim value, Lua value"
-)]
-#[expect(clippy::too_many_lines, reason = "one sequential script")]
+fn parse_history(text: &str) -> Result<History<'_>, String> {
+	let mut lines = text.lines();
+	let start = Start::parse(lines.next().ok_or("empty history")?)?;
+	let steps = lines
+		.enumerate()
+		.map(|(i, line)| {
+			line.parse::<Command>()
+				.map(|command| (line, command))
+				.map_err(|e| format!("line {}: {e}", i + 2))
+		})
+		.collect::<Result<_, _>>()?;
+	Ok(History { start, steps })
+}
+
+/// Lua code to run in the oracle before one step (`REPLAY_STEP`,
+/// `REPLAY_LUA`); both engines' event logs are printed after that step.
+struct Hook {
+	step: usize,
+	code: String,
+}
+
+impl Hook {
+	fn from_env() -> Result<Option<Hook>, String> {
+		let step: usize = match env::var("REPLAY_STEP") {
+			Err(VarError::NotPresent) => return Ok(None),
+			Err(VarError::NotUnicode(s)) => {
+				return Err(format!("bad REPLAY_STEP {}", s.display()));
+			}
+			Ok(s) => s.parse().map_err(|_| format!("bad REPLAY_STEP {s:?}"))?,
+		};
+		let file = env::var_os("REPLAY_LUA").ok_or("REPLAY_STEP needs REPLAY_LUA (a Lua file)")?;
+		let code =
+			fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.to_string_lossy()))?;
+		Ok(Some(Hook { step, code }))
+	}
+}
+
+/// Prints the canonical fields that either engine has whose path starts
+/// with one of `filters`, marking the ones that differ.
+fn print_fields(g: &mut Game, dump: &Json, filters: &[&str]) {
+	let (sim, game) = (canon::from_sim(g), canon::from_lua(dump));
+	let shown =
+		canon::fields(&sim, &game).filter(|f| filters.iter().any(|p| f.path.starts_with(p)));
+	for field in shown {
+		let mark = if field.differs() { "!" } else { " " };
+		println!("{mark} {field}");
+	}
+}
+
 fn run() -> Result<bool, String> {
-	let args: Vec<String> = std::env::args().collect();
+	let args: Vec<String> = env::args().collect();
 	let path = args
 		.get(1)
 		.ok_or("usage: replay <history file> [filter-prefix ...]")?;
 	let filters: Vec<&str> = args[2..].iter().map(String::as_str).collect();
-	let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-	let mut lines = text.lines();
-	let header = lines.next().ok_or("empty history")?;
-	let (seed, back, stake) = match header.split_whitespace().collect::<Vec<_>>()[..] {
-		["start", seed, back, stake] => {
-			let b = Back::from_key(back).ok_or_else(|| format!("unknown back {back:?}"))?;
-			let s: u8 = stake
-				.parse()
-				.ok()
-				.filter(|s| (1..=8).contains(s))
-				.ok_or_else(|| format!("bad stake {stake:?}"))?;
-			(seed.to_string(), b, s)
-		}
-		_ => {
-			return Err(format!(
-				"bad header {header:?} (expected `start <seed> <back> <stake>`)"
-			));
-		}
-	};
-	let steps: Vec<(&str, Line)> = lines
-		.enumerate()
-		.map(|(i, l)| {
-			let parsed = l
-				.parse::<Action>()
-				.map(Line::Act)
-				.or_else(|_| l.parse::<Inject>().map(Line::Inject));
-			parsed
-				.map(|p| (l, p))
-				.map_err(|e| format!("line {}: {e}", i + 2))
-		})
-		.collect::<Result<_, _>>()?;
+	let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+	let history = parse_history(&text)?;
 	let checks = Checks::from_env()?;
-	let hook_step: Option<usize> = match std::env::var("REPLAY_STEP") {
-		Err(_) => None,
-		Ok(s) => Some(s.parse().map_err(|_| format!("bad REPLAY_STEP {s:?}"))?),
-	};
-	let hook_code = match hook_step {
-		Some(_) => {
-			let f = std::env::var("REPLAY_LUA")
-				.map_err(|_| "REPLAY_STEP needs REPLAY_LUA (a Lua file)")?;
-			Some(std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?)
-		}
-		None => None,
-	};
-	let show_frames = std::env::var("REPLAY_FRAMES").is_ok_and(|v| v == "1");
+	let hook = Hook::from_env()?;
+	let show_frames = difftest::env_flag("REPLAY_FRAMES")?.unwrap_or(false);
 
-	let o = Oracle::new()?;
-	let mut g = Game::new_run(&seed, back, stake);
-	let mut lua = o.call("oracle", &start_to_lua(&seed, back, stake))?;
+	let mut oracle = Oracle::new()?;
+	let mut g = history.start.new_game();
+	let mut lua = oracle.command(&history.start.to_lua())?;
 	let start = [("<start>", None)];
-	for (step, (line, cmd)) in start
-		.into_iter()
-		.chain(steps.iter().map(|(l, p)| (*l, Some(p))))
-		.enumerate()
-	{
-		if Some(step) == hook_step {
-			o.exec(hook_code.as_deref().unwrap_or_default())
-				.map_err(|e| format!("hook: {e}"))?;
-			g.enable_evlog();
+	let commands = start.into_iter().chain(
+		history
+			.steps
+			.iter()
+			.map(|&(text, command)| (text, Some(command))),
+	);
+	for (step, (text, command)) in commands.enumerate() {
+		let hooked = hook.as_ref().filter(|h| h.step == step);
+		if let Some(hook) = hooked {
+			oracle.exec(&hook.code).map_err(|e| format!("hook: {e}"))?;
+			g.enable_event_log();
 		}
-		match cmd {
-			None => {}
-			Some(Line::Act(a)) => {
-				if let Err(e) = g.step(*a) {
-					println!("DIVERGED at step {step}: sim rejected {a:?}: {e}");
-					return Ok(false);
-				}
-				lua = o
-					.call("oracle", &action_to_lua(a))
-					.map_err(|e| format!("oracle: {e}"))?;
+		if let Some(command) = command {
+			if let Err(e) = command.apply(&mut g) {
+				println!("DIVERGED at step {step}: sim rejected {command:?}: {e}");
+				return Ok(false);
 			}
-			Some(Line::Inject(i)) => {
-				g.inject(i);
-				lua = o
-					.call("oracle", &inject_to_lua(i))
-					.map_err(|e| format!("oracle: {e}"))?;
-			}
+			lua = oracle
+				.command(&command.to_lua())
+				.map_err(|e| format!("oracle: {e}"))?;
 		}
-		if Some(step) == hook_step {
+		if hooked.is_some() {
 			println!(
 				"{}",
-				o.eval("return table.concat(H.log or {}, string.char(10))")?
+				oracle.eval("return table.concat(H.log or {}, string.char(10))")?
 			);
-			for l in g.evlog() {
-				println!("SIM {l}");
+			for entry in g.event_log() {
+				println!("SIM {entry}");
 			}
 		}
-		let j = json::parse(&lua).map_err(|e| format!("json: {e}"))?;
+		let dump = json::parse(&lua).map_err(|e| format!("json: {e}"))?;
 		if !filters.is_empty() {
-			let (a, b) = (canon::from_sim(&mut g), canon::from_lua(&j));
-			println!("--- step {step}: {line}");
-			for (k, v) in &a {
-				if filters.iter().any(|f| k.starts_with(f)) {
-					let w = b.get(k).map_or("<missing>", String::as_str);
-					let mark = if w == v { " " } else { "!" };
-					println!("{mark} {k}: sim={v} game={w}");
-				}
-			}
+			println!("--- step {step}: {text}");
+			print_fields(&mut g, &dump, &filters);
 		}
 		if show_frames {
-			println!("--- step {step}: {line}");
-			for l in canon::timeline_frames(&g, &j) {
-				println!("{l}");
+			println!("--- step {step}: {text}");
+			for row in canon::timeline_frames(&g, &dump) {
+				println!("{row}");
 			}
 		}
-		let diffs = match diff::compare(&mut g, &j, checks.timeline) {
-			None => continue,
-			Some(Mismatch::Timeline(TimelineDiff::Frame(m))) if !checks.frames => {
-				println!("step {step}: frame offset (not failed): {m}");
-				continue;
+		match difftest::compare(&mut g, &dump, checks) {
+			Comparison::Match => {}
+			Comparison::FrameOffset(offset) => {
+				println!("step {step}: frame offset (not failed): {offset}");
 			}
-			Some(Mismatch::State(d)) => d,
-			Some(Mismatch::Timeline(TimelineDiff::Order(d))) => vec![d],
-			Some(Mismatch::Timeline(TimelineDiff::Frame(m))) => {
-				vec![Diff {
-					path: "timeline frames".into(),
-					sim: m,
-					game: String::new(),
-				}]
+			Comparison::Diverged(mismatch) => {
+				print!("DIVERGED at step {step}: {text}\n{mismatch}");
+				return Ok(false);
 			}
-		};
-		println!("DIVERGED at step {step}: {line}");
-		for d in diffs {
-			println!("  {d}");
 		}
-		return Ok(false);
 	}
 	println!("no divergence ({checks})");
 	Ok(true)

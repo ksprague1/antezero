@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Runs az-train on a Vast.ai instance, then tries to stop the instance so the GPU stops billing.
-# shortcut: Vast's per-instance key may read and start but not stop instances (401, tested
-# 2026-10-19), so the stop can fail; then a monitor on another machine must stop it. Upgrade
-# by running `vastai set api-key` on the instance with a key allowed to stop it.
-# Start it detached:  nohup bash agent/vast/train.sh --preset base --name l40s_1 > train.out 2>&1 &
+# Vast's per-instance key may read and start but not stop instances (401), so the stop can
+# fail; then a monitor on another machine must stop it, unless `vastai set api-key` was run
+# on the instance with a key allowed to stop it.
+# Start it detached:  nohup bash agent/vast/train.sh --preset base --name run1 > train.out 2>&1 &
 # To restart training without stopping the instance, kill this script before az-train.
 set -u
 cd "$(dirname "$0")/../.."

@@ -1,52 +1,28 @@
 //! What a build can score over a round (`obs::capacity`) and the rounds the previews play.
 
-use sim::data::{Back, BlindKind, Edition, Joker, Planet};
-use sim::game::{Game, Phase};
+use sim::data::{BlindKind, Joker, Planet, Voucher};
+use sim::game::Phase;
 use sim::inject::Inject;
-use sim::obs::{self};
-use sim::{Action, Kind, num};
+use sim::{Action, Card, Kind, num, obs};
 
-use crate::first_shop;
+use crate::{first_shop, first_shops};
 
 #[test]
-#[expect(clippy::float_cmp, reason = "hand counts and flags are exact values")]
 fn capacity_orders_jokers_and_counts_grabber() {
 	// At a shop: a x3 joker adds more than a +4 mult joker, which adds
 	// something; Grabber adds a hand and nothing else.
-	let mut g = Game::new_run("CAP", Back::Red, 1);
-	g.inject(&Inject::Dollars(20.0));
-	for s in 0.. {
-		// Best-candidate play reaches the first shop on most seeds.
-		g = Game::new_run(&format!("CAP{s}"), Back::Red, 1);
-		g.step(Action::SelectBlind).unwrap();
-		while g.phase == Phase::Round || g.phase == Phase::RoundEval {
-			let a = if g.phase == Phase::Round {
-				Action::Play(obs::top_plays(&g, 1)[0].mask)
-			} else {
-				Action::CashOut
-			};
-			g.step(a).unwrap();
-		}
-		if g.phase == Phase::Shop {
-			break;
-		}
-	}
+	let g = first_shop("CAP", 0);
 	let seeds = [1u64, 2, 3, 4];
-	let boss = g.boss_choice;
+	let boss = g.blind_select.boss;
 	let base = obs::capacity(&g, boss, &seeds);
-	assert!(base.mean > 0.0 && base.hands == 4.0 && base.chips > 0.0 && base.ratio() > 0.0);
+	assert!(base.mean > 0.0, "no score: {base:?}");
+	assert_eq!(base.hands, 4.0, "{base:?}");
+	assert!(base.chips > 0.0, "no target: {base:?}");
+	assert!(base.ratio() > 0.0, "no ratio: {base:?}");
 	let mut plus = g.clone();
-	plus.inject(&Inject::Joker {
-		joker: Joker::Joker,
-		edition: Edition::None,
-		eternal: false,
-	});
+	plus.inject(Inject::joker(Joker::Joker));
 	let mut times = g.clone();
-	times.inject(&Inject::Joker {
-		joker: Joker::Cavendish,
-		edition: Edition::None,
-		eternal: false,
-	});
+	times.inject(Inject::joker(Joker::Cavendish));
 	let (cp, ct) = (
 		obs::capacity(&plus, boss, &seeds),
 		obs::capacity(&times, boss, &seeds),
@@ -55,40 +31,69 @@ fn capacity_orders_jokers_and_counts_grabber() {
 		ct.mean > cp.mean && cp.mean > base.mean,
 		"{base:?} {cp:?} {ct:?}"
 	);
-	let mut grab = g.clone();
-	grab.inject(&Inject::Voucher(sim::data::Voucher::Grabber));
+	let mut grab = g;
+	grab.inject(Inject::Voucher(Voucher::Grabber));
 	let cg = obs::capacity(&grab, boss, &seeds);
 	assert_eq!(cg.hands, 5.0);
 	assert_eq!(cg.mean, base.mean, "the same hands are dealt");
+}
+
+#[test]
+fn grabber_preview_is_its_extra_hand() {
 	// As a shop item, Grabber's gain is its extra hand (same hands dealt).
-	let mut shop = g.clone();
-	let mut grabber = sim::Card::new(1 << 30, sim::Kind::Voucher(sim::data::Voucher::Grabber));
-	grabber.cost = 10.0;
-	shop.shop_vouchers.push(grabber);
+	let mut shop = first_shop("CAP", 0);
+	let mut grabber = Card::new(1 << 30, Kind::Voucher(Voucher::Grabber));
+	grabber.core.cost = 10.0;
+	shop.areas.shop_vouchers.push(grabber);
 	let mut cache = Vec::new();
-	assert!(obs::build_preview(&shop, &mut cache));
-	let f = cache[0]
-		.item_feats(&shop, obs::zone::SHOP_VOUCHER, shop.shop_vouchers.len() - 1)
-		.unwrap();
+	let preview = obs::build_preview(&shop, &mut cache).expect("a shop has a build preview");
+	let p = preview
+		.item_feats(
+			&shop,
+			obs::ItemZone::ShopVoucher,
+			shop.areas.shop_vouchers.len() - 1,
+		)
+		.expect("a voucher for sale has a preview");
 	assert!(
-		(f[0] - (5.0f32 / 4.0).ln()).abs() < 0.01 && f[3] == 1.0,
-		"Grabber's preview {f:?}"
+		(p.gain - (5.0f32 / 4.0).ln()).abs() < 0.01,
+		"Grabber's preview {p:?}"
 	);
+}
+
+#[test]
+fn psychic_rounds_preview_a_scoring_play() {
 	// The Psychic: only five-card plays score, and they are previewed.
+	let g = first_shop("CAP", 0);
 	for s in 0..8 {
-		let v = obs::virtual_round(&g, BlindKind::Psychic, s);
+		let v = obs::virtual_round(g.clone(), BlindKind::Psychic, s);
 		assert!(
 			obs::best_play(&v) > 0.0,
 			"no scoring play previewed against The Psychic (seed {s})"
 		);
 	}
-	// The virtual round is a playable first decision against the boss.
-	let v = obs::virtual_round(&g, boss, 7);
-	assert_eq!(v.phase, Phase::Round);
-	assert_eq!(v.hand.len(), num::trunc(g.hand_limit.limit));
+}
+
+#[test]
+fn virtual_round_starts_a_fresh_round() {
+	let g = first_shop("CAP", 0);
+	let boss = g.blind_select.boss;
+	let v = obs::virtual_round(g.clone(), boss, 7);
+	assert_eq!(v.flow.phase, Phase::Round);
+	assert_eq!(
+		v.areas.hand.cards.len(),
+		num::trunc(g.areas.hand.limit.limit)
+	);
 	assert_eq!(v.blind.kind, Some(boss));
-	assert!(v.hand.iter().all(|c| !c.face_down) && v.play.is_empty() && v.discard.is_empty());
-	assert_eq!(v.deck.len() + v.hand.len(), g.playing_card_count());
+	assert!(
+		v.areas.hand.cards.iter().all(|c| !c.core.face_down),
+		"a face-down card in the dealt hand"
+	);
+	assert_eq!(v.areas.play.len(), 0, "cards left in play");
+	assert_eq!(v.areas.discard.len(), 0, "cards left in the discard pile");
+	assert_eq!(
+		v.areas.deck.len() + v.areas.hand.cards.len(),
+		g.areas.playing_card_count()
+	);
 }
 
 #[test]
@@ -98,33 +103,21 @@ fn preview_hands_differ_between_games() {
 	// Two games at the same ante and round, with the same cards and the same boss, must not preview on the same
 	// sampled hands (their histories differ): otherwise an item's preview is the same wrong number in every game.
 	let mut by_boss: HashMap<BlindKind, HashSet<u64>> = HashMap::new();
-	let mut from = 0;
-	for _ in 0..64 {
-		let mut g = first_shop("DV", from);
-		from = g
-			.rng
-			.seed()
-			.trim_start_matches("DV")
-			.parse::<u64>()
-			.unwrap()
-			+ 1;
-		g.inject(&Inject::Joker {
-			joker: Joker::Jolly,
-			edition: Edition::None,
-			eternal: false,
-		});
+	let shops = first_shops("DV", 0).take(64);
+	for mut g in shops {
+		g.inject(Inject::joker(Joker::Jolly));
 		let mut cache = Vec::new();
-		assert!(obs::build_preview(&g, &mut cache));
+		let preview = obs::build_preview(&g, &mut cache).expect("a shop has a build preview");
 		by_boss
-			.entry(g.boss_choice)
+			.entry(g.blind_select.boss)
 			.or_default()
-			.insert(cache[0].cap_boss.mean.to_bits());
+			.insert(preview.cap_boss.mean.to_bits());
 	}
 	// The Pillar debuffs the cards a game has played, so its capacities differ anyway.
 	let most = by_boss
 		.iter()
-		.filter(|x| *x.0 != BlindKind::Pillar)
-		.map(|x| x.1.len())
+		.filter(|(boss, _)| **boss != BlindKind::Pillar)
+		.map(|(_, means)| means.len())
 		.max()
 		.unwrap();
 	assert!(
@@ -134,87 +127,83 @@ fn preview_hands_differ_between_games() {
 }
 
 #[test]
-#[expect(
-	clippy::many_single_char_names,
-	reason = "short names for the games being compared"
-)]
-#[expect(clippy::float_cmp, reason = "halving the target is exact")]
 fn previews_start_the_round_as_burglar_and_chicot_do() {
 	// Burglar trades the discards for three hands when the blind is selected, and Chicot disables the boss: the
 	// previewed round must start like the real one.
-	let mut g = first_shop("BG", 0);
-	g.inject(&Inject::Joker {
-		joker: Joker::Burglar,
-		edition: Edition::None,
-		eternal: false,
-	});
-	let v = obs::virtual_round(&g, BlindKind::Big, 3);
-	let mut real = g.clone();
+	let mut burglar = first_shop("BG", 0);
+	burglar.inject(Inject::joker(Joker::Burglar));
+	let preview = obs::virtual_round(burglar.clone(), BlindKind::Big, 3);
+	let mut real = burglar.clone();
 	real.step(Action::EndShop).unwrap();
 	real.step(Action::SelectBlind).unwrap();
 	assert_eq!(
-		(v.hands_left, v.discards_left),
-		(real.hands_left, real.discards_left)
+		(preview.round.hands_left, preview.round.discards_left),
+		(real.round.hands_left, real.round.discards_left)
 	);
-	assert_eq!((v.hands_left, v.discards_left), (7.0, 0.0));
-	assert_eq!(obs::capacity(&g, BlindKind::Big, &[1, 2]).hands, 7.0);
+	assert_eq!(
+		(preview.round.hands_left, preview.round.discards_left),
+		(7.0, 0.0)
+	);
+	assert_eq!(obs::capacity(&burglar, BlindKind::Big, &[1, 2]).hands, 7.0);
 	// A copy joker next to Burglar repeats it: ten hands, in the preview whatever the current order.
-	let mut b = first_shop("BG", 0);
+	let mut copied = first_shop("BG", 0);
 	for j in [Joker::Blueprint, Joker::Burglar] {
-		b.inject(&Inject::Joker {
-			joker: j,
-			edition: Edition::None,
-			eternal: false,
-		});
+		copied.inject(Inject::joker(j));
 	}
-	let mut real = b.clone();
+	let mut real = copied.clone();
 	real.step(Action::EndShop).unwrap();
 	real.step(Action::SelectBlind).unwrap();
-	assert_eq!(real.hands_left, 10.0);
-	b.jokers.reverse();
-	assert_eq!(obs::virtual_round(&b, BlindKind::Big, 3).hands_left, 10.0);
-	let mut c = first_shop("BG", 0);
-	let wall = obs::virtual_round(&c, BlindKind::Wall, 3).blind.chips;
-	c.inject(&Inject::Joker {
-		joker: Joker::Chicot,
-		edition: Edition::None,
-		eternal: false,
-	});
-	let v = obs::virtual_round(&c, BlindKind::Wall, 3);
-	assert!(
-		v.blind.disabled && v.blind.chips == wall / 2.0,
-		"The Wall with Chicot: {} chips (without: {wall})",
-		v.blind.chips
+	assert_eq!(real.round.hands_left, 10.0);
+	copied.areas.jokers.reverse();
+	assert_eq!(
+		obs::virtual_round(copied.clone(), BlindKind::Big, 3)
+			.round
+			.hands_left,
+		10.0
 	);
-	assert!(!obs::virtual_round(&c, BlindKind::Big, 3).blind.disabled);
+	let mut chicot = first_shop("BG", 0);
+	let wall = obs::virtual_round(chicot.clone(), BlindKind::Wall, 3)
+		.blind
+		.chips;
+	chicot.inject(Inject::joker(Joker::Chicot));
+	let preview = obs::virtual_round(chicot.clone(), BlindKind::Wall, 3);
+	assert!(
+		preview.blind.disabled && preview.blind.chips == wall / 2.0,
+		"The Wall with Chicot: {} chips (without: {wall})",
+		preview.blind.chips
+	);
+	assert!(
+		!obs::virtual_round(chicot.clone(), BlindKind::Big, 3)
+			.blind
+			.disabled
+	);
 	// As a shop item against The Wall, Chicot's gain counts the halved target.
 	let mut shop = first_shop("BG", 0);
-	shop.boss_choice = BlindKind::Wall;
-	shop.dollars = 50.0;
-	shop.shop_jokers.clear();
-	shop.shop_jokers.push(c.jokers.last().unwrap().clone());
+	shop.blind_select.boss = BlindKind::Wall;
+	shop.run.dollars = 50.0;
+	shop.areas.shop_jokers.clear();
+	shop.areas
+		.shop_jokers
+		.push(chicot.areas.jokers.last().unwrap().clone().into());
 	let mut cache = Vec::new();
-	assert!(obs::build_preview(&shop, &mut cache));
-	let f = cache[0].item_feats(&shop, obs::zone::SHOP_CARD, 0).unwrap();
+	let preview = obs::build_preview(&shop, &mut cache).expect("a shop has a build preview");
+	let p = preview
+		.item_feats(&shop, obs::ItemZone::ShopCard, 0)
+		.expect("a joker for sale has a preview");
 	assert!(
-		(f[0] - 2f32.ln()).abs() < 0.02,
-		"Chicot's preview against The Wall {f:?}"
+		(p.gain - 2f32.ln()).abs() < 0.02,
+		"Chicot's preview against The Wall {p:?}"
 	);
 }
 
 #[test]
-#[expect(clippy::float_cmp, reason = "hand counts are exact values")]
 fn capacity_against_the_eye_and_the_mouth_is_a_whole_round() {
 	// The Eye scores no hand type twice and The Mouth only the first hand's type, so the round is worth less than
 	// its hands' best plays added up; one hand alone is worth the same.
 	let (mut eye_less, mut mouth_less) = (0, 0);
 	for s in 0..12u64 {
 		let mut g = first_shop("EM", s * 7);
-		g.inject(&Inject::Joker {
-			joker: Joker::Jolly,
-			edition: Edition::None,
-			eternal: false,
-		});
+		g.inject(Inject::joker(Joker::Jolly));
 		let seeds = [s + 1, s + 2, s + 3, s + 4];
 		let free = obs::capacity(&g, BlindKind::Small, &seeds).mean;
 		for (boss, less) in [
@@ -238,11 +227,7 @@ fn capacity_against_the_eye_and_the_mouth_is_a_whole_round() {
 			);
 			// A longer round (Burglar: seven hands) keeps using up hand types past the four sampled hands.
 			let mut long = g.clone();
-			long.inject(&Inject::Joker {
-				joker: Joker::Burglar,
-				edition: Edition::None,
-				eternal: false,
-			});
+			long.inject(Inject::joker(Joker::Burglar));
 			let (l, f) = (
 				obs::capacity(&long, boss, &seeds),
 				obs::capacity(&long, BlindKind::Small, &seeds),
@@ -260,7 +245,7 @@ fn capacity_against_the_eye_and_the_mouth_is_a_whole_round() {
 			);
 			// A round of one hand has nothing to restrict, however many hands are sampled.
 			let mut one = g.clone();
-			one.rr_hands = 1.0;
+			one.round.base_hands = 1.0;
 			assert_eq!(
 				obs::capacity(&one, boss, &seeds).mean,
 				obs::capacity(&one, BlindKind::Small, &seeds).mean,
@@ -280,35 +265,31 @@ fn item_capacity_against_the_eye_is_on_the_rounds_scale() {
 	// disabled (Chicot owned, which scores nothing itself) by what the rule costs the build.
 	let mut scale = 0;
 	for s in 0..12u64 {
+		let shop = first_shop("EM", s * 7);
 		let item = |chicot: bool| {
-			let mut g = first_shop("EM", s * 7);
-			g.boss_choice = BlindKind::Eye;
-			g.dollars = 50.0;
-			g.inject(&Inject::Joker {
-				joker: Joker::Jolly,
-				edition: Edition::None,
-				eternal: false,
-			});
+			let mut g = shop.clone();
+			g.blind_select.boss = BlindKind::Eye;
+			g.run.dollars = 50.0;
+			g.inject(Inject::joker(Joker::Jolly));
 			if chicot {
-				g.inject(&Inject::Joker {
-					joker: Joker::Chicot,
-					edition: Edition::None,
-					eternal: false,
-				});
+				g.inject(Inject::joker(Joker::Chicot));
 			}
-			g.shop_jokers.clear();
-			let mut p = sim::Card::new(999, Kind::Planet(Planet::Pluto));
-			(p.cost, p.base_cost) = (3.0, 3.0);
-			g.shop_jokers.push(p);
+			g.areas.shop_jokers.clear();
+			let mut p = Card::new(999, Kind::Planet(Planet::Pluto));
+			(p.core.cost, p.core.base_cost) = (3.0, 3.0);
+			g.areas.shop_jokers.push(p.into());
 			let mut cache = Vec::new();
-			assert!(obs::build_preview(&g, &mut cache));
-			(
-				f64::from(cache[0].item_feats(&g, obs::zone::SHOP_CARD, 0).unwrap()[1]),
-				cache[0].cap_boss.mean,
-			)
+			let preview = obs::build_preview(&g, &mut cache).expect("a shop has a build preview");
+			let ratio = preview
+				.item_feats(&g, obs::ItemZone::ShopCard, 0)
+				.expect("a planet for sale has a preview")
+				.ratio;
+			(f64::from(ratio), preview.cap_boss.mean)
 		};
-		let ((r_eye, m_eye), (r_free, m_free)) = (item(false), item(true));
-		if r_free < 3.9 && m_eye < m_free * 0.98 {
+		let ((r_eye, m_eye), (r_free, m_free)) =
+			(item(/* chicot= */ false), item(/* chicot= */ true));
+		// Only ratios below the feature's cap show the scale.
+		if r_free < obs::PREVIEW_RATIO_MAX - 0.1 && m_eye < m_free * 0.98 {
 			assert!(
 				(r_eye / r_free - m_eye / m_free).abs() < 0.01,
 				"item ratio {r_eye} vs {r_free} with the boss disabled; the build's capacity {m_eye} vs {m_free}"

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup of a fresh Vast.ai instance (Ubuntu image, as root, from the unpacked repo):
-# build tools, Rust, uv, the Python env (builds the Rust extension), the vastai CLI, then a CUDA check.
+# One-time setup of a fresh Vast.ai instance (Ubuntu image, as root, from the unpacked repo).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export DEBIAN_FRONTEND=noninteractive PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"

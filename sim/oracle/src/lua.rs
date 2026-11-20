@@ -1,27 +1,39 @@
 //! The Lua 5.1 C API of the game's `lua51.dll`, loaded at runtime.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{self, Path};
+use std::{iter, mem, ptr, slice};
 
-type LuaState = c_void;
+/// A `lua_State`, only ever behind a pointer.
+#[repr(C)]
+struct LuaState {
+	_opaque: [u8; 0],
+}
+
+/// A loaded module (`HMODULE`), only ever behind a pointer.
+#[repr(C)]
+struct ModuleHandle {
+	_opaque: [u8; 0],
+}
 
 const LUA_GLOBALSINDEX: c_int = -10002;
 const LUA_TNIL: c_int = 0;
 const LUA_TNUMBER: c_int = 3;
 const LUA_TSTRING: c_int = 4;
 /// Name of the chunks passed to `luaL_loadbuffer` (shown in errors).
-const CHUNK: &std::ffi::CStr = c"=oracle";
+const CHUNK: &CStr = c"=oracle";
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-	fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
-	fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
-	fn FreeLibrary(module: *mut c_void) -> c_int;
+	fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut ModuleHandle;
+	fn GetProcAddress(module: *mut ModuleHandle, name: *const c_char) -> *mut c_void;
+	fn FreeLibrary(module: *mut ModuleHandle) -> c_int;
 	fn GetLastError() -> u32;
 }
 const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
+#[derive(Debug)]
 struct Api {
 	new_state: unsafe extern "C" fn() -> *mut LuaState,
 	open_libs: unsafe extern "C" fn(*mut LuaState),
@@ -35,8 +47,8 @@ struct Api {
 	close: unsafe extern "C" fn(*mut LuaState),
 }
 
-/// The loaded DLL (freed on drop).
-struct Module(*mut c_void);
+#[derive(Debug)]
+struct Module(*mut ModuleHandle);
 
 impl Drop for Module {
 	fn drop(&mut self) {
@@ -47,15 +59,12 @@ impl Drop for Module {
 
 /// A Lua state of the game's `LuaJIT`. Fields drop in order: the state is
 /// closed before the DLL is released.
+#[derive(Debug)]
 pub struct State {
 	api: Api,
 	l: *mut LuaState,
 	_module: Module,
 }
-
-// SAFETY: a Lua state has no thread affinity, and `State` is not `Sync`, so
-// only one thread uses it at a time.
-unsafe impl Send for State {}
 
 impl Drop for State {
 	fn drop(&mut self) {
@@ -67,17 +76,15 @@ impl Drop for State {
 
 impl State {
 	pub fn new(dll: &Path) -> Result<State, String> {
-		let wide: Vec<u16> = dll
-			.as_os_str()
-			.encode_wide()
-			.chain(std::iter::once(0))
-			.collect();
+		// `LOAD_WITH_ALTERED_SEARCH_PATH` is undefined for a relative path.
+		let dll = path::absolute(dll).map_err(|e| format!("{}: {e}", dll.display()))?;
+		let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(iter::once(0)).collect();
 		// SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the
 		// call, and the reserved file handle is null as required.
 		let handle = unsafe {
 			LoadLibraryExW(
 				wide.as_ptr(),
-				std::ptr::null_mut(),
+				ptr::null_mut(),
 				LOAD_WITH_ALTERED_SEARCH_PATH,
 			)
 		};
@@ -97,7 +104,7 @@ impl State {
 					return Err(format!("missing symbol {}", $name));
 				}
 				// SAFETY: the symbol is the Lua 5.1 C API function of this signature.
-				unsafe { std::mem::transmute::<*mut c_void, $ty>(p) }
+				unsafe { mem::transmute::<*mut c_void, $ty>(p) }
 			}};
 		}
 		let api = Api {
@@ -126,10 +133,10 @@ impl State {
 		})
 	}
 
-	pub fn exec(&self, code: &str) -> Result<(), String> {
-		// SAFETY: `self.l` is a live state used by one thread at a time; Lua
-		// copies the chunk, whose pointer is valid for the length passed, and
-		// a failed load or call leaves its message on the stack for `pop_error`.
+	pub fn exec(&mut self, code: &str) -> Result<(), String> {
+		// SAFETY: `self.l` is a live state, borrowed exclusively; Lua copies
+		// the chunk, whose pointer is valid for the length passed, and a
+		// failed load or call leaves its message on the stack for `pop_error`.
 		unsafe {
 			if (self.api.load_buffer)(
 				self.l,
@@ -147,7 +154,7 @@ impl State {
 		Ok(())
 	}
 
-	pub fn eval(&self, code: &str) -> Result<String, String> {
+	pub fn eval(&mut self, code: &str) -> Result<String, String> {
 		// SAFETY: as in `exec`; the successful call leaves its one result on
 		// the stack for `pop_result`.
 		unsafe {
@@ -167,13 +174,14 @@ impl State {
 		}
 	}
 
-	pub fn call(&self, name: &str, arg: &str) -> Result<String, String> {
-		let cname = CString::new(name).map_err(|_| format!("bad function name {name:?}"))?;
-		// SAFETY: as in `exec`; `cname` is NUL-terminated and Lua copies the
+	/// Calls the global function `name(arg)` and returns its string result
+	/// (as [`eval`](Self::eval)).
+	pub fn call(&mut self, name: &CStr, arg: &str) -> Result<String, String> {
+		// SAFETY: as in `exec`; `name` is NUL-terminated and Lua copies the
 		// argument string. The call leaves its one result (or its error
 		// message) on the stack for `pop_result` (`pop_error`).
 		unsafe {
-			(self.api.get_field)(self.l, LUA_GLOBALSINDEX, cname.as_ptr());
+			(self.api.get_field)(self.l, LUA_GLOBALSINDEX, name.as_ptr());
 			(self.api.push_lstring)(self.l, arg.as_ptr().cast::<c_char>(), arg.len());
 			if (self.api.pcall)(self.l, 1, 1, 0) != 0 {
 				return Err(self.pop_error());
@@ -188,13 +196,16 @@ impl State {
 	/// # Safety
 	///
 	/// The result must be on top of the stack.
-	unsafe fn pop_result(&self) -> Result<String, String> {
+	unsafe fn pop_result(&mut self) -> Result<String, String> {
 		// SAFETY: the caller guarantees a value at index -1 of the live state.
 		let t = unsafe { (self.api.lua_type)(self.l, -1) };
 		let r = match t {
 			LUA_TNIL => Ok(String::new()),
-			// SAFETY: the value at index -1 is still there.
-			LUA_TNUMBER | LUA_TSTRING => Ok(unsafe { self.top_string() }),
+			LUA_TNUMBER | LUA_TSTRING => {
+				// SAFETY: the value at index -1 is still there.
+				let bytes = unsafe { self.top_bytes() }.expect("Lua converts strings and numbers");
+				String::from_utf8(bytes).map_err(|e| format!("the result is not UTF-8: {e}"))
+			}
 			_ => Err(format!("expected a string result, got Lua type {t}")),
 		};
 		// SAFETY: clearing the stack of the live state is always valid.
@@ -202,34 +213,41 @@ impl State {
 		r
 	}
 
-	/// The value on top of the stack as text.
+	/// The bytes of the string or number on top of the stack, or `None` if
+	/// it is another type.
 	///
 	/// # Safety
 	///
 	/// The stack must not be empty.
-	unsafe fn top_string(&self) -> String {
+	unsafe fn top_bytes(&mut self) -> Option<Vec<u8>> {
 		let mut len = 0usize;
 		// SAFETY: the caller guarantees a value at index -1; `len` is a valid out pointer.
 		let p = unsafe { (self.api.to_lstring)(self.l, -1, &raw mut len) };
 		if p.is_null() {
-			return String::new();
+			return None;
 		}
 		// SAFETY: Lua returned `len` bytes that stay valid while the value is
 		// on the stack; they are copied before anything pops it.
-		let bytes = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) };
-		String::from_utf8_lossy(bytes).into_owned()
+		Some(unsafe { slice::from_raw_parts(p.cast::<u8>(), len) }.to_vec())
 	}
 
-	/// Pops the error message of a failed load or call.
+	/// Pops the error of a failed load or call: its message, or the Lua type
+	/// of an error value that is not a string.
 	///
 	/// # Safety
 	///
-	/// The message must be on top of the stack.
-	unsafe fn pop_error(&self) -> String {
+	/// The error must be on top of the stack.
+	unsafe fn pop_error(&mut self) -> String {
 		// SAFETY: the caller guarantees a value at index -1 of the live state.
-		let s = unsafe { self.top_string() };
+		let message = match unsafe { self.top_bytes() } {
+			Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+			// SAFETY: as above.
+			None => format!("error value of Lua type {}", unsafe {
+				(self.api.lua_type)(self.l, -1)
+			}),
+		};
 		// SAFETY: clearing the stack of the live state is always valid.
 		unsafe { (self.api.set_top)(self.l, 0) };
-		s
+		message
 	}
 }

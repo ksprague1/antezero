@@ -9,7 +9,7 @@ current area order.
 Two translations are provided:
 
 * :meth:`Action.harness` -> the oracle harness command table (``H.act``),
-  identical to ``action_to_lua`` in ``sim/oracle/src/diff.rs`` (1-based).
+  identical to ``Command::to_lua`` in ``sim/oracle/src/command.rs`` (1-based).
   The companion mod's ``az_act`` executes it with the harness's timing
   protocol.
 * :meth:`Action.balatrobot` -> a native BalatroBot ``(method, params)`` call
@@ -46,7 +46,6 @@ OPERANDS: dict[str, tuple[int, ...]] = {
     "pick": (8, 32),
     "skip_pack": (),
 }
-# op -> number of operands.
 ARITY: dict[str, int] = {op: len(w) for op, w in OPERANDS.items()}
 
 # What Rust's unsigned integer `FromStr` accepts.
@@ -54,14 +53,11 @@ _UINT = re.compile(r"\+?[0-9]+")
 
 
 def mask_indices(m: int) -> list[int]:
-    """0-based hand indices of a selection mask, ascending (like the sim)."""
     return [i for i in range(32) if m >> i & 1]
 
 
 @dataclass(frozen=True, slots=True)
 class Action:
-    """One sim action. ``op`` is the code keyword, ``args`` its integers."""
-
     op: str
     args: tuple[int, ...] = ()
 
@@ -75,7 +71,6 @@ class Action:
             if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v < 1 << w:
                 raise ValueError(f"{self.op}: operand {v!r} is not a {w}-bit unsigned integer")
 
-    # -- constructors -----------------------------------------------------
     @staticmethod
     def select() -> Action:
         return Action("select")
@@ -156,7 +151,6 @@ class Action:
     def skip_pack() -> Action:
         return Action("skip_pack")
 
-    # -- text codes -------------------------------------------------------
     def code(self) -> str:
         """``Action::code`` text form, e.g. ``play 11``."""
         return " ".join([self.op, *map(str, self.args)])
@@ -181,9 +175,8 @@ class Action:
             return None
         return Action(op, vals)
 
-    # -- translations -----------------------------------------------------
     def harness(self) -> dict[str, Any]:
-        """The oracle ``H.act`` table (1-based), as in diff.rs ``action_to_lua``."""
+        """The oracle ``H.act`` table (1-based), as in command.rs ``Command::to_lua``."""
         op, a = self.op, self.args
 
         def cards(m: int) -> list[int]:
@@ -233,7 +226,7 @@ class Action:
         raise AssertionError(op)
 
     def harness_lua(self) -> str:
-        """The exact ``H.act{...}`` Lua command diff.rs sends to the oracle."""
+        """The exact ``H.act{...}`` Lua command the oracle's difftest sends."""
         return f"H.act({lua_table(self.harness())})"
 
     def balatrobot(self, n_jokers: int = 0, n_hand: int = 0) -> tuple[str, dict[str, Any]] | None:

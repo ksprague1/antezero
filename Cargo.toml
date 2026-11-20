@@ -1,5 +1,3 @@
-# The Rust workspace: the simulator (`sim`), the ground-truth oracle that
-# runs the game's own Lua (`sim/oracle`) and the Python bindings (`sim/py`).
 [workspace]
 members = ["sim", "sim/oracle", "sim/py"]
 # The Python extension needs a Python toolchain; build it with maturin
@@ -9,13 +7,24 @@ resolver = "3"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+absolute_paths = "warn" # import the item or its module; no `std::a::b` or `crate::a::b` inline
+allow_attributes = "warn" # silence a lint with #[expect], which warns once it is no longer needed
+allow_attributes_without_reason = "warn" # every #[expect] says why
 clone_on_ref_ptr = "warn" # write Rc::clone(&x), so `.clone()` always means a real copy
-doc_paragraphs_missing_punctuation = "warn" # doc comments use full sentences
+dbg_macro = "warn" # debugging leftover
+doc_paragraphs_missing_punctuation = "warn"
+# A bit-exact port: floats hold whole numbers and exact game constants, and
+# the game compares them with `==`, so the simulator must too.
+float_cmp = "allow"
 multiple_inherent_impl = "warn" # one inherent impl block per type, not one per ported class
 needless_collect = "warn" # nursery, may false-positive
 redundant_clone = "warn" # nursery, may false-positive
+# The state structs mirror the game's Lua tables (`Card`, `card.ability`,
+# `G.GAME`, `Blind`), whose flags are independent of each other.
+struct_excessive_bools = "allow"
 tabs_in_doc_comments = "allow" # hard_tabs makes rustfmt indent doc examples with tabs
-undocumented_unsafe_blocks = "warn" # every unsafe block needs a `// SAFETY:` comment
+todo = "warn" # unfinished work
+undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn" # use expect("why this can't fail") instead
 
 [profile.release]

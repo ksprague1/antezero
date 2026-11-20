@@ -19,10 +19,15 @@
 //! with the extracted game scripts).
 
 pub mod canon;
-pub mod diff;
+pub mod command;
+pub mod difftest;
 pub mod json;
 #[cfg(windows)]
 mod lua;
+#[cfg(not(windows))]
+#[path = "lua_unavailable.rs"]
+mod lua;
 mod oracle;
+pub mod policy;
 
-pub use oracle::{Oracle, available, default_dll, default_src, dll_available, lua_str};
+pub use oracle::{Oracle, available, default_dll, default_src, dll_available, lua_path, lua_str};

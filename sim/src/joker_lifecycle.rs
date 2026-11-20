@@ -1,414 +1,585 @@
 //! Joker contexts outside hand scoring: shop, packs, selling, blind setup,
 //! discards and the end of the round.
+//!
+//! A joker reacts to a context in one `match` arm, as in `joker_scoring`.
+//! What a joker does when it is gained or lost (`add_to_deck` /
+//! `remove_from_deck`) is in `card_lifecycle`.
 
-use crate::card::Kind;
-use crate::data::{Edition, JACK, Joker, TagKind, Tarot};
-use crate::ev::Ev;
-use crate::game::{Area, CardSet, Game};
-use crate::jokers::{Ctx, Effect, ret};
+use crate::areas::Pile;
+use crate::blind::CardDebuff;
+use crate::calculate_joker::{Discarded, Effect, LifecycleCtx};
+use crate::card::{Card, Kind};
+use crate::card_lifecycle::{Pricing, YORICK_DISCARDS};
+use crate::data::{Edition, Enhancement, Joker, Rank, Seal, TagKind, Tarot};
+use crate::event::{Draw, Event};
+use crate::event_queue::{Blocks, EventQueue, Trigger};
+use crate::game::{Area, Areas, CardSet, Game};
+use crate::playing_card::SuitTest;
+use crate::pools::{NewCard, OwnedArea, RarityRoll};
 use crate::rng::Key;
-use crate::{blind, cards, events, flow, jokers, num};
+use crate::round::Round;
+use crate::tags::TagEvent;
+use crate::{
+	areas, blind, calculate_joker, card_lifecycle, event_queue, flow, num, pools, round_end,
+};
 
-#[expect(
-	clippy::too_many_lines,
-	reason = "one arm per context; the order of the checks is the Lua if-chain's"
-)]
+/// `Card:calculate_joker` for the contexts outside hand scoring; returns
+/// the effect to show, if any. `copier` is the Blueprint or Brainstorm the
+/// joker's logic runs for, if it is being copied.
 pub(crate) fn calculate(
-	g: &mut Game, ji: usize, j: Joker, ctx: &Ctx, blueprinted: bool, actor: usize,
+	g: &mut Game, ji: usize, j: Joker, ctx: LifecycleCtx, copier: Option<usize>,
 ) -> Option<Effect> {
 	use Joker as J;
-	let ab = g.jokers[ji].ab;
-	let prob = g.probabilities;
-	match *ctx {
-		Ctx::OpenBooster => {
-			if j == J::Hallucination && jokers::consumable_room(g) {
-				let key = g.key_ante("halu");
-				if g.rng.random(&key) < prob / 2.0 {
-					g.consumeable_buffer += 1.0;
-					g.events.push_before(0.0, Ev::Create {
-						set: CardSet::Tarot,
-						area: Area::Consumables,
-						forced: None,
-						append: "hal",
-						rarity: None,
-						legendary: false,
-					});
-					g.events.status_extra();
-				}
-			}
-			None
-		}
-		Ctx::SellingSelf => {
-			if j == J::Luchador
-				&& g.blind.kind.is_some()
-				&& !g.blind.disabled
-				&& g.blind.slot() == Some(crate::game::BlindSlot::Boss)
-			{
-				g.events.status_extra();
-				blind::disable_blind(g);
-			}
-			if j == J::DietCola {
-				g.events.push(Ev::AddTag {
-					kind: TagKind::Double,
-					orbital: None,
-				});
-			}
-			if j == J::Invisible && ab.invis_rounds >= 2.0 && !blueprinted {
-				let mut sorted: Vec<usize> = (0..g.jokers.len()).filter(|&i| i != ji).collect();
-				g.events.status_extra();
-				if !sorted.is_empty() && num::float(g.jokers.len()) <= g.joker_limit.limit {
-					// pseudorandom_element(jokers) sorts by sort_id.
-					sorted.sort_by_key(|&i| g.jokers[i].id);
-					let key = Key::from("invisible");
-					let pick = sorted[g.rng.element(&key, sorted.len())];
-					let strip = g.jokers[pick].edition == Edition::Negative;
-					let mut c = flow::copy_card(g, g.jokers[pick].clone(), strip);
-					if c.is_joker(J::Invisible) {
-						c.ab.invis_rounds = 0.0;
-					}
-					cards::add_to_deck(g, &mut c, false);
-					g.jokers.push(c);
-				}
-			}
-			None
-		}
-		Ctx::SellingCard => {
-			if j == J::Campfire && !blueprinted {
-				jokers::jab(g, ji).x_mult += 0.25;
-				g.events.push(Ev::StatusLater(0.75));
-			}
-			None
-		}
-		Ctx::RerollShop => {
-			if j == J::Flash && !blueprinted {
-				jokers::jab(g, ji).mult += 2.0;
-				g.events.push(Ev::StatusLater(0.75));
-			}
-			None
-		}
-		Ctx::EndingShop => {
-			if j == J::Perkeo && !g.consumables.is_empty() {
-				g.events.push(Ev::PerkeoCopy);
-				g.events.status_extra();
-			}
-			None
-		}
-		Ctx::SkipBlind => {
-			if j == J::Throwback && !blueprinted {
-				g.events.push(Ev::StatusLater(0.75));
-			}
-			None
-		}
-		Ctx::SkippingBooster => {
-			if j == J::RedCard && !blueprinted {
-				jokers::jab(g, ji).mult += 3.0;
-				g.events.push(Ev::StatusLater(0.45));
-			}
-			None
-		}
-		Ctx::PlayingCardAdded { n } => {
-			if g.jokers[ji].getting_sliced {
-				return None;
-			}
-			if j == J::Hologram && !blueprinted && n > 0 {
-				jokers::jab(g, ji).x_mult += num::float(n) * 0.25;
-				g.events.status_extra();
-			}
-			None
-		}
-		Ctx::FirstHandDrawn => {
-			if j == J::Certificate {
-				g.events.push(Ev::CertificateCard);
-				jokers::playing_card_joker_effects(g, 1);
-			}
-			None
-		}
-		Ctx::SettingBlind { boss } => {
-			if g.jokers[ji].getting_sliced {
-				return None;
-			}
-			if j == J::Chicot && !blueprinted && boss {
-				g.events.push(Ev::ChicotOuter);
-			}
-			if j == J::Madness && !blueprinted && !boss {
-				jokers::jab(g, ji).x_mult += 0.5;
-				let mut dest: Vec<usize> = (0..g.jokers.len())
-					.filter(|&i| i != ji && !g.jokers[i].ab.eternal && !g.jokers[i].getting_sliced)
-					.collect();
-				if !dest.is_empty() {
-					dest.sort_by_key(|&i| g.jokers[i].id);
-					let key = Key::from("madness");
-					let pick = dest[g.rng.element(&key, dest.len())];
-					if !g.jokers[actor].getting_sliced {
-						g.jokers[pick].getting_sliced = true;
-						let id = g.jokers[pick].id;
-						g.events.push(Ev::DissolveJoker { id, fac: 1.6 });
-					}
-				}
-				if !g.jokers[actor].getting_sliced {
-					g.events.status_extra();
-				}
-			}
-			if j == J::Burglar && !g.jokers[actor].getting_sliced {
-				g.events.push(Ev::Burglar);
-			}
-			if j == J::RiffRaff
-				&& !g.jokers[actor].getting_sliced
-				&& (num::float(g.jokers.len()) + g.joker_buffer) < g.joker_limit.limit
-			{
-				let n =
-					2f64.min(g.joker_limit.limit - (num::float(g.jokers.len()) + g.joker_buffer));
-				g.joker_buffer += n;
-				#[expect(
-					clippy::cast_possible_truncation,
-					clippy::cast_sign_loss,
-					reason = "`n` is 1 or 2 free joker slots"
-				)]
-				let n = n as u32;
-				g.events.push(Ev::RiffRaff { n });
-				g.events.status_extra();
-			}
-			if j == J::Cartomancer && !g.jokers[actor].getting_sliced && jokers::consumable_room(g)
-			{
-				g.consumeable_buffer += 1.0;
-				g.events.push(Ev::CartomancerOuter);
-			}
-			if j == J::Ceremonial
-				&& !blueprinted
-				&& ji + 1 < g.jokers.len()
-				&& !g.jokers[ji + 1].ab.eternal
-				&& !g.jokers[ji + 1].getting_sliced
-			{
-				g.jokers[ji + 1].getting_sliced = true;
-				g.joker_buffer -= 1.0;
-				let me = g.jokers[ji].id;
-				let victim = g.jokers[ji + 1].id;
-				g.events.push(Ev::DaggerSlice { dagger: me, victim });
-				g.events.status_extra();
-			}
-			if j == J::Marble && !g.jokers[actor].getting_sliced {
-				g.events.push(Ev::MarbleStone);
-				g.events.status_extra();
-				// G.deck.config.card_limit + 1 (no game effect here)
-				g.events.push(Ev::Wait);
-				g.events.draw_ev(
-					crate::ev::Pile::Play,
-					crate::ev::Pile::Deck,
-					None,
-					false,
-					false,
-					0.1,
+	let blueprinted = copier.is_some();
+	match (ctx, j) {
+		(LifecycleCtx::OpenBooster, J::Hallucination) if g.areas.consumable_room_after_queued() => {
+			let key = g.run.key_ante("halu");
+			if g.rng.random(&key) < g.run.probabilities / 2.0 {
+				calculate_joker::queue_consumable(
+					&mut g.areas,
+					&mut g.events,
+					CardSet::Tarot,
+					"hal",
 				);
-				jokers::playing_card_joker_effects(g, 1);
-			}
-			None
-		}
-		Ctx::RemovePlayingCards { faces, glass } => {
-			if j == J::Caino && !blueprinted {
-				if faces > 0 {
-					jokers::jab(g, ji).caino_xmult += num::float(faces) * 1.0;
-					g.events.push(Ev::StatusLater(0.75));
-				}
-				return None;
-			}
-			if j == J::Glass && !blueprinted {
-				if glass > 0 {
-					g.events.push(Ev::GlassJokerOuter {
-						id: g.jokers[ji].id,
-						n: num::index32(glass),
-					});
-				}
-				return None;
-			}
-			None
-		}
-		Ctx::UsingConsumeable { kind, hanged_glass } => {
-			if j == J::Glass && !blueprinted && kind == Kind::Tarot(Tarot::HangedMan) {
-				if hanged_glass > 0 {
-					jokers::jab(g, ji).x_mult += 0.75 * num::float(hanged_glass);
-					g.events.push(Ev::StatusLater(0.75));
-				}
-				return None;
-			}
-			if j == J::FortuneTeller && !blueprinted && matches!(kind, Kind::Tarot(_)) {
-				g.events.push(Ev::StatusLater(0.75));
-			}
-			if j == J::Constellation && !blueprinted && matches!(kind, Kind::Planet(_)) {
-				jokers::jab(g, ji).x_mult += 0.1;
-				g.events.push(Ev::StatusLater(0.75));
-				return None;
-			}
-			None
-		}
-		Ctx::PreDiscard { hook } => {
-			if j == J::Burnt
-				&& g.discards_used <= 0.0
-				&& !hook
-				&& let Some(h) = g.burnt_hand
-			{
 				g.events.status_extra();
-				g.events.hand_text(0.3);
-				events::level_up_hand_ev(g, h, 1.0, false);
-				g.events.hand_text(0.0);
 			}
-			None
 		}
-		Ctx::Discard {
-			other,
-			last,
-			n_full,
-			full_faces,
-		} => {
-			let oc = &g.hand[other];
-			if j == J::Ramen && !blueprinted {
-				if ab.x_mult - 0.01 <= 1.0 {
-					jokers::schedule_self_destruct(g, ji);
-					ret!(extra: true);
-				}
-				jokers::jab(g, ji).x_mult -= 0.01;
-				ret!(extra: true, delay: Some(0.2));
-			}
-			if j == J::Yorick && !blueprinted {
-				if ab.yorick_discards <= 1.0 {
-					jokers::jab(g, ji).yorick_discards = 23.0;
-					jokers::jab(g, ji).x_mult += 1.0;
-					ret!(extra: true, delay: Some(0.2));
-				}
-				jokers::jab(g, ji).yorick_discards -= 1.0;
-				return None;
-			}
-			if j == J::Trading && !blueprinted && g.discards_used <= 0.0 && n_full == 1 {
-				g.events.push(Ev::EaseDollars(3.0));
-				ret!(remove: true, delay: Some(0.45));
-			}
-			let smeared = g.smeared();
-			if j == J::Castle
-				&& !oc.debuff
-				&& oc.is_suit(g.castle_suit, false, false, smeared)
-				&& !blueprinted
-			{
-				jokers::jab(g, ji).chips += 3.0;
-				ret!(extra: true);
-			}
-			let oc = &g.hand[other];
-			if j == J::Mail && !oc.debuff && oc.get_id() == Some(g.mail_rank.rank) {
-				g.events.push(Ev::EaseDollars(5.0));
-				ret!(dollars: None);
-			}
-			let oc = &g.hand[other];
-			if j == J::HitTheRoad && !oc.debuff && oc.id_is(JACK) && !blueprinted {
-				jokers::jab(g, ji).x_mult += 0.5;
-				ret!(extra: true, delay: Some(0.45));
-			}
-			if j == J::GreenJoker && !blueprinted && other == last {
-				let prev = ab.mult;
-				let m = (ab.mult - 1.0).max(0.0);
-				jokers::jab(g, ji).mult = m;
-				#[expect(
-					clippy::float_cmp,
-					reason = "exact: whether the floor at 0 left the value unchanged"
-				)]
-				let changed = m != prev;
-				if changed {
-					ret!(extra: true);
-				}
-			}
-			if j == J::Faceless && other == last && full_faces >= 3 {
-				g.events.push(Ev::DollarsStatus {
-					d: 5.0,
-					delay: 0.45,
-				});
-				return None;
-			}
-			None
+		(LifecycleCtx::SellingSelf, _) => selling_self(g, ji, j, blueprinted),
+		(LifecycleCtx::SellingCard, J::Campfire) if !blueprinted => {
+			g.areas.jokers[ji].ab.x_mult += 0.25;
+			g.events.push(Event::StatusLater(0.75));
 		}
-		Ctx::EndOfRound { game_over } => {
-			if blueprinted {
-				return None;
-			}
-			let boss = g.blind.boss;
-			if j == J::Campfire && boss && ab.x_mult > 1.0 {
-				jokers::jab(g, ji).x_mult = 1.0;
-				ret!(extra: true);
-			}
-			if j == J::Rocket && boss {
-				jokers::jab(g, ji).dollars += 2.0;
-				ret!(extra: true);
-			}
-			if j == J::TurtleBean {
-				if ab.remaining - 1.0 <= 0.0 {
-					jokers::schedule_self_destruct(g, ji);
-					ret!(extra: true);
-				}
-				jokers::jab(g, ji).remaining -= 1.0;
-				cards::change_hand_size(g, -1.0);
-				ret!(extra: true);
-			}
-			if j == J::Invisible {
-				jokers::jab(g, ji).invis_rounds += 1.0;
-				ret!(extra: true);
-			}
-			if j == J::Popcorn {
-				if ab.mult - 4.0 <= 0.0 {
-					jokers::schedule_self_destruct(g, ji);
-					ret!(extra: true);
-				}
-				jokers::jab(g, ji).mult -= 4.0;
-				ret!(extra: true);
-			}
-			if j == J::TodoList {
-				let (hands, n) = g.visible_hands_pairs(ab.to_do);
-				let key = Key::from("to_do");
-				let i = g.rng.element(&key, n);
-				jokers::jab(g, ji).to_do = Some(hands[i]);
-				ret!(extra: true);
-			}
-			if j == J::Egg {
-				jokers::jab(g, ji).extra_value += 3.0;
-				cards::reprice(g, Area::Jokers, ji);
-				ret!(extra: true);
-			}
-			if j == J::Gift {
-				for area in [Area::Jokers, Area::Consumables] {
-					for i in 0..g.area(area).len() {
-						g.area_mut(area)[i].ab.extra_value += 1.0;
-						cards::reprice(g, area, i);
-					}
-				}
-				ret!(extra: true);
-			}
-			if j == J::HitTheRoad && ab.x_mult > 1.0 {
-				jokers::jab(g, ji).x_mult = 1.0;
-				ret!(extra: true);
-			}
-			if j == J::GrosMichel || j == J::Cavendish {
-				let (key, odds) = if j == J::Cavendish {
-					("cavendish", 1000.0)
-				} else {
-					("gros_michel", 6.0)
-				};
-				let key = Key::from(key);
-				if g.rng.random(&key) < prob / odds {
-					jokers::schedule_self_destruct(g, ji);
-					if j == J::GrosMichel {
-						g.gros_michel_extinct = true;
-					}
-				}
-				ret!(extra: true);
-			}
-			if j == J::MrBones && game_over && g.chips / g.blind.chips >= 0.25 {
-				let id = g.jokers[ji].id;
-				g.events.push(Ev::DissolveJoker { id, fac: 1.0 });
-				ret!(saved: true);
-			}
-			None
+		(LifecycleCtx::RerollShop, J::Flash) if !blueprinted => {
+			g.areas.jokers[ji].ab.mult += 2.0;
+			g.events.push(Event::StatusLater(0.75));
 		}
-		Ctx::EndOfRoundRepetition { effects } => {
-			if j == J::Mime && effects {
-				ret!(repetitions: 1);
-			}
-			None
+		(LifecycleCtx::EndingShop, J::Perkeo) if !g.areas.consumables.is_empty() => {
+			g.events.push(Event::Joker(JokerEvent::PerkeoCopy));
+			g.events.status_extra();
 		}
-		_ => unreachable!("scoring context {ctx:?}"),
+		(LifecycleCtx::SkipBlind, J::Throwback) if !blueprinted => {
+			g.events.push(Event::StatusLater(0.75));
+		}
+		(LifecycleCtx::SkippingBooster, J::RedCard) if !blueprinted => {
+			g.areas.jokers[ji].ab.mult += 3.0;
+			g.events.push(Event::StatusLater(0.45));
+		}
+		(LifecycleCtx::PlayingCardAdded { n }, J::Hologram)
+			if !g.areas.jokers[ji].getting_sliced && !blueprinted && n > 0 =>
+		{
+			g.areas.jokers[ji].ab.x_mult += num::float(n) * 0.25;
+			g.events.status_extra();
+		}
+		(LifecycleCtx::FirstHandDrawn, J::Certificate) => {
+			g.events.push(Event::Joker(JokerEvent::CertificateCard));
+			calculate_joker::calc_jokers(g, LifecycleCtx::PlayingCardAdded { n: 1 });
+		}
+		(LifecycleCtx::SettingBlind { boss }, _) if !g.areas.jokers[ji].getting_sliced => {
+			setting_blind(g, ji, j, boss, copier);
+		}
+		(LifecycleCtx::RemovePlayingCards { faces, .. }, J::Caino) if !blueprinted && faces > 0 => {
+			g.areas.jokers[ji].ab.caino_xmult += num::float(faces) * 1.0;
+			g.events.push(Event::StatusLater(0.75));
+		}
+		(LifecycleCtx::RemovePlayingCards { glass, .. }, J::Glass) if !blueprinted && glass > 0 => {
+			g.events.push(Event::Joker(JokerEvent::GlassJokerOuter {
+				id: g.areas.jokers[ji].core.id,
+				n: num::index32(glass),
+			}));
+		}
+		(LifecycleCtx::UsingConsumeable { kind, hanged_glass }, _) if !blueprinted => {
+			using_consumable(
+				&mut g.areas.jokers,
+				&mut g.events,
+				ji,
+				j,
+				kind,
+				hanged_glass,
+			);
+		}
+		(
+			LifecycleCtx::PreDiscard {
+				hook: false,
+				burnt_hand: Some(hand),
+			},
+			J::Burnt,
+		) if g.round.discards_used <= 0.0 => {
+			g.events.status_extra();
+			g.events.hand_text(0.3);
+			event_queue::level_up_hand(&mut g.hands, &mut g.events, hand, 1.0);
+			g.events.hand_text(0.0);
+		}
+		(LifecycleCtx::Discard(d), _) => {
+			return discard(&mut g.areas, &g.round, &mut g.events, ji, j, blueprinted, d);
+		}
+		(LifecycleCtx::EndOfRound { game_over }, _) if !blueprinted => {
+			return end_of_round(g, ji, j, game_over);
+		}
+		(LifecycleCtx::EndOfRoundRepetition { effects: true }, J::Mime) => {
+			return Some(Effect {
+				repetitions: 1,
+				..Effect::NONE
+			});
+		}
+		// No other joker reacts in these contexts.
+		_ => {}
 	}
+	None
+}
+
+/// `context.selling_self`.
+fn selling_self(g: &mut Game, ji: usize, j: Joker, blueprinted: bool) {
+	match j {
+		Joker::Luchador if !g.blind.disabled && g.blind.is_boss() => {
+			g.events.status_extra();
+			blind::disable_blind(g);
+		}
+		Joker::DietCola => g.events.push(Event::Tag(TagEvent::Add {
+			kind: TagKind::Double,
+			orbital: None,
+		})),
+		Joker::Invisible if g.areas.jokers[ji].ab.invis_rounds >= 2.0 && !blueprinted => {
+			g.events.status_extra();
+			let others = |i, _: &Card| i != ji;
+			if num::float(g.areas.jokers.len()) <= g.areas.limits.jokers.limit
+				&& let Some(pick) =
+					areas::pick_card(&mut g.rng, "invisible", &g.areas.jokers, others)
+			{
+				let strip = g.areas.jokers[pick].core.edition == Some(Edition::Negative);
+				let original = g.areas.jokers[pick].clone();
+				let mut c = flow::copy_card(
+					&mut g.areas,
+					&mut g.history,
+					g.shop.discount_percent,
+					&g.hands,
+					&mut g.rng,
+					original,
+					strip,
+				);
+				if c.is_joker(Joker::Invisible) {
+					c.ab.invis_rounds = 0.0;
+				}
+				card_lifecycle::add_to_deck(g, &mut c);
+				g.areas.jokers.push(c);
+			}
+		}
+		_ => {}
+	}
+}
+
+/// `context.setting_blind` for a joker that is not being sliced. Most
+/// effects also need the acting joker (`copier`, else the joker itself) to
+/// be intact.
+fn setting_blind(g: &mut Game, ji: usize, j: Joker, boss: bool, copier: Option<usize>) {
+	use Joker as J;
+	let blueprinted = copier.is_some();
+	let actor_intact = !g.areas.jokers[copier.unwrap_or(ji)].getting_sliced;
+	match j {
+		J::Chicot if !blueprinted && boss => g.events.push(Event::Joker(JokerEvent::ChicotOuter)),
+		J::Madness if !blueprinted && !boss => {
+			g.areas.jokers[ji].ab.x_mult += 0.5;
+			let victims = |i, c: &Card| i != ji && !c.ab.eternal() && !c.getting_sliced;
+			// The victim is drawn even when the Madness is being sliced itself.
+			if let Some(pick) = areas::pick_card(&mut g.rng, "madness", &g.areas.jokers, victims)
+				&& actor_intact
+			{
+				g.areas.jokers[pick].getting_sliced = true;
+				let id = g.areas.jokers[pick].core.id;
+				g.events.push(Event::Joker(JokerEvent::DissolveJoker {
+					id,
+					time_factor: 1.6,
+				}));
+			}
+			if actor_intact {
+				g.events.status_extra();
+			}
+		}
+		J::Burglar if actor_intact => g.events.push(Event::Joker(JokerEvent::Burglar)),
+		J::RiffRaff
+			if actor_intact
+				&& (num::float(g.areas.jokers.len()) + g.areas.joker_buffer)
+					< g.areas.limits.jokers.limit =>
+		{
+			let n = 2f64.min(
+				g.areas.limits.jokers.limit
+					- (num::float(g.areas.jokers.len()) + g.areas.joker_buffer),
+			);
+			g.areas.joker_buffer += n;
+			g.events.push(Event::Joker(JokerEvent::RiffRaff {
+				n: num::index32(num::trunc(n)),
+			}));
+			g.events.status_extra();
+		}
+		J::Cartomancer if actor_intact && g.areas.consumable_room_after_queued() => {
+			g.areas.consumable_buffer += 1.0;
+			g.events.push(Event::Joker(JokerEvent::CartomancerOuter));
+		}
+		J::Ceremonial
+			if !blueprinted
+				&& ji + 1 < g.areas.jokers.len()
+				&& !g.areas.jokers[ji + 1].ab.eternal()
+				&& !g.areas.jokers[ji + 1].getting_sliced =>
+		{
+			g.areas.jokers[ji + 1].getting_sliced = true;
+			g.areas.joker_buffer -= 1.0;
+			let me = g.areas.jokers[ji].core.id;
+			let victim = g.areas.jokers[ji + 1].core.id;
+			g.events
+				.push(Event::Joker(JokerEvent::DaggerSlice { dagger: me, victim }));
+			g.events.status_extra();
+		}
+		J::Marble if actor_intact => {
+			g.events.push(Event::Joker(JokerEvent::MarbleStone));
+			g.events.status_extra();
+			// G.deck.config.card_limit + 1 (no game effect here)
+			g.events.push(Event::Wait);
+			g.events.draw(Draw::next(Pile::Play, Pile::Deck), 0.1);
+			calculate_joker::calc_jokers(g, LifecycleCtx::PlayingCardAdded { n: 1 });
+		}
+		_ => {}
+	}
+}
+
+/// `context.using_consumeable` for a joker acting for itself.
+fn using_consumable(
+	jokers: &mut [Card], events: &mut EventQueue, ji: usize, j: Joker, kind: Kind,
+	hanged_glass: usize,
+) {
+	match j {
+		Joker::Glass if kind == Kind::Tarot(Tarot::HangedMan) && hanged_glass > 0 => {
+			jokers[ji].ab.x_mult += 0.75 * num::float(hanged_glass);
+			events.push(Event::StatusLater(0.75));
+		}
+		Joker::FortuneTeller if matches!(kind, Kind::Tarot(_)) => {
+			events.push(Event::StatusLater(0.75));
+		}
+		Joker::Constellation if matches!(kind, Kind::Planet(_)) => {
+			jokers[ji].ab.x_mult += 0.1;
+			events.push(Event::StatusLater(0.75));
+		}
+		_ => {}
+	}
+}
+
+/// `context.discard`, once per discarded card.
+fn discard(
+	areas: &mut Areas, round: &Round, events: &mut EventQueue, ji: usize, j: Joker,
+	blueprinted: bool, d: Discarded,
+) -> Option<Effect> {
+	use Joker as J;
+	let ab = areas.jokers[ji].ab;
+	let oc = &areas.hand.cards[d.other];
+	match j {
+		J::Ramen if !blueprinted => {
+			if ab.x_mult - 0.01 <= 1.0 {
+				calculate_joker::schedule_self_destruct(events, areas.jokers[ji].core.id);
+				Some(Effect::EXTRA)
+			} else {
+				areas.jokers[ji].ab.x_mult -= 0.01;
+				Some(Effect {
+					extra: true,
+					delay: Some(0.2),
+					..Effect::NONE
+				})
+			}
+		}
+		J::Yorick if !blueprinted => {
+			let yorick = &mut areas.jokers[ji].ab;
+			if yorick.yorick_discards <= 1.0 {
+				yorick.yorick_discards = YORICK_DISCARDS;
+				yorick.x_mult += 1.0;
+				Some(Effect {
+					extra: true,
+					delay: Some(0.2),
+					..Effect::NONE
+				})
+			} else {
+				yorick.yorick_discards -= 1.0;
+				None
+			}
+		}
+		J::Trading if !blueprinted && round.discards_used <= 0.0 && d.n_full == 1 => {
+			events.push(Event::EaseDollars(3.0));
+			Some(Effect {
+				remove: true,
+				delay: Some(0.45),
+				..Effect::NONE
+			})
+		}
+		J::Castle
+			if !oc.core.debuff
+				&& oc.is_suit(round.castle_suit, SuitTest::Scoring, areas.smeared())
+				&& !blueprinted =>
+		{
+			areas.jokers[ji].ab.chips += 3.0;
+			Some(Effect::EXTRA)
+		}
+		J::Mail if !oc.core.debuff && oc.effective_rank() == Some(round.mail_rank.rank) => {
+			// It eases its dollars itself: the table it returns pays none.
+			events.push(Event::EaseDollars(5.0));
+			Some(Effect::NONE)
+		}
+		J::HitTheRoad if !oc.core.debuff && oc.has_rank(Rank::Jack) && !blueprinted => {
+			areas.jokers[ji].ab.x_mult += 0.5;
+			Some(Effect {
+				extra: true,
+				delay: Some(0.45),
+				..Effect::NONE
+			})
+		}
+		J::GreenJoker if !blueprinted && d.other == d.last => {
+			let m = (ab.mult - 1.0).max(0.0);
+			areas.jokers[ji].ab.mult = m;
+			(m != ab.mult).then_some(Effect::EXTRA)
+		}
+		J::Faceless if d.other == d.last && d.full_faces >= 3 => {
+			events.push(Event::DollarsStatus {
+				dollars: 5.0,
+				delay: 0.45,
+			});
+			None
+		}
+		_ => None,
+	}
+}
+
+/// `context.end_of_round` for a joker acting for itself.
+fn end_of_round(g: &mut Game, ji: usize, j: Joker, game_over: bool) -> Option<Effect> {
+	use Joker as J;
+	let ab = g.areas.jokers[ji].ab;
+	let boss = g.blind.is_boss();
+	match j {
+		J::Campfire if boss && ab.x_mult > 1.0 => g.areas.jokers[ji].ab.x_mult = 1.0,
+		J::Rocket if boss => g.areas.jokers[ji].ab.dollars += 2.0,
+		J::TurtleBean => {
+			if ab.extra - 1.0 <= 0.0 {
+				calculate_joker::schedule_self_destruct(&mut g.events, g.areas.jokers[ji].core.id);
+			} else {
+				g.areas.jokers[ji].ab.extra -= 1.0;
+				flow::change_hand_size(&mut g.events, -1.0);
+			}
+		}
+		J::Invisible => g.areas.jokers[ji].ab.invis_rounds += 1.0,
+		J::Popcorn => {
+			if ab.mult - 4.0 <= 0.0 {
+				calculate_joker::schedule_self_destruct(&mut g.events, g.areas.jokers[ji].core.id);
+			} else {
+				g.areas.jokers[ji].ab.mult -= 4.0;
+			}
+		}
+		J::TodoList => {
+			let hand = g.hands.random_visible(&mut g.rng, "to_do", ab.to_do);
+			g.areas.jokers[ji].ab.to_do = Some(hand);
+		}
+		J::Egg => {
+			g.areas.jokers[ji].ab.extra_value += 3.0;
+			Pricing::new(g.shop.discount_percent, &g.areas.jokers)
+				.set_cost(&mut g.areas.jokers[ji], Some(Area::Jokers));
+		}
+		J::Gift => {
+			let pricing = Pricing::new(g.shop.discount_percent, &g.areas.jokers);
+			for (cards, area) in [
+				(&mut g.areas.jokers, Area::Jokers),
+				(&mut g.areas.consumables, Area::Consumables),
+			] {
+				for c in cards {
+					c.ab.extra_value += 1.0;
+					pricing.set_cost(c, Some(area));
+				}
+			}
+		}
+		J::HitTheRoad if ab.x_mult > 1.0 => g.areas.jokers[ji].ab.x_mult = 1.0,
+		J::GrosMichel | J::Cavendish => {
+			let (key, odds) = if j == J::Cavendish {
+				("cavendish", 1000.0)
+			} else {
+				("gros_michel", 6.0)
+			};
+			let key = Key::from(key);
+			if g.rng.random(&key) < g.run.probabilities / odds {
+				calculate_joker::schedule_self_destruct(&mut g.events, g.areas.jokers[ji].core.id);
+				if j == J::GrosMichel {
+					g.history.gros_michel_extinct = true;
+				}
+			}
+		}
+		J::MrBones if game_over && g.round.chips / g.blind.chips >= 0.25 => {
+			let id = g.areas.jokers[ji].core.id;
+			g.events.push(Event::Joker(JokerEvent::DissolveJoker {
+				id,
+				time_factor: 1.0,
+			}));
+			return Some(Effect {
+				saved: true,
+				..Effect::NONE
+			});
+		}
+		_ => return None,
+	}
+	Some(Effect::EXTRA)
+}
+
+/// The events joker effects queue. An `...Outer` event is one whose body
+/// queues the next event (its `...Inner` one, or the effect itself), as the
+/// game's nested `add_event` calls do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum JokerEvent {
+	ChicotOuter,
+	ChicotDisable,
+	Burglar,
+	RiffRaff {
+		n: u32,
+	},
+	CartomancerOuter,
+	DaggerSlice {
+		dagger: u32,
+		victim: u32,
+	},
+	MarbleStone,
+	CertificateCard,
+	GlassJokerOuter {
+		id: u32,
+		n: u32,
+	},
+	GlassJokerInner {
+		id: u32,
+		n: u32,
+	},
+	PerkeoCopy,
+	/// A joker eating or melting itself: an event that queues the removal.
+	EatenOuter {
+		id: u32,
+	},
+	RemoveJokerLater {
+		id: u32,
+	},
+	/// An event whose body calls `start_dissolve` on a joker.
+	DissolveJoker {
+		id: u32,
+		time_factor: f64,
+	},
+	/// Vampire's juice event, which clears the card's `vampired` mark.
+	Unvampire {
+		id: u32,
+	},
+}
+
+pub(crate) fn run_event(g: &mut Game, e: JokerEvent) {
+	use JokerEvent as E;
+	match e {
+		E::ChicotOuter => {
+			g.events.push(Event::Joker(E::ChicotDisable));
+			g.events.status_extra();
+		}
+		E::ChicotDisable => {
+			blind::disable_blind(g);
+			g.events.delay(0.4);
+		}
+		E::Burglar => {
+			let d = g.round.discards_left;
+			g.events.push(Event::EaseDiscard(-d));
+			g.events.push(Event::EaseHands(3.0));
+			g.events.status_extra();
+		}
+		E::RiffRaff { n } => {
+			for _ in 0..n {
+				pools::create_owned(
+					g,
+					NewCard::joker(RarityRoll::Fixed(0.0), OwnedArea::Jokers, "rif"),
+				);
+				g.events.materialize(1.0);
+				g.areas.joker_buffer = 0.0;
+			}
+		}
+		E::CartomancerOuter => {
+			g.events.push(Event::Create(NewCard::new(
+				CardSet::Tarot,
+				OwnedArea::Consumables,
+				"car",
+			)));
+			g.events.status_extra();
+		}
+		E::DaggerSlice { dagger, victim } => {
+			g.areas.joker_buffer = 0.0;
+			let value = g
+				.areas
+				.jokers
+				.iter()
+				.find(|c| c.core.id == victim)
+				.expect("the sliced joker stays until this event dissolves it")
+				.core
+				.sell_cost;
+			if let Some(d) = g.areas.jokers.iter_mut().find(|c| c.core.id == dagger) {
+				d.ab.mult += value * 2.0;
+			}
+			g.events.start_dissolve_scaled(victim, 1.6);
+		}
+		E::MarbleStone => {
+			let (suit, rank) = pools::random_front(&mut g.rng, &Key::from("marb_fr"));
+			let c = card_lifecycle::make_playing_card(
+				&mut g.areas,
+				g.run.hands_played,
+				g.shop.discount_percent,
+				suit,
+				rank,
+				Enhancement::Stone,
+			);
+			g.events.materialize(1.0);
+			g.areas.play.push(c);
+		}
+		E::CertificateCard => certificate_card(g),
+		E::GlassJokerOuter { id, n } => g.events.push(Event::Joker(E::GlassJokerInner { id, n })),
+		E::GlassJokerInner { id, n } => {
+			if let Some(c) = g.areas.jokers.iter_mut().find(|c| c.core.id == id) {
+				c.ab.x_mult += 0.75 * f64::from(n);
+			}
+		}
+		E::PerkeoCopy => round_end::perkeo_copy(g),
+		E::EatenOuter { id } => g.events.push_event(
+			Event::Joker(E::RemoveJokerLater { id }),
+			Trigger::After(0.3),
+			Blocks::Barrier,
+		),
+		E::RemoveJokerLater { id } => {
+			if let Some(i) = areas::position_of(&g.areas.jokers, id) {
+				let c = g.areas.jokers.remove(i);
+				card_lifecycle::remove_owned(g, c);
+			}
+		}
+		E::DissolveJoker { id, time_factor } => g.events.start_dissolve_scaled(id, time_factor),
+		E::Unvampire { id } => {
+			if let Some(c) = g.areas.playing_cards_mut().find(|c| c.core.id == id) {
+				c.vampired = false;
+			}
+		}
+	}
+}
+
+/// Certificate: a random playing card with a random seal, into the hand.
+fn certificate_card(g: &mut Game) {
+	let (suit, rank) = pools::random_front(&mut g.rng, &Key::from("cert_fr"));
+	let mut c = card_lifecycle::make_playing_card(
+		&mut g.areas,
+		g.run.hands_played,
+		g.shop.discount_percent,
+		suit,
+		rank,
+		Enhancement::Base,
+	);
+	let key = Key::from("certsl");
+	let st = g.rng.random(&key);
+	c.seal = Some(if st > 0.75 {
+		Seal::Red
+	} else if st > 0.5 {
+		Seal::Blue
+	} else if st > 0.25 {
+		Seal::Gold
+	} else {
+		Seal::Purple
+	});
+	Pricing::new(g.shop.discount_percent, &g.areas.jokers).set_cost(&mut c, None);
+	g.events.materialize(1.0);
+	CardDebuff::new(&g.blind, &g.areas.jokers).apply(&mut c);
+	g.areas.hand.cards.push(c);
+	g.areas.hand.sort();
 }

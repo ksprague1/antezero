@@ -7,34 +7,48 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::actions::{Operands, ParseError};
-use crate::card::Kind;
+use crate::card::{Card, CardLike, Kind};
+use crate::card_lifecycle::Pricing;
 use crate::data::{
-	ACE, ALL_JOKERS, ALL_PLANETS, ALL_SPECTRALS, ALL_TAROTS, ALL_VOUCHERS, Edition, Enhancement,
-	Joker, Rank, Seal, Suit, Voucher,
+	ALL_JOKERS, ALL_PLANETS, ALL_SPECTRALS, ALL_TAROTS, ALL_VOUCHERS, Edition, Enhancement, Joker,
+	Planet, Rank, Seal, Spectral, Suit, Tarot, Voucher,
 };
-use crate::game::{Area, Game};
-use crate::{cards, events, shop};
+use crate::event_queue::EditionTiming;
+use crate::game::{Area, Areas, Game};
+use crate::pools::OwnedArea;
+use crate::shop::VoucherSource;
+use crate::{card_lifecycle, event_queue, shop};
 
 /// A scenario injection applied identically to both engines.
-#[derive(Clone, Copy, Debug)]
+///
+/// Its text code, used in histories (written by `Display`, read back by
+/// `FromStr`), gives every enum as its discriminant, an edition as
+/// [`Edition::id`] and a seal as 1 + its discriminant (0 for none):
+/// `inject_joker <joker> <edition> <eternal: 0 or 1>`,
+/// `inject_cons <set: 0 tarot, 1 planet, 2 spectral> <card> <edition>`,
+/// `inject_card <suit> <rank id> <enhancement> <edition> <seal>`,
+/// `inject_dollars <amount>` and `inject_voucher <voucher>`; any eternal
+/// byte but 0 reads as eternal. For example, `inject_cons 1 0 0` injects
+/// Mercury with no edition.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Inject {
 	/// `add_joker(key, edition, silent, eternal)` for a joker.
 	Joker {
 		joker: Joker,
-		edition: Edition,
+		edition: Option<Edition>,
 		eternal: bool,
 	},
 	/// `add_joker(key, edition)` for a tarot, planet or spectral card.
 	Consumable {
-		kind: Kind,
-		edition: Edition,
+		card: Consumable,
+		edition: Option<Edition>,
 	},
 	/// `create_playing_card({front, center}, G.deck)` + edition and seal.
 	Card {
 		suit: Suit,
 		rank: Rank,
 		enhancement: Enhancement,
-		edition: Edition,
+		edition: Option<Edition>,
 		seal: Option<Seal>,
 	},
 	Dollars(f64),
@@ -42,44 +56,76 @@ pub enum Inject {
 	Voucher(Voucher),
 }
 
+/// The card of an [`Inject::Consumable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Consumable {
+	Tarot(Tarot),
+	Planet(Planet),
+	Spectral(Spectral),
+}
+
+impl Consumable {
+	/// The text code's set and card numbers.
+	fn code(self) -> (u8, u8) {
+		match self {
+			Consumable::Tarot(tarot) => (0, tarot as u8),
+			Consumable::Planet(planet) => (1, planet as u8),
+			Consumable::Spectral(spectral) => (2, spectral as u8),
+		}
+	}
+
+	/// The card a text code's set and card numbers name, if any.
+	fn from_code(set: u8, card: u8) -> Option<Consumable> {
+		let card = usize::from(card);
+		match set {
+			0 => ALL_TAROTS.get(card).copied().map(Consumable::Tarot),
+			1 => ALL_PLANETS.get(card).copied().map(Consumable::Planet),
+			2 => ALL_SPECTRALS.get(card).copied().map(Consumable::Spectral),
+			_ => None,
+		}
+	}
+}
+
+impl From<Consumable> for Kind {
+	fn from(card: Consumable) -> Kind {
+		match card {
+			Consumable::Tarot(tarot) => Kind::Tarot(tarot),
+			Consumable::Planet(planet) => Kind::Planet(planet),
+			Consumable::Spectral(spectral) => Kind::Spectral(spectral),
+		}
+	}
+}
+
+impl Inject {
+	/// The joker `joker` with no edition, not eternal.
+	#[must_use]
+	pub fn joker(joker: Joker) -> Inject {
+		Inject::Joker {
+			joker,
+			edition: None,
+			eternal: false,
+		}
+	}
+}
+
 /// See [`Game::inject`].
-///
-/// # Panics
-///
-/// Panics if a [`Inject::Consumable`] is not a tarot, planet or spectral card.
-pub(crate) fn inject(g: &mut Game, i: &Inject) {
-	events::begin_action(g);
-	match *i {
+pub(crate) fn inject(g: &mut Game, i: Inject) {
+	event_queue::begin_action(&mut g.rng, &mut g.events);
+	match i {
 		Inject::Joker {
 			joker,
 			edition,
 			eternal,
 		} => {
-			let mut c = cards::make_card(g, Kind::Joker(joker));
-			g.events.materialize(1.0);
-			cards::add_to_deck(g, &mut c, false);
-			if edition != Edition::None {
-				cards::set_edition(g, &mut c, edition, Some(Area::Jokers));
-				g.events.edition_fx(edition, false);
-			}
+			let mut c = make_owned_card(g, Kind::Joker(joker), edition, OwnedArea::Jokers);
 			if eternal {
-				c.set_eternal(true);
+				c.make_eternal();
 			}
-			g.jokers.push(c);
+			g.areas.jokers.push(c);
 		}
-		Inject::Consumable { kind, edition } => {
-			assert!(
-				kind.is_consumable(),
-				"Inject::Consumable needs a consumable, got {kind:?}"
-			);
-			let mut c = cards::make_card(g, kind);
-			g.events.materialize(1.0);
-			cards::add_to_deck(g, &mut c, false);
-			if edition != Edition::None {
-				cards::set_edition(g, &mut c, edition, Some(Area::Consumables));
-				g.events.edition_fx(edition, false);
-			}
-			g.consumables.push(c);
+		Inject::Consumable { card, edition } => {
+			let c = make_owned_card(g, card.into(), edition, OwnedArea::Consumables);
+			g.areas.consumables.push(c);
 		}
 		Inject::Card {
 			suit,
@@ -88,32 +134,72 @@ pub(crate) fn inject(g: &mut Game, i: &Inject) {
 			edition,
 			seal,
 		} => {
-			let mut c = cards::make_playing_card(g, suit, rank, enhancement);
-			c.face_down = true;
-			if edition != Edition::None {
-				cards::set_edition(g, &mut c, edition, Some(Area::Deck));
-			}
+			let mut c = card_lifecycle::make_playing_card(
+				&mut g.areas,
+				g.run.hands_played,
+				g.shop.discount_percent,
+				suit,
+				rank,
+				enhancement,
+			);
+			c.core.face_down = true;
+			give_edition(
+				&mut c,
+				edition,
+				Area::Deck,
+				&mut g.areas,
+				g.shop.discount_percent,
+			);
 			if seal.is_some() {
 				c.seal = seal;
-				cards::set_cost(g, &mut c, Some(Area::Deck));
+				Pricing::new(g.shop.discount_percent, &g.areas.jokers)
+					.set_cost(&mut c, Some(Area::Deck));
 			}
-			g.deck.insert(0, c);
+			g.areas.deck.insert(0, c);
 		}
 		Inject::Dollars(amount) => {
-			g.dollars += amount;
+			g.run.dollars += amount;
 			// Money moves without an event: nothing to run.
 			return;
 		}
 		Inject::Voucher(voucher) => {
-			g.set_voucher_used(voucher);
-			shop::apply_voucher(g, voucher, true);
+			g.history.used_vouchers.insert(voucher);
+			shop::apply_voucher(&mut g.round, &mut g.events, voucher, VoucherSource::Deck);
 		}
 	}
-	events::run_queue(g);
+	event_queue::run_queue(g);
+}
+
+/// An injected joker or consumable: made, materialized and added to the
+/// deck, with its edition, on its way into `area`.
+fn make_owned_card(g: &mut Game, kind: Kind, edition: Option<Edition>, area: OwnedArea) -> Card {
+	let mut c = card_lifecycle::make_card(g, kind);
+	g.events.materialize(1.0);
+	card_lifecycle::add_to_deck(g, &mut c);
+	give_edition(
+		&mut c,
+		edition,
+		area.into(),
+		&mut g.areas,
+		g.shop.discount_percent,
+	);
+	g.events.edition_fx(edition, EditionTiming::Delayed);
+	c
+}
+
+/// `set_edition` for an injected card in `area`; one without an edition is
+/// left as it was made.
+fn give_edition(
+	c: &mut impl CardLike, edition: Option<Edition>, area: Area, areas: &mut Areas,
+	discount_percent: f64,
+) {
+	if edition.is_some() {
+		let pricing = Pricing::new(discount_percent, &areas.jokers);
+		card_lifecycle::set_edition(c, edition, Some(area), pricing, &mut areas.limits);
+	}
 }
 
 impl fmt::Display for Inject {
-	/// The text code used in histories (enum discriminants as numbers).
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match *self {
 			Inject::Joker {
@@ -125,18 +211,13 @@ impl fmt::Display for Inject {
 					f,
 					"inject_joker {} {} {}",
 					joker as u8,
-					edition as u8,
+					Edition::id(edition),
 					u8::from(eternal)
 				)
 			}
-			Inject::Consumable { kind, edition } => {
-				let (set, index) = match kind {
-					Kind::Tarot(tarot) => (0, tarot as u8),
-					Kind::Planet(planet) => (1, planet as u8),
-					Kind::Spectral(spectral) => (2, spectral as u8),
-					_ => return Err(fmt::Error),
-				};
-				write!(f, "inject_cons {set} {index} {}", edition as u8)
+			Inject::Consumable { card, edition } => {
+				let (set, index) = card.code();
+				write!(f, "inject_cons {set} {index} {}", Edition::id(edition))
 			}
 			Inject::Card {
 				suit,
@@ -147,10 +228,11 @@ impl fmt::Display for Inject {
 			} => {
 				write!(
 					f,
-					"inject_card {} {rank} {} {} {}",
+					"inject_card {} {} {} {} {}",
 					suit as u8,
+					rank.id(),
 					enhancement as u8,
-					edition as u8,
+					Edition::id(edition),
 					seal.map_or(0, |seal| seal as u8 + 1)
 				)
 			}
@@ -167,12 +249,16 @@ impl FromStr for Inject {
 		fn pick<T: Copy>(table: &[T], i: usize, n: &Operands) -> Result<T, ParseError> {
 			table.get(i).copied().ok_or_else(|| n.err())
 		}
+		/// An edition's number (see [`Edition::id`]).
+		fn edition(n: &mut Operands) -> Result<Option<Edition>, ParseError> {
+			Edition::from_id(n.next()?).ok_or_else(|| n.err())
+		}
 
 		let (op, mut n) = Operands::new(s);
 		let inject = match op.ok_or_else(|| n.err())? {
 			"inject_joker" => {
 				let joker = pick(&ALL_JOKERS, n.next()?, &n)?;
-				let edition = pick(&Edition::ALL, n.next()?, &n)?;
+				let edition = edition(&mut n)?;
 				Inject::Joker {
 					joker,
 					edition,
@@ -180,25 +266,18 @@ impl FromStr for Inject {
 				}
 			}
 			"inject_cons" => {
-				let kind = match n.next::<u8>()? {
-					0 => Kind::Tarot(pick(&ALL_TAROTS, n.next()?, &n)?),
-					1 => Kind::Planet(pick(&ALL_PLANETS, n.next()?, &n)?),
-					2 => Kind::Spectral(pick(&ALL_SPECTRALS, n.next()?, &n)?),
-					_ => return Err(n.err()),
-				};
+				let set = n.next()?;
+				let card = Consumable::from_code(set, n.next()?).ok_or_else(|| n.err())?;
 				Inject::Consumable {
-					kind,
-					edition: pick(&Edition::ALL, n.next()?, &n)?,
+					card,
+					edition: edition(&mut n)?,
 				}
 			}
 			"inject_card" => {
 				let suit = pick(&Suit::ALL, n.next()?, &n)?;
-				let rank: Rank = n.next()?;
-				if !(2..=ACE).contains(&rank) {
-					return Err(n.err());
-				}
+				let rank = Rank::from_id(n.next()?).ok_or_else(|| n.err())?;
 				let enhancement = pick(&Enhancement::ALL, n.next()?, &n)?;
-				let edition = pick(&Edition::ALL, n.next()?, &n)?;
+				let edition = edition(&mut n)?;
 				let seal = match n.next::<usize>()? {
 					0 => None,
 					index => Some(pick(&Seal::ALL, index - 1, &n)?),

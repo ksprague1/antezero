@@ -1,43 +1,112 @@
-//! Game state (`G.GAME` + card areas), the small queries every module
-//! shares and the public entry points. The game's logic lives in the modules
-//! that port it (see the crate docs): each is a set of functions over a
-//! [`Game`].
+//! Game state: the card areas and the parts of `G.GAME`, each its own type.
+//! The game's logic lives in the modules that port it.
 
-/// Appends a timeline entry (`trace-keys` builds; see [`crate::rng::Trace`]).
-macro_rules! trace {
-    ($g:expr, $($t:tt)*) => {
-        #[cfg(feature = "trace-keys")]
-        $g.rng.trace.record(format_args!($($t)*));
-    };
-}
-pub(crate) use trace;
+use std::ops::{Index, IndexMut};
+use std::slice;
 
-use crate::actions::{self, Action, ActionError, CardMask};
-use crate::card::{Card, Kind};
-use crate::data::{
-	Back, BlindKind, Booster, CenterSet, HandType, Joker, PackKind, Rank, Suit, TagKind, Voucher,
-};
-use crate::events::{EventQueue, St};
-use crate::hand_eval::EvalFlags;
+use crate::actions::{self, Action, ActionError};
+pub use crate::areas::{Area, Areas, Hand, HandSort, Limit, Limits};
+pub use crate::blind::BlindScaling;
+use crate::card_mask::CardMask;
+use crate::data::{ALL_BLINDS, Back, BlindKind, HandType, TagKind};
+use crate::enum_sets::HandSet;
+use crate::event_queue::EventQueue;
 use crate::inject::{self, Inject};
-use crate::rng::{Key, PseudoRandom};
-use crate::{run, scoring, search};
+pub use crate::packs::{OpenPack, PackState};
+use crate::rng::PseudoRandom;
+pub use crate::round::{IdolCard, MailRank, Round};
+pub use crate::run::{History, Modifiers, Run, Setup, Stake, StartingParams};
+pub use crate::shop::{BOOSTER_SLOTS, PackSlot, Shop};
+pub use crate::tags::{OrbitalChoices, Tags};
+use crate::{hidden, run, scoring};
 
 /// Decision points exposed to the agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Phase {
-	/// Choosing (or skipping) the next blind.
 	BlindSelect,
-	/// Selecting cards to play/discard.
 	Round,
-	/// Between rounds.
 	Shop,
-	/// A booster pack is open (see [`Game::pack`]).
 	Pack,
-	/// Round won; waiting for "Cash Out".
 	RoundEval,
-	/// Run lost.
 	GameOver,
+}
+
+impl Phase {
+	/// Every phase, in the order above.
+	pub const ALL: [Phase; 6] = [
+		Phase::BlindSelect,
+		Phase::Round,
+		Phase::Shop,
+		Phase::Pack,
+		Phase::RoundEval,
+		Phase::GameOver,
+	];
+
+	/// The phase's name, as the Python bindings show it.
+	#[must_use]
+	pub fn name(self) -> &'static str {
+		match self {
+			Phase::BlindSelect => "blind_select",
+			Phase::Round => "round",
+			Phase::Shop => "shop",
+			Phase::Pack => "pack",
+			Phase::RoundEval => "round_eval",
+			Phase::GameOver => "game_over",
+		}
+	}
+}
+
+/// `G.STATE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum State {
+	SelectingHand,
+	HandPlayed,
+	DrawToHand,
+	GameOver,
+	Shop,
+	PlayTarot,
+	BlindSelect,
+	RoundEval,
+	TarotPack,
+	PlanetPack,
+	SpectralPack,
+	StandardPack,
+	BuffoonPack,
+	NewRound,
+}
+
+impl State {
+	#[must_use]
+	pub fn is_pack(self) -> bool {
+		matches!(
+			self,
+			State::TarotPack
+				| State::PlanetPack
+				| State::SpectralPack
+				| State::StandardPack
+				| State::BuffoonPack
+		)
+	}
+
+	#[must_use]
+	pub fn name(self) -> &'static str {
+		match self {
+			State::SelectingHand => "SELECTING_HAND",
+			State::HandPlayed => "HAND_PLAYED",
+			State::DrawToHand => "DRAW_TO_HAND",
+			State::GameOver => "GAME_OVER",
+			State::Shop => "SHOP",
+			State::PlayTarot => "PLAY_TAROT",
+			State::BlindSelect => "BLIND_SELECT",
+			State::RoundEval => "ROUND_EVAL",
+			State::TarotPack => "TAROT_PACK",
+			State::PlanetPack => "PLANET_PACK",
+			State::SpectralPack => "SPECTRAL_PACK",
+			State::StandardPack => "STANDARD_PACK",
+			State::BuffoonPack => "BUFFOON_PACK",
+			State::NewRound => "NEW_ROUND",
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,7 +139,8 @@ pub enum BlindSlot {
 }
 
 impl BlindSlot {
-	/// The slot `kind` occupies in an ante (every boss is `Boss`).
+	pub const ALL: [BlindSlot; 3] = [BlindSlot::Small, BlindSlot::Big, BlindSlot::Boss];
+
 	#[must_use]
 	pub fn of(kind: BlindKind) -> BlindSlot {
 		match kind {
@@ -87,6 +157,145 @@ impl BlindSlot {
 			BlindSlot::Big => "Big",
 			BlindSlot::Boss => "Boss",
 		}
+	}
+}
+
+/// One value for each blind of an ante.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PerBlind<T>(pub(crate) [T; BlindSlot::ALL.len()]);
+
+impl<T: Copy> PerBlind<T> {
+	/// `value` for every blind.
+	#[must_use]
+	pub fn all(value: T) -> PerBlind<T> {
+		PerBlind([value; BlindSlot::ALL.len()])
+	}
+}
+
+impl<T> PerBlind<T> {
+	/// The values, from the small blind to the boss.
+	pub fn iter(&self) -> slice::Iter<'_, T> {
+		self.0.iter()
+	}
+}
+
+impl<'table, T> IntoIterator for &'table PerBlind<T> {
+	type IntoIter = slice::Iter<'table, T>;
+	type Item = &'table T;
+
+	fn into_iter(self) -> slice::Iter<'table, T> {
+		self.iter()
+	}
+}
+
+impl<T> Index<BlindSlot> for PerBlind<T> {
+	type Output = T;
+
+	#[inline]
+	fn index(&self, slot: BlindSlot) -> &T {
+		&self.0[slot as usize]
+	}
+}
+
+impl<T> IndexMut<BlindSlot> for PerBlind<T> {
+	#[inline]
+	fn index_mut(&mut self, slot: BlindSlot) -> &mut T {
+		&mut self.0[slot as usize]
+	}
+}
+
+/// The tags for skipping the ante's small and big blind
+/// (`G.GAME.round_resets.blind_tags`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkipTags {
+	pub small: Option<TagKind>,
+	pub big: Option<TagKind>,
+}
+
+impl SkipTags {
+	/// The tag for skipping the blind at `slot`: the boss has none.
+	#[must_use]
+	pub fn of(self, slot: BlindSlot) -> Option<TagKind> {
+		match slot {
+			BlindSlot::Small => self.small,
+			BlindSlot::Big => self.big,
+			BlindSlot::Boss => None,
+		}
+	}
+}
+
+/// `G.GAME.hands`: every poker hand's level and play counts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandLevels(pub(crate) [HandLevel; HandType::ALL.len()]);
+
+impl HandLevels {
+	/// The levels, in [`HandType::ALL`] order.
+	pub fn iter(&self) -> slice::Iter<'_, HandLevel> {
+		self.0.iter()
+	}
+
+	pub fn iter_mut(&mut self) -> slice::IterMut<'_, HandLevel> {
+		self.0.iter_mut()
+	}
+
+	/// `pseudorandom_element` over the visible hands other than `exclude`,
+	/// which the game lists in `pairs(G.GAME.hands)` order.
+	pub(crate) fn random_visible(
+		&self, rng: &mut PseudoRandom, key: &str, exclude: Option<HandType>,
+	) -> HandType {
+		let mut visible = [HandType::HighCard; HandType::ALL.len()];
+		let mut n = 0;
+		for h in HandType::PAIRS_ORDER {
+			if self[h].visible && Some(h) != exclude {
+				visible[n] = h;
+				n += 1;
+			}
+		}
+		visible[rng.element_str(key, n)]
+	}
+
+	/// `level_up_hand(card, hand, instant, amount)`: raises `hand` by `amount`
+	/// levels with no planet used and no events.
+	pub fn level_up(&mut self, hand: HandType, amount: f64) {
+		let base = hand.base();
+		let level = &mut self[hand];
+		level.level = (level.level + amount).max(0.0);
+		level.mult = (base.mult + base.level_mult * (level.level - 1.0)).max(1.0);
+		level.chips = (base.chips + base.level_chips * (level.level - 1.0)).max(0.0);
+	}
+}
+
+impl<'table> IntoIterator for &'table HandLevels {
+	type IntoIter = slice::Iter<'table, HandLevel>;
+	type Item = &'table HandLevel;
+
+	fn into_iter(self) -> slice::Iter<'table, HandLevel> {
+		self.iter()
+	}
+}
+
+impl<'table> IntoIterator for &'table mut HandLevels {
+	type IntoIter = slice::IterMut<'table, HandLevel>;
+	type Item = &'table mut HandLevel;
+
+	fn into_iter(self) -> slice::IterMut<'table, HandLevel> {
+		self.iter_mut()
+	}
+}
+
+impl Index<HandType> for HandLevels {
+	type Output = HandLevel;
+
+	#[inline]
+	fn index(&self, hand: HandType) -> &HandLevel {
+		&self.0[hand as usize]
+	}
+}
+
+impl IndexMut<HandType> for HandLevels {
+	#[inline]
+	fn index_mut(&mut self, hand: HandType) -> &mut HandLevel {
+		&mut self.0[hand as usize]
 	}
 }
 
@@ -110,10 +319,6 @@ pub struct Tag {
 
 /// The active blind (`G.GAME.blind`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[expect(
-	clippy::struct_excessive_bools,
-	reason = "independent flags, one per field of the game's `Blind`"
-)]
 pub struct Blind {
 	pub kind: Option<BlindKind>,
 	pub chips: f64,
@@ -122,18 +327,17 @@ pub struct Blind {
 	pub disabled: bool,
 	pub triggered: bool,
 	pub prepped: bool,
-	pub boss: bool,
 	/// The Eye: hands already played this round.
-	pub eye_hands: u16,
+	pub eye_hands: HandSet,
 	/// The Mouth: the only allowed hand.
 	pub only_hand: Option<HandType>,
 	pub discards_sub: f64,
 	pub hands_sub: f64,
 }
 
-impl Blind {
-	#[must_use]
-	pub fn empty() -> Blind {
+impl Default for Blind {
+	/// No blind (`G.GAME.blind` before one is set).
+	fn default() -> Blind {
 		Blind {
 			kind: None,
 			chips: 0.0,
@@ -142,26 +346,22 @@ impl Blind {
 			disabled: false,
 			triggered: false,
 			prepped: true,
-			boss: false,
-			eye_hands: 0,
+			eye_hands: HandSet::default(),
 			only_hand: None,
 			discards_sub: 0.0,
 			hands_sub: 0.0,
 		}
 	}
+}
 
+impl Blind {
+	/// Whether the blind is a boss (`G.GAME.blind.boss`).
 	#[inline]
 	#[must_use]
-	pub fn is(&self, k: BlindKind) -> bool {
-		self.kind == Some(k)
+	pub fn is_boss(&self) -> bool {
+		self.kind.is_some_and(BlindKind::is_boss)
 	}
 
-	/// `Blind:get_type()`.
-	pub fn slot(&self) -> Option<BlindSlot> {
-		self.kind.map(BlindSlot::of)
-	}
-
-	/// The blind is a boss whose effect is active.
 	#[inline]
 	#[must_use]
 	pub fn active(&self, k: BlindKind) -> bool {
@@ -169,142 +369,14 @@ impl Blind {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
-#[expect(
-	clippy::struct_excessive_bools,
-	reason = "independent flags, one per `G.GAME.modifiers` field"
-)]
-pub struct Modifiers {
-	pub no_blind_reward: [bool; 3],
-	pub scaling: u8,
-	pub enable_eternals_in_shop: bool,
-	pub enable_perishables_in_shop: bool,
-	pub enable_rentals_in_shop: bool,
-	pub no_interest: bool,
-	pub money_per_hand: Option<f64>,
-	pub money_per_discard: Option<f64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StartingParams {
-	pub dollars: f64,
-	pub hand_size: f64,
-	pub discards: f64,
-	pub hands: f64,
-	pub reroll_cost: f64,
-	pub joker_slots: f64,
-	pub ante_scaling: f64,
-	pub consumable_slots: f64,
-	pub no_faces: bool,
-	pub erratic_suits_and_ranks: bool,
-}
-
-impl Default for StartingParams {
-	fn default() -> Self {
-		StartingParams {
-			dollars: 4.0,
-			hand_size: 8.0,
-			discards: 3.0,
-			hands: 4.0,
-			reroll_cost: 5.0,
-			joker_slots: 5.0,
-			ante_scaling: 1.0,
-			consumable_slots: 2.0,
-			no_faces: false,
-			erratic_suits_and_ranks: false,
-		}
-	}
-}
-
-/// One of the shop's two booster slots this round (`G.GAME.current_round.used_packs`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PackSlot {
-	/// No pack has been rolled for the slot yet.
-	Unrolled,
-	/// The slot offers this pack.
-	Offered(Booster),
-	/// The slot's pack was opened.
-	Opened,
-}
-
-/// The Idol's card (`G.GAME.current_round.idol_card`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IdolCard {
-	pub rank: Rank,
-	pub suit: Suit,
-	/// The card's id, which keeps its last valid value like the game's.
-	pub id: Option<Rank>,
-}
-
-/// Mail-In Rebate's rank (`G.GAME.current_round.mail_card`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MailRank {
-	pub rank: Rank,
-	/// The rank's id, which keeps its last valid value like the game's.
-	pub id: Option<Rank>,
-}
-
-/// The Orbital Tag hands rolled for an ante's three blinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OrbitalChoices {
-	pub ante: i32,
-	/// By [`BlindSlot`].
-	pub hands: [Option<HandType>; 3],
-}
-
-/// An open booster pack (the state to return to is `pack_interrupt`, the
-/// remaining picks are `Game::pack_choices`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PackState {
-	pub kind: PackKind,
-}
-
-/// A card area with its `config.card_limit` (+ `real_card_limit` bookkeeping).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Limit {
-	pub limit: f64,
-	pub real: f64,
-}
-
-impl Limit {
-	#[must_use]
-	pub fn new(l: f64) -> Limit {
-		Limit { limit: l, real: l }
-	}
-
-	/// `CardArea:change_size(delta)` (the deferred part).
-	#[inline]
-	pub fn change(&mut self, delta: f64) {
-		self.real += delta;
-		self.limit = self.real.max(0.0);
-	}
-}
-
-/// Which `Card:open`/area a newly created card goes into (affects polls).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Area {
-	Jokers,
-	Consumables,
-	Hand,
-	Deck,
-	Play,
-	Discard,
-	ShopJokers,
-	ShopVouchers,
-	ShopBoosters,
-	PackCards,
-}
-
-/// Card sets that `create_card` can sample.
+/// The sets of the cards other than playing cards that `create_card` can
+/// sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardSet {
 	Joker,
 	Tarot,
 	Planet,
 	Spectral,
-	TarotPlanet,
-	Base,
-	Enhanced,
 }
 
 impl CardSet {
@@ -314,197 +386,144 @@ impl CardSet {
 			CardSet::Tarot => "Tarot",
 			CardSet::Planet => "Planet",
 			CardSet::Spectral => "Spectral",
-			CardSet::TarotPlanet => "Tarot_Planet",
-			CardSet::Base => "Base",
-			CardSet::Enhanced => "Enhanced",
 		}
 	}
 }
 
-#[derive(Clone, Debug)]
-#[expect(
-	clippy::struct_excessive_bools,
-	reason = "independent flags, one per `G.GAME` field"
-)]
-pub struct Game {
-	pub rng: PseudoRandom,
-	pub back: Back,
-	pub stake: u8,
-	pub modifiers: Modifiers,
-	pub starting_params: StartingParams,
+/// How often each blind has been the boss (`G.GAME.bosses_used`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BossesUsed([u32; ALL_BLINDS.len()]);
+
+impl Index<BlindKind> for BossesUsed {
+	type Output = u32;
+
+	#[inline]
+	fn index(&self, blind: BlindKind) -> &u32 {
+		&self.0[blind as usize]
+	}
+}
+
+impl IndexMut<BlindKind> for BossesUsed {
+	#[inline]
+	fn index_mut(&mut self, blind: BlindKind) -> &mut u32 {
+		&mut self.0[blind as usize]
+	}
+}
+
+/// The ante's blinds (`G.GAME.round_resets`' blind fields).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlindSelect {
+	pub states: PerBlind<BlindStatus>,
+	/// The ante's boss.
+	pub boss: BlindKind,
+	pub skip_tags: SkipTags,
+	pub boss_rerolled: bool,
+	pub selected: Option<BlindKind>,
+	pub on_deck: Option<BlindSlot>,
+	pub bosses_used: BossesUsed,
+}
+
+impl Default for BlindSelect {
+	fn default() -> BlindSelect {
+		BlindSelect {
+			states: PerBlind([
+				BlindStatus::Select,
+				BlindStatus::Upcoming,
+				BlindStatus::Upcoming,
+			]),
+			boss: BlindKind::Small,
+			skip_tags: SkipTags::default(),
+			boss_rerolled: false,
+			selected: None,
+			on_deck: None,
+			bosses_used: BossesUsed::default(),
+		}
+	}
+}
+
+impl BlindSelect {
+	/// The ante's blind in `slot`.
+	#[must_use]
+	pub fn kind(&self, slot: BlindSlot) -> BlindKind {
+		match slot {
+			BlindSlot::Small => BlindKind::Small,
+			BlindSlot::Big => BlindKind::Big,
+			BlindSlot::Boss => self.boss,
+		}
+	}
+
+	/// The blind the "select" button refers to.
+	#[must_use]
+	pub fn on_deck_kind(&self) -> Option<BlindKind> {
+		self.on_deck.map(|slot| self.kind(slot))
+	}
+}
+
+/// Where the run is: the decision point, `G.STATE`, and flags that last for
+/// one action.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flow {
 	pub phase: Phase,
-	pub won: bool,
-	/// Keep playing after winning ("Endless mode"); otherwise the run is
-	/// terminal once the winning round is evaluated.
-	pub endless: bool,
-	/// Blinds defeated or skipped so far (progress measure for agents).
-	pub blinds_cleared: u32,
-	/// `G.GAME.win_notified`: the run was won (`won` is also set when the
-	/// final boss is lost, like the game's `G.GAME.won`).
-	pub(crate) win_notified: bool,
-	/// The win overlay paused the game for the rest of the current frame.
-	pub(crate) pause_rest: bool,
+	pub state: State,
+	/// `G.STATE_COMPLETE`.
+	pub state_complete: bool,
 	/// Set by `evaluate_play` (used by `preview_play` to stop early).
 	pub(crate) scored: bool,
 	/// The hand-name text was cleared since the cards were selected (The
 	/// Hook's discard), so scoring re-announces the hand.
 	pub(crate) hand_text_cleared: bool,
-
-	// Counters.
-	pub next_sort_id: u32,
-
-	// Areas.
-	pub deck: Vec<Card>,
-	pub hand: Vec<Card>,
-	pub play: Vec<Card>,
-	pub discard: Vec<Card>,
-	pub jokers: Vec<Card>,
-	pub consumables: Vec<Card>,
-	pub shop_jokers: Vec<Card>,
-	pub shop_vouchers: Vec<Card>,
-	pub shop_boosters: Vec<Card>,
-	pub pack_cards: Vec<Card>,
-	pub joker_limit: Limit,
-	pub consumable_limit: Limit,
-	pub hand_limit: Limit,
-	/// `G.hand.config.sort` ('desc' by rank or 'suit desc').
-	pub hand_sort_by_suit: bool,
-	pub pack: Option<PackState>,
-
-	// G.GAME
-	pub ante: i32,
-	pub blind_ante: i32,
-	pub win_ante: i32,
-	pub round: i32,
-	pub dollars: f64,
-	pub chips: f64,
-	pub hands_left: f64,
-	pub discards_left: f64,
-	pub hands_played_round: f64,
-	pub discards_used: f64,
-	pub hands_played: f64,
-	pub unused_discards: f64,
-	pub skips: f64,
-	pub reroll_cost: f64,
-	pub reroll_cost_increase: f64,
-	pub free_rerolls: f64,
-	pub used_packs: [PackSlot; 2],
-	pub current_voucher: Option<Voucher>,
-	/// The ante's voucher has been shown in a shop (observation only).
-	pub voucher_seen: bool,
+	pub(crate) end_round_pending: bool,
 	/// Free reorders (hand moves / sorts, joker moves) since the last other
-	/// action (observation only): [`crate::obs::ops`] stops offering them at
-	/// a cap, else a policy can stall a game forever.
+	/// action (observation only): [`crate::obs`] stops offering them at a
+	/// cap, else a policy can stall a game forever.
 	pub rearranges: u8,
-	/// Whether [`crate::obs::ops`] offers skipping blinds (observation only:
-	/// a training switch; the game itself always allows skips).
-	pub allow_skip: bool,
-	/// Round ×Mult like Steamodded, which the real game runs under the bridge
-	/// (see `Game::x_mult`); off, like vanilla and the oracle.
-	pub steamodded: bool,
-	pub idol_card: IdolCard,
-	pub mail_rank: MailRank,
-	pub ancient_suit: Option<Suit>,
-	pub castle_suit: Suit,
-	pub most_played_hand: HandType,
-	pub round_dollars: f64,
+}
 
-	pub rr_hands: f64,
-	pub rr_discards: f64,
-	pub rr_reroll_cost: f64,
-	pub temp_reroll_cost: Option<f64>,
-	pub temp_handsize: Option<f64>,
-	pub blind_states: [BlindStatus; 3],
-	pub boss_choice: BlindKind,
-	pub blind_tags: [Option<TagKind>; 2],
-	pub boss_rerolled: bool,
-	pub selected_blind: Option<BlindKind>,
-	pub blind_on_deck: Option<BlindSlot>,
-	pub round_bonus_next_hands: f64,
-	pub round_bonus_discards: f64,
+impl Default for Flow {
+	fn default() -> Flow {
+		Flow {
+			phase: Phase::BlindSelect,
+			state: State::BlindSelect,
+			state_complete: false,
+			scored: false,
+			hand_text_cleared: false,
+			end_round_pending: false,
+			rearranges: 0,
+		}
+	}
+}
 
-	pub hands: [HandLevel; 12],
-	pub probabilities: f64,
-	pub bosses_used: [u32; 30],
-	pub used_jokers: CenterSet,
-	pub used_vouchers: u32,
-	pub banned: CenterSet,
-	pub banned_tags: u32,
-	pub banned_blinds: u32,
-	pub gros_michel_extinct: bool,
-	pub planets_used: u16,
-	pub consumable_usage_tarot: f64,
-	pub consumable_usage_planet: f64,
-	pub consumable_usage_spectral: f64,
-	pub last_tarot_planet: Option<Kind>,
-	pub last_hand_played: Option<HandType>,
-	pub tags: Vec<Tag>,
-	pub next_tag_id: u32,
-	pub shop_joker_max: f64,
-	pub edition_rate: f64,
-	pub joker_rate: f64,
-	pub tarot_rate: f64,
-	pub planet_rate: f64,
-	pub spectral_rate: f64,
-	pub playing_card_rate: f64,
-	pub consumeable_buffer: f64,
-	pub joker_buffer: f64,
-	pub dollar_buffer: f64,
-	pub discount_percent: f64,
-	pub interest_cap: f64,
-	pub interest_amount: f64,
-	pub bankrupt_at: f64,
-	pub perishable_rounds: f64,
-	pub rental_rate: f64,
-	pub ecto_minus: f64,
-	pub pack_size: u8,
-	pub pack_choices: u8,
-	pub first_shop_buffoon: bool,
-	pub orbital_choices: Vec<OrbitalChoices>,
-	pub shop_free: bool,
-	pub shop_d6ed: bool,
-	pub starting_deck_size: f64,
-	pub last_blind_boss: bool,
-	pub facing_blind: bool,
-	pub blind: Blind,
-
-	/// `G.STATE` / `G.STATE_COMPLETE`.
-	pub state: St,
-	pub state_complete: bool,
+/// A run.
+#[derive(Debug)]
+pub struct Game {
+	pub rng: PseudoRandom,
 	/// `G.E_MANAGER`'s queue and the timers it runs on.
 	pub(crate) events: EventQueue,
-	/// Cards outside any area (used consumables, opened boosters) until
-	/// their dissolve animation removes them.
-	pub(crate) consumed: Vec<Card>,
-	pub(crate) in_flight: Option<Card>,
-	pub(crate) pending_highlight: Vec<usize>,
-	pub(crate) pack_interrupt: Option<St>,
-	pub(crate) end_round_pending: bool,
-	pub(crate) burnt_hand: Option<HandType>,
-	/// `G.shop` exists.
-	pub shop_open: bool,
-	pub(crate) shop_exists_at_open: bool,
-	pub(crate) ankh_deletable: Vec<u32>,
-	/// Ids of the cards that scored in the last evaluated hand.
-	pub last_scoring: Vec<u32>,
-	/// Score of the last evaluated hand.
-	pub last_hand_score: f64,
+	pub setup: Setup,
+	pub flow: Flow,
+	pub areas: Areas,
+	pub run: Run,
+	pub history: History,
+	pub round: Round,
+	pub blind_select: BlindSelect,
+	/// The active blind (`G.GAME.blind`).
+	pub blind: Blind,
+	pub shop: Shop,
+	pub pack: PackState,
+	/// `G.GAME.hands`.
+	pub hands: HandLevels,
+	pub tags: Tags,
 }
 
 impl Game {
-	// -----------------------------------------------------------------
-	// Entry points
-	// -----------------------------------------------------------------
-
 	/// Starts a new seeded run (fully unlocked profile, no challenge):
-	/// `seed` of at most [`MAX_SEED_LEN`](crate::MAX_SEED_LEN) bytes, `stake`
-	/// 1..=8.
+	/// `seed` of at most [`MAX_SEED_LEN`](crate::MAX_SEED_LEN) bytes.
 	///
 	/// # Panics
 	///
-	/// Panics if `seed` is longer than that or `stake` is not in `1..=8`.
+	/// Panics if `seed` is longer than that.
 	#[must_use]
-	pub fn new_run(seed: &str, back: Back, stake: u8) -> Game {
+	pub fn new_run(seed: &str, back: Back, stake: Stake) -> Game {
 		run::new_run(seed, back, stake)
 	}
 
@@ -513,8 +532,8 @@ impl Game {
 	/// # Errors
 	///
 	/// Returns why `a` is not legal now.
-	pub fn check(&self, a: &Action) -> Result<(), ActionError> {
-		actions::check(self, *a)
+	pub fn check(&self, a: Action) -> Result<(), ActionError> {
+		actions::check(self, a)
 	}
 
 	/// Applies an action and runs the game until the next decision point.
@@ -539,8 +558,8 @@ impl Game {
 	/// further actions stay possible; stopping is the caller's decision.
 	#[must_use]
 	pub fn is_terminal(&self) -> bool {
-		self.phase == Phase::GameOver
-			|| (self.run_won() && self.state == St::RoundEval && !self.endless)
+		self.flow.phase == Phase::GameOver
+			|| (self.run_won() && self.flow.state == State::RoundEval && !self.setup.endless)
 			|| self.is_stuck()
 	}
 
@@ -550,9 +569,9 @@ impl Game {
 	/// The run cannot continue, so it counts as lost.
 	#[must_use]
 	pub fn is_stuck(&self) -> bool {
-		self.phase == Phase::Pack
-			&& self.hand.is_empty()
-			&& self.check(&Action::SkipPack).is_err()
+		self.flow.phase == Phase::Pack
+			&& self.areas.hand.cards.is_empty()
+			&& self.check(Action::SkipPack).is_err()
 			&& {
 				let mut v = Vec::new();
 				self.legal_actions(&mut v);
@@ -561,11 +580,7 @@ impl Game {
 	}
 
 	/// Applies a scenario injection (see [`crate::inject`]).
-	///
-	/// # Panics
-	///
-	/// Panics if an [`Inject::Consumable`] is not a tarot, planet or spectral card.
-	pub fn inject(&mut self, i: &Inject) {
+	pub fn inject(&mut self, i: Inject) {
 		inject::inject(self, i);
 	}
 
@@ -573,7 +588,7 @@ impl Game {
 	/// frame (Steel / Stone tallies, Stencil, Swashbuckler, Temperance, ...).
 	/// Observers call it before reading a state.
 	pub fn update_derived(&mut self) {
-		scoring::update_derived(self);
+		scoring::update_derived(&mut self.areas, self.run.skips);
 	}
 
 	/// Replaces everything a player cannot know with a fresh sample, keeping
@@ -586,7 +601,14 @@ impl Game {
 	/// only, not on the hidden arrangement it replaces.
 	/// For determinized search and for restarting from snapshots.
 	pub fn resample_hidden(&mut self, seed: &str) {
-		search::resample_hidden(self, seed);
+		hidden::resample(
+			&mut self.areas,
+			&self.run,
+			&self.history,
+			&mut self.shop,
+			&mut self.rng,
+			seed,
+		);
 	}
 
 	/// Score `Play(mask)` would make, computed on `self`, which is left
@@ -600,202 +622,127 @@ impl Game {
 	///
 	/// Panics if the event queue stalls before the hand is scored (a simulator bug).
 	pub fn preview_play(&mut self, mask: CardMask) -> Result<f64, ActionError> {
-		search::preview_play(self, mask)
+		actions::preview_play(self, mask)
 	}
 
-	/// The blind the "select" button refers to.
-	#[must_use]
-	pub fn blind_on_deck_kind(&self) -> Option<BlindKind> {
-		self.blind_on_deck.map(|s| match s {
-			BlindSlot::Small => BlindKind::Small,
-			BlindSlot::Big => BlindKind::Big,
-			BlindSlot::Boss => self.boss_choice,
-		})
+	/// Like [`Game::preview_play`], but the hand's own effects are applied
+	/// to `self` as well (money, created and destroyed cards, the played
+	/// cards discarded), before anything is drawn or the round ends.
+	///
+	/// # Errors
+	///
+	/// Returns why the play is not legal now.
+	///
+	/// # Panics
+	///
+	/// Panics if the event queue stalls before the hand is played out (a simulator bug).
+	pub fn preview_hand(&mut self, mask: CardMask) -> Result<f64, ActionError> {
+		actions::preview_hand(self, mask)
 	}
 
-	/// Jokers that change how poker hands are evaluated.
-	#[must_use]
-	pub fn eval_flags(&self) -> EvalFlags {
-		EvalFlags {
-			four_fingers: self.has_joker(Joker::FourFingers),
-			shortcut: self.has_joker(Joker::Shortcut),
-			smeared: self.smeared(),
-		}
+	/// Makes this game a copy of `source` that draws from a copy of `rng`,
+	/// in the buffers it has: what a search makes for each candidate in place
+	/// of a fresh clone.
+	pub(crate) fn copy_from(&mut self, source: &Game, rng: &PseudoRandom) {
+		let Game {
+			rng: own_rng,
+			events,
+			setup,
+			flow,
+			areas,
+			run,
+			history,
+			round,
+			blind_select,
+			blind,
+			shop,
+			pack,
+			hands,
+			tags,
+		} = self;
+		own_rng.clone_from(rng);
+		events.clone_from(&source.events);
+		areas.clone_from(&source.areas);
+		tags.clone_from(&source.tags);
+		*setup = source.setup;
+		*run = source.run;
+		*flow = source.flow;
+		*history = source.history;
+		*round = source.round;
+		*blind_select = source.blind_select;
+		*blind = source.blind;
+		*shop = source.shop;
+		*pack = source.pack;
+		*hands = source.hands;
 	}
 
 	/// Turns timeline recording on or off (a no-op without `trace-keys`).
 	pub fn set_tracing(&mut self, on: bool) {
-		#[cfg(feature = "trace-keys")]
-		{
-			self.rng.trace.enabled = on;
-			if !on {
-				self.rng.trace.entries = Vec::new();
-			}
-		}
-		#[cfg(not(feature = "trace-keys"))]
-		let _ = on;
+		self.rng.trace.set_enabled(on);
 	}
 
-	/// Enables the completed-event log (`trace-keys` builds).
+	/// Starts logging the completed events of each action (see
+	/// [`Game::event_log`]).
 	#[cfg(feature = "trace-keys")]
-	pub fn enable_evlog(&mut self) {
-		self.rng.trace.evlog = Some(Vec::new());
+	pub fn enable_event_log(&mut self) {
+		self.rng.trace.enable_event_log();
 	}
 
 	/// Completed events of the current action (`trace-keys` builds).
 	#[cfg(feature = "trace-keys")]
 	#[must_use]
-	pub fn evlog(&self) -> &[String] {
-		self.rng.trace.evlog.as_deref().unwrap_or(&[])
+	pub fn event_log(&self) -> &[String] {
+		self.rng.trace.event_log()
 	}
 
 	/// The current action's timeline (empty without `trace-keys`).
 	#[must_use]
 	pub fn timeline(&self) -> &[String] {
-		#[cfg(feature = "trace-keys")]
-		{
-			&self.rng.trace.entries
-		}
-		#[cfg(not(feature = "trace-keys"))]
-		{
-			&[]
-		}
+		self.rng.trace.entries()
 	}
-
-	// -----------------------------------------------------------------
-	// Small helpers
-	// -----------------------------------------------------------------
 
 	/// Whether the run was won (the final boss was beaten). Unlike `won`,
 	/// false when the run ended on the final boss.
 	#[must_use]
 	pub fn run_won(&self) -> bool {
-		self.win_notified
+		self.run.win_notified
 	}
+}
 
-	/// `base .. ante`.
-	#[inline]
-	pub(crate) fn key_ante(&self, base: &str) -> Key {
-		let mut k = Key::from(base);
-		k.push_int(i64::from(self.ante));
-		k
-	}
-
-	#[inline]
-	pub(crate) fn new_card(&mut self, kind: Kind) -> Card {
-		self.next_sort_id += 1;
-		Card::new(self.next_sort_id, kind)
-	}
-
-	/// A non-debuffed `j` in the joker area (`next(find_joker(name))`).
-	#[inline]
-	#[must_use]
-	pub fn has_joker(&self, j: Joker) -> bool {
-		self.jokers
-			.iter()
-			.any(|c| c.kind == Kind::Joker(j) && !c.debuff)
-	}
-
-	#[inline]
-	#[must_use]
-	pub fn count_joker(&self, j: Joker) -> usize {
-		self.jokers
-			.iter()
-			.filter(|c| c.kind == Kind::Joker(j) && !c.debuff)
-			.count()
-	}
-
-	#[inline]
-	pub(crate) fn pareidolia(&self) -> bool {
-		self.has_joker(Joker::Pareidolia)
-	}
-
-	#[inline]
-	pub(crate) fn smeared(&self) -> bool {
-		self.has_joker(Joker::Smeared)
-	}
-
-	#[inline]
-	#[must_use]
-	pub fn voucher_used(&self, v: Voucher) -> bool {
-		self.used_vouchers >> (v as u32) & 1 == 1
-	}
-
-	#[inline]
-	pub(crate) fn set_voucher_used(&mut self, v: Voucher) {
-		self.used_vouchers |= 1 << (v as u32);
-	}
-
-	pub(crate) fn area(&self, a: Area) -> &Vec<Card> {
-		match a {
-			Area::Jokers => &self.jokers,
-			Area::Consumables => &self.consumables,
-			Area::Hand => &self.hand,
-			Area::Deck => &self.deck,
-			Area::Play => &self.play,
-			Area::Discard => &self.discard,
-			Area::ShopJokers => &self.shop_jokers,
-			Area::ShopVouchers => &self.shop_vouchers,
-			Area::ShopBoosters => &self.shop_boosters,
-			Area::PackCards => &self.pack_cards,
+// Written out, like the `Clone` of the parts with buffers, so that
+// `clone_from` reuses the buffers: a search refreshes one copy per candidate.
+impl Clone for Game {
+	fn clone(&self) -> Game {
+		Game {
+			rng: self.rng.clone(),
+			events: self.events.clone(),
+			areas: self.areas.clone(),
+			tags: self.tags.clone(),
+			..*self
 		}
 	}
 
-	pub(crate) fn area_mut(&mut self, a: Area) -> &mut Vec<Card> {
-		match a {
-			Area::Jokers => &mut self.jokers,
-			Area::Consumables => &mut self.consumables,
-			Area::Hand => &mut self.hand,
-			Area::Deck => &mut self.deck,
-			Area::Play => &mut self.play,
-			Area::Discard => &mut self.discard,
-			Area::ShopJokers => &mut self.shop_jokers,
-			Area::ShopVouchers => &mut self.shop_vouchers,
-			Area::ShopBoosters => &mut self.shop_boosters,
-			Area::PackCards => &mut self.pack_cards,
+	fn clone_from(&mut self, source: &Game) {
+		self.copy_from(source, &source.rng);
+	}
+}
+
+/// A game to try actions on: each try gets a copy of the real game, built in
+/// the buffers of the copy before it.
+#[derive(Debug, Default)]
+pub struct Scratch(Option<Game>);
+
+impl Scratch {
+	/// A copy of `source` that draws from a copy of `rng`, made in the
+	/// buffers of the previous copy.
+	pub fn copy(&mut self, source: &Game, rng: &PseudoRandom) -> &mut Game {
+		if let Some(ref mut copy) = self.0 {
+			copy.copy_from(source, rng);
+			copy
+		} else {
+			let mut first = source.clone();
+			first.rng.clone_from(rng);
+			self.0.insert(first)
 		}
-	}
-
-	/// Visible hands in `pairs(G.GAME.hands)` order.
-	pub(crate) fn visible_hands_pairs(&self, exclude: Option<HandType>) -> ([HandType; 12], usize) {
-		let mut out = [HandType::HighCard; 12];
-		let mut n = 0;
-		for h in HandType::PAIRS_ORDER {
-			if self.hands[h as usize].visible && Some(h) != exclude {
-				out[n] = h;
-				n += 1;
-			}
-		}
-		(out, n)
-	}
-
-	/// All playing cards (`G.playing_cards`) in their areas.
-	pub(crate) fn playing_cards(&self) -> impl Iterator<Item = &Card> {
-		self.deck
-			.iter()
-			.chain(self.hand.iter())
-			.chain(self.play.iter())
-			.chain(self.discard.iter())
-	}
-
-	pub(crate) fn playing_cards_mut(&mut self) -> impl Iterator<Item = &mut Card> {
-		self.deck
-			.iter_mut()
-			.chain(self.hand.iter_mut())
-			.chain(self.play.iter_mut())
-			.chain(self.discard.iter_mut())
-	}
-
-	#[must_use]
-	pub fn playing_card_count(&self) -> usize {
-		self.deck.len() + self.hand.len() + self.play.len() + self.discard.len()
-	}
-
-	/// The `(rank, suit)` of the valid (non-stone) playing cards in `sort_id`
-	/// order, for the `reset_*_card` samplers.
-	pub(crate) fn non_stone_sorted(&self) -> Vec<(Rank, Suit)> {
-		let mut cards: Vec<&Card> = self.playing_cards().filter(|c| !c.is_stone()).collect();
-		cards.sort_unstable_by_key(|c| c.id);
-		cards.into_iter().map(|c| (c.rank, c.suit)).collect()
 	}
 }

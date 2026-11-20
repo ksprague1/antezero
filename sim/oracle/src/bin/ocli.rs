@@ -3,16 +3,18 @@
 //! stdout and errors to stderr.
 //!
 //! With no arguments it reads one expression per line from stdin and answers
-//! each with exactly one stdout line (the result, or `ERROR: <message>` with
-//! newlines flattened), so other programs can drive it over a pipe.
+//! each with its result or with `ERROR: <message>` (newlines flattened), so
+//! other programs can drive it over a pipe: one line per answer as long as
+//! the results are one line (the harness' JSON dumps are).
 //!
 //! Exits with status 1 if any expression failed.
 
 use std::io::BufRead;
 use std::process::ExitCode;
+use std::{env, io};
 
 fn main() -> ExitCode {
-	let o = match oracle::Oracle::new() {
+	let mut o = match oracle::Oracle::new() {
 		Ok(o) => o,
 		Err(e) => {
 			eprintln!("oracle init failed: {e}");
@@ -20,12 +22,12 @@ fn main() -> ExitCode {
 		}
 	};
 	let mut failed = false;
-	let args: Vec<String> = std::env::args().skip(1).collect();
+	let args: Vec<String> = env::args().skip(1).collect();
 	if args.is_empty() {
-		for line in std::io::stdin().lock().lines() {
+		for line in io::stdin().lock().lines() {
 			match line {
 				Ok(l) if l.trim().is_empty() => {}
-				Ok(l) => match o.call("oracle", &l) {
+				Ok(l) => match o.command(&l) {
 					Ok(s) => println!("{s}"),
 					Err(e) => {
 						println!("ERROR: {}", e.replace(['\r', '\n'], " | "));
@@ -40,7 +42,7 @@ fn main() -> ExitCode {
 		}
 	} else {
 		for a in &args {
-			match o.call("oracle", a) {
+			match o.command(a) {
 				Ok(s) => println!("{s}"),
 				Err(e) => {
 					eprintln!("ERROR: {e}");

@@ -1,5 +1,3 @@
--- Headless Balatro harness.
---
 -- Loads the unmodified game scripts from HARNESS_SRC with the LÖVE engine
 -- replaced by inert stubs, then exposes a small API (table H) to start runs,
 -- perform player actions through the game's own button callbacks, advance
@@ -8,9 +6,6 @@
 
 local SRC = HARNESS_SRC
 
-----------------------------------------------------------------------------
--- JSON encoding (deterministic: object keys sorted)
-----------------------------------------------------------------------------
 local json = {}
 local function esc(s)
   return (s:gsub('[%c"\\]', function(c)
@@ -51,9 +46,6 @@ end
 function json.encode(v) local out = {} enc(v, out) return table.concat(out) end
 JSON = json
 
-----------------------------------------------------------------------------
--- LÖVE stubs
-----------------------------------------------------------------------------
 local function noop() end
 local function Obj(methods)
   return setmetatable(methods or {}, {__index = function() return noop end})
@@ -137,9 +129,6 @@ love = {
   arg = Obj{ parseGameArguments = function(a) return a end },
 }
 
-----------------------------------------------------------------------------
--- Boot the game
-----------------------------------------------------------------------------
 _RELEASE_MODE = true
 _DEMO = false
 dofile(SRC..'/main.lua')
@@ -161,7 +150,6 @@ G.SETTINGS.tutorial_progress = nil
 G.SETTINGS.GAMESPEED = 1
 G.F_NO_SAVING = true
 
--- Fully unlocked & discovered profile.
 local function unlock_all()
   for _, t in ipairs({G.P_CENTERS, G.P_BLINDS, G.P_TAGS, G.P_SEALS}) do
     for k, v in pairs(t) do
@@ -172,9 +160,6 @@ local function unlock_all()
 end
 unlock_all()
 
-----------------------------------------------------------------------------
--- Frame driving
-----------------------------------------------------------------------------
 H = {}
 H.dt = 1/60
 H.frame = 0
@@ -338,9 +323,6 @@ function H.settle(max_frames)
   error('settle: game did not stabilise (state '..tostring(G.STATE)..', blocking '..blocking_pending()..')')
 end
 
-----------------------------------------------------------------------------
--- Runs and actions
-----------------------------------------------------------------------------
 -- `unique_val` derives from the global UI node counter (UI-activity
 -- dependent, not reproducible); model it as monotone in creation order,
 -- exactly like the simulator does.
@@ -457,9 +439,6 @@ function H.inject(t)
   return H.state()
 end
 
-----------------------------------------------------------------------------
--- State dump
-----------------------------------------------------------------------------
 local state_names = {}
 for k, v in pairs(G.STATES) do state_names[v] = k end
 

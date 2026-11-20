@@ -1,62 +1,55 @@
 //! What the observation shows and hides, and the ops it offers.
 
-use sim::Action;
-use sim::data::{Back, BlindKind, Edition, HandType, Joker};
-use sim::game::{Game, Phase};
-use sim::inject::Inject;
-use sim::obs::{self, ObsMut};
+use std::mem;
 
-use crate::{Buf, tok, walk};
+use sim::data::{Back, BlindKind, HandType, Joker};
+use sim::game::{BlindSlot, Game, HandSort, Phase};
+use sim::inject::Inject;
+use sim::obs::{self, ObsBuf};
+use sim::{Action, AnyCard, Card, CardMask, Kind, Stake, canon, num};
+
+use crate::{assert_same, encode_with_deck, first_shop, observe, tok, walk};
 
 #[test]
 fn deck_order_is_not_observable() {
-	let mut g = Game::new_run("ORDER", Back::Red, 1);
+	let mut g = Game::new_run("ORDER", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
-	let mut a = Buf::new();
-	a.encode(&g);
-	g.deck.reverse();
-	let mut b = Buf::new();
-	b.encode(&g);
-	assert_eq!(a.ti, b.ti);
-	assert_eq!(a.tf, b.tf);
-	assert_eq!(a.gf, b.gf);
+	let a = observe(&g);
+	g.areas.deck.reverse();
+	assert_same(&a, &observe(&g), "reversed deck");
 }
 
 #[test]
 fn every_op_has_a_legal_completion() {
 	let mut ops = Vec::new();
-	let mut buf = Buf::new();
+	let mut buf = ObsBuf::new();
 	let mut n = 0;
 	for s in 0..40 {
 		walk(&format!("OP{s}"), 300, |g| {
-			let lay = buf.encode(g);
-			obs::ops(g, &lay, 4, &mut ops);
-			assert!(!ops.is_empty(), "no ops in {:?}", g.phase);
+			let lay = encode_with_deck(g, &mut buf);
+			obs::ops(
+				g,
+				&lay,
+				obs::OpOptions {
+					candidates: 4,
+					..Default::default()
+				},
+				&mut ops,
+			);
+			assert!(!ops.is_empty(), "no ops in {:?}", g.flow.phase);
 			for o in &ops {
-				// minimal card set: required + lowest allowed cards
-				let mut m = o.required;
-				let mut i = 0;
-				while m.count_ones() < u32::from(o.card_min) && i < 32 {
-					if o.allowed >> i & 1 == 1 {
-						m |= 1 << i;
+				let m = o.minimal_cards();
+				let dest = o.dest.map(|slots| match o.kind {
+					obs::OpKind::MoveHand => {
+						let from = m.lowest().expect("a hand move takes a card");
+						num::byte((from + 1) % usize::from(slots))
 					}
-					i += 1;
-				}
-				let dest = if o.dest > 0 {
-					if o.index == 0 && o.kind != obs::op::MOVE_HAND {
-						1
-					} else if o.kind == obs::op::MOVE_HAND {
-						(m.trailing_zeros() + 1) % u32::from(o.dest)
-					} else {
-						0
-					}
-				} else {
-					0
-				};
+					_ => u8::from(o.index == 0),
+				});
 				assert!(
 					obs::decode(g, o, m, dest).is_some(),
 					"op {o:?} has no legal completion in {:?}",
-					g.phase
+					g.flow.phase
 				);
 				n += 1;
 			}
@@ -70,53 +63,87 @@ fn reorders_are_capped_until_another_action() {
 	let reorder = |o: &obs::Op| {
 		matches!(
 			o.kind,
-			obs::op::SORT_RANK | obs::op::SORT_SUIT | obs::op::MOVE_HAND | obs::op::MOVE_JOKER
+			obs::OpKind::SortRank
+				| obs::OpKind::SortSuit
+				| obs::OpKind::MoveHand
+				| obs::OpKind::MoveJoker
 		)
 	};
-	let (mut buf, mut ops) = (Buf::new(), Vec::new());
+	let (mut buf, mut ops) = (ObsBuf::new(), Vec::new());
 	let mut offered = |g: &Game| {
-		let lay = buf.encode(g);
-		obs::ops(g, &lay, 4, &mut ops);
+		let lay = encode_with_deck(g, &mut buf);
+		obs::ops(
+			g,
+			&lay,
+			obs::OpOptions {
+				candidates: 4,
+				..Default::default()
+			},
+			&mut ops,
+		);
 		ops.iter().any(reorder)
 	};
-	let mut g = Game::new_run("STALL", Back::Red, 1);
+	let mut g = Game::new_run("STALL", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
-	assert_eq!(g.phase, Phase::Round);
-	for _ in 0..obs::MAX_REARRANGES {
-		assert!(offered(&g));
-		g.step(Action::SortHand { by_suit: false }).unwrap();
+	assert_eq!(g.flow.phase, Phase::Round);
+	for i in 0..obs::MAX_REARRANGES {
+		assert!(
+			offered(&g),
+			"reorders not offered after {i} of the {} allowed",
+			obs::MAX_REARRANGES
+		);
+		g.step(Action::SortHand(HandSort::Rank)).unwrap();
 	}
 	assert!(!offered(&g), "reorders still offered after the cap");
-	g.step(Action::Discard(1)).unwrap();
+	g.step(Action::Discard(CardMask::from_bits(1))).unwrap();
 	assert!(offered(&g), "another action must offer reorders again");
 }
 
 #[test]
 fn skipping_can_be_switched_off() {
-	let (mut buf, mut ops) = (Buf::new(), Vec::new());
-	let mut g = Game::new_run("NOSKIP", Back::Red, 1);
-	let lay = buf.encode(&g);
-	obs::ops(&g, &lay, 4, &mut ops);
-	assert!(ops.iter().any(|o| o.kind == obs::op::SKIP_BLIND));
-	g.allow_skip = false;
-	obs::ops(&g, &lay, 4, &mut ops);
-	assert!(!ops.iter().any(|o| o.kind == obs::op::SKIP_BLIND));
-	assert!(ops.iter().any(|o| o.kind == obs::op::SELECT_BLIND));
+	let (mut buf, mut ops) = (ObsBuf::new(), Vec::new());
+	let g = Game::new_run("NOSKIP", Back::Red, Stake::White);
+	let lay = encode_with_deck(&g, &mut buf);
+	obs::ops(
+		&g,
+		&lay,
+		obs::OpOptions {
+			candidates: 4,
+			..Default::default()
+		},
+		&mut ops,
+	);
+	assert!(ops.iter().any(|o| o.kind == obs::OpKind::SkipBlind));
+	obs::ops(
+		&g,
+		&lay,
+		obs::OpOptions {
+			candidates: 4,
+			allow_skip: false,
+		},
+		&mut ops,
+	);
+	assert!(!ops.iter().any(|o| o.kind == obs::OpKind::SkipBlind));
+	assert!(ops.iter().any(|o| o.kind == obs::OpKind::SelectBlind));
 }
 
 #[test]
 fn face_down_cards_are_hidden() {
-	let mut g = Game::new_run("HIDE", Back::Red, 1);
+	let mut g = Game::new_run("HIDE", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
-	for c in &mut g.hand {
-		c.face_down = true;
+	for c in &mut g.areas.hand.cards {
+		c.core.face_down = true;
 	}
-	let mut b = Buf::new();
-	let lay = b.encode(&g);
+	let mut b = ObsBuf::new();
+	let lay = encode_with_deck(&g, &mut b);
 	for i in 0..lay.hand {
-		let t = &b.ti[i * obs::TOK_INT..(i + 1) * obs::TOK_INT];
-		assert_eq!(t[1], obs::center::HIDDEN);
-		assert_eq!(&t[2..7], &[0, 0, 0, 0, 0]);
+		let t = tok(&b, i);
+		assert_eq!(t.center, obs::center::HIDDEN);
+		assert_eq!(
+			(t.suit, t.rank, t.enhancement, t.edition, t.seal),
+			(0, 0, 0, 0, 0),
+			"a face-down card shows its face"
+		);
 	}
 	assert!(
 		!obs::top_plays(&g, 8).is_empty(),
@@ -126,60 +153,72 @@ fn face_down_cards_are_hidden() {
 
 #[test]
 fn face_down_identity_is_not_observable() {
-	let mut g = Game::new_run("HIDE2", Back::Red, 1);
+	let mut g = Game::new_run("HIDE2", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
-	g.hand[0].face_down = true;
-	let mut a = Buf::new();
-	a.encode(&g);
+	g.areas.hand.cards[0].core.face_down = true;
+	let a = observe(&g);
 	// Swap the face-down card with an unseen deck card: same observation.
-	let k = g.deck.len() / 2;
-	std::mem::swap(&mut g.hand[0], &mut g.deck[k]);
-	g.hand[0].face_down = true;
-	g.deck[k].face_down = false;
-	let mut b = Buf::new();
-	b.encode(&g);
-	a.assert_same(&b, "swapped face-down card");
+	let k = g.areas.deck.len() / 2;
+	mem::swap(&mut g.areas.hand.cards[0], &mut g.areas.deck[k]);
+	g.areas.hand.cards[0].core.face_down = true;
+	g.areas.deck[k].core.face_down = false;
+	assert_same(&a, &observe(&g), "swapped face-down card");
 }
 
 #[test]
-#[expect(
-	clippy::many_single_char_names,
-	reason = "short names for the games and buffers being compared"
-)]
 fn resample_hidden_keeps_the_observation() {
-	let mut n = 0;
+	let mut checked = 0;
 	for s in 0..40 {
-		let mut states = Vec::new();
-		walk(&format!("RS{s}"), 200, |g| states.push(g.clone()));
-		// Every other state, alternately with face-down hand cards.
-		for (k, g) in states.into_iter().step_by(2).enumerate() {
-			let mut g = g;
+		let states = every_other_state(&format!("RS{s}"), 200);
+		for (k, mut g) in states.into_iter().enumerate() {
 			if k % 2 == 0 {
-				for c in g.hand.iter_mut().step_by(3) {
-					c.face_down = true;
+				for card in g.areas.hand.cards.iter_mut().step_by(3) {
+					card.core.face_down = true;
 				}
 			}
-			let mut a = Buf::new();
-			a.encode(&g);
-			let mut c = g.clone();
-			c.resample_hidden(&format!("X{k}"));
-			let mut b = Buf::new();
-			let lay = b.encode(&c);
-			a.assert_same(&b, &format!("resample in {:?}", g.phase));
-			let (mut oa, mut ob) = (Vec::new(), Vec::new());
-			obs::ops(&g, &lay, 4, &mut oa);
-			obs::ops(&c, &lay, 4, &mut ob);
-			assert_eq!(oa, ob, "ops differ after resample in {:?}", g.phase);
+			let before = observe(&g);
+			let mut resampled = g.clone();
+			resampled.resample_hidden(&format!("X{k}"));
+			let mut after = ObsBuf::new();
+			let lay = encode_with_deck(&resampled, &mut after);
+			assert_same(&before, &after, &format!("resample in {:?}", g.flow.phase));
+			let (mut ops_before, mut ops_after) = (Vec::new(), Vec::new());
+			obs::ops(
+				&g,
+				&lay,
+				obs::OpOptions {
+					candidates: 4,
+					..Default::default()
+				},
+				&mut ops_before,
+			);
+			obs::ops(
+				&resampled,
+				&lay,
+				obs::OpOptions {
+					candidates: 4,
+					..Default::default()
+				},
+				&mut ops_after,
+			);
+			obs::order_gain(&g, &mut ops_before);
+			obs::order_gain(&resampled, &mut ops_after);
+			assert_eq!(
+				ops_before, ops_after,
+				"ops differ after resample in {:?}",
+				g.flow.phase
+			);
 			// The resampled game is still playable.
 			let mut acts = Vec::new();
-			c.legal_actions(&mut acts);
-			if let Some(&a0) = acts.first() {
-				c.step(a0).unwrap();
-			}
-			n += 1;
+			resampled.legal_actions(&mut acts);
+			let first = *acts
+				.first()
+				.expect("a resampled state that is not over has a legal action");
+			resampled.step(first).unwrap();
+			checked += 1;
 		}
 	}
-	assert!(n > 100, "only {n} states checked");
+	assert!(checked > 100, "only {checked} states checked");
 }
 
 #[test]
@@ -189,49 +228,54 @@ fn resample_hidden_ignores_the_hidden_arrangement() {
 	// face-down jokers (all hidden) must give the identical world.
 	let (mut n, mut swaps, mut jokers) = (0, 0, 0);
 	for s in 0..60 {
-		let mut states = Vec::new();
-		walk(&format!("RI{s}"), 300, |g| states.push(g.clone()));
-		for (k, mut g) in states.into_iter().step_by(2).enumerate() {
+		let states = every_other_state(&format!("RI{s}"), 300);
+		for (k, mut g) in states.into_iter().enumerate() {
 			if k % 2 == 0 {
-				for c in g.hand.iter_mut().step_by(3) {
-					c.face_down = true;
+				for c in g.areas.hand.cards.iter_mut().step_by(3) {
+					c.core.face_down = true;
 				}
 				for j in [Joker::Joker, Joker::Cavendish, Joker::Misprint] {
-					g.inject(&Inject::Joker {
-						joker: j,
-						edition: Edition::None,
-						eternal: false,
-					});
+					g.inject(Inject::joker(j));
 				}
-				for c in &mut g.jokers {
-					c.face_down = true;
+				for c in &mut g.areas.jokers {
+					c.core.face_down = true;
 				}
 			}
 			let mut h = g.clone();
-			h.deck.reverse();
-			if k % 2 == 0 && h.jokers.len() > 1 {
-				h.jokers.reverse();
+			h.areas.deck.reverse();
+			if k % 2 == 0 && h.areas.jokers.len() > 1 {
+				h.areas.jokers.reverse();
 				jokers += 1;
 			}
-			if let Some(i) = h.hand.iter().position(|c| c.face_down)
-				&& !h.deck.is_empty()
+			if let Some(i) = h.areas.hand.cards.iter().position(|c| c.core.face_down)
+				&& !h.areas.deck.is_empty()
 			{
-				let j = h.deck.len() / 2;
-				std::mem::swap(&mut h.hand[i], &mut h.deck[j]);
-				(h.hand[i].face_down, h.hand[i].ab.wheel_flipped) =
-					(g.hand[i].face_down, g.hand[i].ab.wheel_flipped);
-				(h.deck[j].face_down, h.deck[j].ab.wheel_flipped) =
-					(g.deck[j].face_down, g.deck[j].ab.wheel_flipped);
+				let j = h.areas.deck.len() / 2;
+				mem::swap(&mut h.areas.hand.cards[i], &mut h.areas.deck[j]);
+				(
+					h.areas.hand.cards[i].core.face_down,
+					h.areas.hand.cards[i].wheel_flipped,
+				) = (
+					g.areas.hand.cards[i].core.face_down,
+					g.areas.hand.cards[i].wheel_flipped,
+				);
+				(
+					h.areas.deck[j].core.face_down,
+					h.areas.deck[j].wheel_flipped,
+				) = (
+					g.areas.deck[j].core.face_down,
+					g.areas.deck[j].wheel_flipped,
+				);
 				swaps += 1;
 			}
-			let (mut a, mut b) = (g.clone(), h);
+			let phase = g.flow.phase;
+			let (mut a, mut b) = (g, h);
 			a.resample_hidden(&format!("W{k}"));
 			b.resample_hidden(&format!("W{k}"));
 			assert_eq!(
-				sim::canon::from_sim(&mut a),
-				sim::canon::from_sim(&mut b),
-				"world depends on the hidden arrangement ({s}/{k}, {:?})",
-				g.phase
+				canon::from_sim(&mut a),
+				canon::from_sim(&mut b),
+				"world depends on the hidden arrangement ({s}/{k}, {phase:?})"
 			);
 			n += 1;
 		}
@@ -244,33 +288,25 @@ fn resample_hidden_ignores_the_hidden_arrangement() {
 
 #[test]
 fn deck_token_ties_do_not_leak_order() {
-	let mut g = Game::new_run("TIES", Back::Red, 1);
+	let mut g = Game::new_run("TIES", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
 	// Two cards that agree on every categorical feature but not on a bonus.
-	let last = g.deck.len() - 1;
-	let (suit, rank) = (g.deck[0].suit, g.deck[0].rank);
-	g.deck[last].suit = suit;
-	g.deck[last].rank = rank;
-	g.deck[last].ab.perma_bonus = 10.0;
+	let last = g.areas.deck.len() - 1;
+	let (suit, rank) = (g.areas.deck[0].suit, g.areas.deck[0].rank);
+	g.areas.deck[last].suit = suit;
+	g.areas.deck[last].rank = rank;
+	g.areas.deck[last].perma_bonus = 10.0;
 	for deck_tokens in [false, true] {
 		let enc = |g: &Game| {
-			let mut b = Buf::new();
-			obs::encode_opts(
-				g,
-				&mut ObsMut {
-					tok_i: &mut b.ti,
-					tok_f: &mut b.tf,
-					glob_i: &mut b.gi,
-					glob_f: &mut b.gf,
-				},
-				deck_tokens,
-			);
+			let mut b = ObsBuf::new();
+			obs::encode_opts(g, &mut b.as_mut(), deck_tokens);
 			b
 		};
 		let a = enc(&g);
 		let mut r = g.clone();
-		r.deck.reverse();
-		a.assert_same(
+		r.areas.deck.reverse();
+		assert_same(
+			&a,
 			&enc(&r),
 			&format!("reversed deck (deck_tokens={deck_tokens})"),
 		);
@@ -279,37 +315,74 @@ fn deck_token_ties_do_not_leak_order() {
 
 #[test]
 fn blind_tokens_show_the_hand_they_name() {
-	let mut g = Game::new_run("NAMED", Back::Red, 1);
-	g.boss_choice = BlindKind::Ox;
-	g.most_played_hand = HandType::Flush;
-	let mut b = Buf::new();
-	b.encode(&g);
+	let mut g = Game::new_run("NAMED", Back::Red, Stake::White);
+	g.blind_select.boss = BlindKind::Ox;
+	g.round.most_played_hand = HandType::Flush;
+	let mut b = observe(&g);
 	let boss = (0..obs::MAX_TOKENS)
-		.find(|&i| tok(&b, i)[0] == obs::zone::BLIND && tok(&b, i)[7] == 2)
+		.find(|&i| {
+			let t = tok(&b, i);
+			t.zone == obs::Zone::Blind.id() && t.slot == BlindSlot::Boss as i32
+		})
 		.unwrap();
-	assert_eq!(tok(&b, boss)[3], HandType::Flush as i32 + 1);
+	// The rank column of a blind names its hand.
+	assert_eq!(tok(&b, boss).rank, obs::hand_id(Some(HandType::Flush)));
 	// The Mouth, once a hand has fixed it.
-	g.boss_choice = BlindKind::Mouth;
+	g.blind_select.boss = BlindKind::Mouth;
 	g.blind.kind = Some(BlindKind::Mouth);
 	g.blind.only_hand = Some(HandType::Pair);
-	b.encode(&g);
-	assert_eq!(tok(&b, boss)[3], HandType::Pair as i32 + 1);
+	encode_with_deck(&g, &mut b);
+	assert_eq!(tok(&b, boss).rank, obs::hand_id(Some(HandType::Pair)));
+}
+
+#[test]
+fn joker_targets_show_before_the_joker_is_owned() {
+	for joker in [Joker::Idol, Joker::Mail, Joker::Ancient, Joker::Castle] {
+		let mut g = first_shop("TARGET", 0);
+		g.inject(Inject::joker(joker));
+		let offered = AnyCard::Card(Card::new(999, Kind::Joker(joker)));
+		g.areas.shop_jokers = vec![offered.clone()];
+		g.areas.pack_cards = vec![offered];
+		let b = observe(&g);
+		let shown = |zone: obs::Zone| {
+			let i = (0..obs::MAX_TOKENS)
+				.rfind(|&i| tok(&b, i).zone == zone.id())
+				.unwrap();
+			[tok(&b, i).suit, tok(&b, i).rank]
+		};
+		let owned = shown(obs::Zone::Joker);
+		assert_ne!(owned, [0, 0], "{joker:?}");
+		assert_eq!(shown(obs::Zone::ShopCard), owned, "{joker:?} in the shop");
+		assert_eq!(shown(obs::Zone::Pack), owned, "{joker:?} in a pack");
+	}
 }
 
 #[test]
 fn hand_can_be_reordered_in_packs() {
-	let mut buf = Buf::new();
+	let mut buf = ObsBuf::new();
 	let mut ops = Vec::new();
 	let mut packs = 0;
 	for s in 0..60 {
 		walk(&format!("PK{s}"), 300, |g| {
-			if g.phase == Phase::Pack && g.hand.len() >= 2 {
-				let lay = buf.encode(g);
-				obs::ops(g, &lay, 0, &mut ops);
-				for k in [obs::op::SORT_RANK, obs::op::SORT_SUIT, obs::op::MOVE_HAND] {
+			if g.flow.phase == Phase::Pack && g.areas.hand.cards.len() >= 2 {
+				let lay = encode_with_deck(g, &mut buf);
+				obs::ops(
+					g,
+					&lay,
+					obs::OpOptions {
+						candidates: 0,
+						..Default::default()
+					},
+					&mut ops,
+				);
+				for k in [
+					obs::OpKind::SortRank,
+					obs::OpKind::SortSuit,
+					obs::OpKind::MoveHand,
+				] {
 					assert!(
 						ops.iter().any(|o| o.kind == k),
-						"op {k} missing in a pack with the hand drawn"
+						"op {k:?} missing in a pack with the hand drawn"
 					);
 				}
 				packs += 1;
@@ -321,18 +394,40 @@ fn hand_can_be_reordered_in_packs() {
 
 #[test]
 fn reorder_destinations_are_checked() {
-	let mut g = Game::new_run("DEST", Back::Red, 1);
+	let mut g = Game::new_run("DEST", Back::Red, Stake::White);
 	g.step(Action::SelectBlind).unwrap();
-	let mut buf = Buf::new();
-	let lay = buf.encode(&g);
+	let mut buf = ObsBuf::new();
+	let lay = encode_with_deck(&g, &mut buf);
 	let mut ops = Vec::new();
-	obs::ops(&g, &lay, 0, &mut ops);
-	let mv = ops.iter().find(|o| o.kind == obs::op::MOVE_HAND).unwrap();
+	obs::ops(
+		&g,
+		&lay,
+		obs::OpOptions {
+			candidates: 0,
+			..Default::default()
+		},
+		&mut ops,
+	);
+	let mv = ops
+		.iter()
+		.find(|o| o.kind == obs::OpKind::MoveHand)
+		.unwrap();
 	assert_eq!(
-		obs::decode(&g, mv, 1, 2),
+		obs::decode(&g, mv, CardMask::from_bits(1), Some(2)),
 		Some(Action::MoveHand { from: 0, to: 2 })
 	);
-	// 258 would wrap to 2 as a u8.
-	assert_eq!(obs::decode(&g, mv, 1, 258), None);
-	assert_eq!(obs::decode(&g, mv, 1, u32::from(mv.dest)), None);
+	assert_eq!(obs::decode(&g, mv, CardMask::from_bits(1), None), None);
+	assert_eq!(obs::decode(&g, mv, CardMask::from_bits(1), mv.dest), None);
+}
+
+/// Every other state of a [`walk`] from `seed` (the first, the third, ...).
+fn every_other_state(seed: &str, steps: usize) -> Vec<Game> {
+	let (mut states, mut keep) = (Vec::new(), true);
+	walk(seed, steps, |g| {
+		if keep {
+			states.push(g.clone());
+		}
+		keep = !keep;
+	});
+	states
 }

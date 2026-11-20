@@ -45,7 +45,6 @@ def load(path: Path) -> list[Step]:
 
 
 def divergence(a: Step, b: Step) -> list[tuple[str, str, str]]:
-    """The differences between two steps (empty if they match)."""
     if a.line is not None and b.line is not None and a.line != b.line:
         return [("<history line>", a.line, b.line)]
     if a.state is None or b.state is None:

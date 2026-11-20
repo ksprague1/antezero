@@ -1,13 +1,11 @@
-//! Text codes of actions and scenario injections (histories, bindings).
-
-use sim::data::{ACE, Back, Edition, Enhancement, Joker, Planet, Seal, Spectral, Suit, Voucher};
-use sim::game::{Game, Phase};
-use sim::inject::Inject;
-use sim::{Action, Kind};
+use sim::data::{Back, Edition, Enhancement, Joker, Planet, Rank, Seal, Spectral, Suit, Voucher};
+use sim::game::{Game, HandSort, Phase};
+use sim::inject::{Consumable, Inject};
+use sim::{Action, CardMask, Stake};
 
 #[test]
 fn every_legal_action_round_trips() {
-	let mut g = Game::new_run("CODES", Back::Red, 1);
+	let mut g = Game::new_run("CODES", Back::Red, Stake::White);
 	let mut acts = Vec::new();
 	let mut n = 0;
 	for step in 0..400 {
@@ -20,7 +18,7 @@ fn every_legal_action_round_trips() {
 			assert_eq!(code.parse::<Action>(), Ok(*a), "{code}");
 			n += 1;
 		}
-		let a = if g.phase == Phase::Round {
+		let a = if g.flow.phase == Phase::Round {
 			*acts.iter().find(|a| matches!(a, Action::Play(_))).unwrap()
 		} else {
 			acts[step % acts.len()]
@@ -30,7 +28,7 @@ fn every_legal_action_round_trips() {
 	for a in [
 		Action::MoveJoker { from: 0, to: 3 },
 		Action::MoveHand { from: 7, to: 1 },
-		Action::SortHand { by_suit: true },
+		Action::SortHand(HandSort::Suit),
 	] {
 		assert_eq!(a.to_string().parse::<Action>(), Ok(a));
 	}
@@ -54,7 +52,10 @@ fn malformed_action_codes_are_rejected() {
 	] {
 		assert!(bad.parse::<Action>().is_err(), "{bad:?} parsed");
 	}
-	assert_eq!("  play   30 ".parse::<Action>(), Ok(Action::Play(30)));
+	assert_eq!(
+		"  play   30 ".parse::<Action>(),
+		Ok(Action::Play(CardMask::from_bits(30)))
+	);
 }
 
 #[test]
@@ -62,38 +63,38 @@ fn inject_codes_round_trip_and_reject_malformed_input() {
 	let samples = [
 		Inject::Joker {
 			joker: Joker::Blueprint,
-			edition: Edition::Negative,
+			edition: Some(Edition::Negative),
 			eternal: true,
 		},
 		Inject::Consumable {
-			kind: Kind::Planet(Planet::Eris),
-			edition: Edition::None,
+			card: Consumable::Planet(Planet::Eris),
+			edition: None,
 		},
 		Inject::Consumable {
-			kind: Kind::Spectral(Spectral::Ankh),
-			edition: Edition::Polychrome,
+			card: Consumable::Spectral(Spectral::Ankh),
+			edition: Some(Edition::Polychrome),
 		},
 		Inject::Card {
 			suit: Suit::Clubs,
-			rank: 12,
+			rank: Rank::Queen,
 			enhancement: Enhancement::Lucky,
-			edition: Edition::Holo,
+			edition: Some(Edition::Holo),
 			seal: Some(Seal::Purple),
 		},
 		Inject::Card {
 			suit: Suit::Hearts,
-			rank: ACE,
+			rank: Rank::Ace,
 			enhancement: Enhancement::Base,
-			edition: Edition::None,
+			edition: None,
 			seal: None,
 		},
 		Inject::Dollars(17.5),
 		Inject::Voucher(Voucher::Palette),
 	];
-	for i in samples {
-		let code = i.to_string();
+	for inject in samples {
+		let code = inject.to_string();
 		let back: Inject = code.parse().unwrap();
-		assert_eq!(back.to_string(), code);
+		assert_eq!(back, inject, "{code}");
 	}
 	for bad in [
 		"inject_joker",

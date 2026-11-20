@@ -89,7 +89,6 @@ class GameEnv:
             proc.stop()
             raise
 
-    # -- Env interface ----------------------------------------------------
     def reset(self, seed: str, deck: str = "b_red", stake: int | str = 1) -> Obs:
         self._set(self.client.az_start(seed, back_key(deck), stake_num(stake), settle_timeout=self.settle_timeout))
         self._pack_from_shop = False
@@ -201,9 +200,7 @@ class GameEnv:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-    # -- routing ------------------------------------------------------------
     def route_for(self, a: Action) -> str:
-        """Which route `step` would use for `a` in the current state."""
         if self.route == "harness" or a.op in ("reroll_boss", "sort", "buy_use"):
             return "harness"  # (BalatroBot has no such endpoint)
         s = self.state()
@@ -247,7 +244,6 @@ class GameEnv:
                     return "harness"  # #208
         return "balatrobot"
 
-    # -- internals ------------------------------------------------------------
     def _set(self, d: StateDump) -> None:
         self._dump = d
 

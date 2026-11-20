@@ -1,4 +1,3 @@
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -7,13 +6,10 @@ wheels/
 *.egg-info
 .pytest_cache/
 
-# Virtual environments
 .venv
 
-# Rust build output
 target/
 
-# Local scratch work (difftest failure histories, notes) and training runs
 .scratch/
 agent/runs/
 reference/

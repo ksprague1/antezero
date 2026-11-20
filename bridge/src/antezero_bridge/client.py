@@ -21,12 +21,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 12346
 
 
-class RPCError(APIError):
-    """A JSON-RPC error response (``name`` is BalatroBot's error name)."""
+class RPCError(APIError): ...
 
 
-class ProtocolError(RuntimeError):
-    """The server's reply is not a JSON-RPC response to the request."""
+class ProtocolError(RuntimeError): ...
 
 
 class SettleTimeout(RuntimeError):
@@ -61,8 +59,6 @@ class StateDump:
 
 
 class BridgeClient:
-    """Calls BalatroBot (native methods) and the companion ``az_*`` methods."""
-
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 120.0):
         self.host = host
         self.port = port
@@ -97,13 +93,11 @@ class BridgeClient:
         return data["result"]
 
     def _result(self, method: str, params: dict[str, Any], timeout: float | None, *keys: str) -> dict[str, Any]:
-        """``call`` for methods whose result is an object with ``keys``."""
         res = self.call(method, params, timeout=timeout)
         if not isinstance(res, dict) or any(k not in res for k in keys):
             raise ProtocolError(f"{method}: unexpected result {str(res)[:200]}")
         return res
 
-    # -- BalatroBot -------------------------------------------------------
     def health(self, timeout: float = 2.0) -> bool:
         try:
             return self.call("health", timeout=timeout).get("status") == "ok"
@@ -113,7 +107,6 @@ class BridgeClient:
     def gamestate(self) -> dict[str, Any]:
         return self.call("gamestate")
 
-    # -- companion mod ----------------------------------------------------
     def az_info(self, timeout: float | None = None) -> dict[str, Any]:
         return self._result("az_info", {}, timeout, "version")
 

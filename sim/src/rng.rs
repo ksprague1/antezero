@@ -10,8 +10,20 @@
 //! contiguous copy (see [`PseudoRandom`]).
 
 use std::f64::consts::{E, PI};
+use std::num::NonZeroU64;
+use std::{fmt, mem, str};
 
 use crate::num;
+
+/// Records a timeline entry in a [`PseudoRandom`]'s trace (`trace-keys`
+/// builds only).
+macro_rules! trace {
+    ($rng:expr, $($t:tt)*) => {
+        #[cfg(feature = "trace-keys")]
+        $rng.trace.record(format_args!($($t)*));
+    };
+}
+pub(crate) use trace;
 
 /// `LuaJIT`'s `math.random` generator state (four combined Tausworthe LFSRs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +40,7 @@ impl LuaRandom {
 		// 64-k[i] as four 8 bit constants.
 		let mut r: u32 = 0x1109_0601;
 		let mut d = seed;
-		for i in 0..4 {
+		for slot in &mut rs.state {
 			let m: u64 = 1u64 << (r & 255);
 			r >>= 8;
 			// LuaJIT's literals are exactly M_PI and M_E.
@@ -37,7 +49,7 @@ impl LuaRandom {
 			if u < m {
 				u += m; // Ensure k[i] MSB of gen[i] are non-zero.
 			}
-			rs.state[i] = u;
+			*slot = u;
 		}
 		for _ in 0..10 {
 			rs.step();
@@ -46,13 +58,9 @@ impl LuaRandom {
 	}
 
 	/// One PRNG step. Returns the raw bits of a double in `[1, 2)`.
-	#[inline(always)]
+	#[inline]
 	fn step(&mut self) -> u64 {
-		#[inline(always)]
-		#[expect(
-			clippy::inline_always,
-			reason = "kept from the tuned original: this runs for every random draw"
-		)]
+		#[inline]
 		fn tw(z: u64, k: u32, q: u32, s: u32) -> u64 {
 			(((z << q) ^ z) >> (k - s)) ^ ((z & (u64::MAX << (64 - k))) << s)
 		}
@@ -91,11 +99,7 @@ impl LuaRandom {
 }
 
 /// Lua's `a % b` for numbers: `a - floor(a/b)*b`.
-#[inline(always)]
-#[expect(
-	clippy::inline_always,
-	reason = "kept from the tuned original: this runs for every random draw"
-)]
+#[inline]
 #[must_use]
 pub fn lua_mod(a: f64, b: f64) -> f64 {
 	a - (a / b).floor() * b
@@ -123,10 +127,6 @@ pub fn pseudohash(bytes: &[u8]) -> f64 {
 /// rounded, which is precisely what `tonumber` produces for that string.
 #[inline]
 #[must_use]
-#[expect(
-	clippy::float_cmp,
-	reason = "exact ties decide the rounding, as in printf"
-)]
 pub fn round13(x: f64) -> f64 {
 	const S: f64 = 1e13;
 	let product = x * S;
@@ -150,19 +150,25 @@ pub fn round13(x: f64) -> f64 {
 #[derive(Clone, Copy)]
 pub struct Key {
 	len: u8,
-	buf: [u8; 63],
+	buf: [u8; Key::CAPACITY],
 }
 
 impl Key {
+	/// The longest key, in bytes.
+	pub const CAPACITY: usize = 63;
+
 	#[inline]
 	#[must_use]
 	pub const fn new() -> Self {
 		Key {
 			len: 0,
-			buf: [0; 63],
+			buf: [0; Key::CAPACITY],
 		}
 	}
 
+	/// # Panics
+	///
+	/// Panics if the key would grow past [`Key::CAPACITY`] bytes.
 	#[inline]
 	pub fn push(&mut self, s: &str) -> &mut Self {
 		self.push_bytes(s.as_bytes())
@@ -170,7 +176,7 @@ impl Key {
 
 	/// # Panics
 	///
-	/// Panics if the key would grow past its 63 bytes.
+	/// Panics if the key would grow past [`Key::CAPACITY`] bytes.
 	#[inline]
 	pub fn push_bytes(&mut self, s: &[u8]) -> &mut Self {
 		let l = self.len as usize;
@@ -186,6 +192,10 @@ impl Key {
 	}
 
 	/// Appends an integer the way Lua's `tostring` formats integral numbers.
+	///
+	/// # Panics
+	///
+	/// Panics if the key would grow past [`Key::CAPACITY`] bytes.
 	#[inline]
 	pub fn push_int(&mut self, v: i64) -> &mut Self {
 		let mut tmp = [0u8; 20];
@@ -209,24 +219,23 @@ impl Key {
 	#[inline]
 	#[must_use]
 	pub fn as_bytes(&self) -> &[u8] {
-		&self.buf[..self.len as usize]
+		&self.buf[..usize::from(self.len)]
 	}
 
-	/// 64-bit hash used to index stream state (never 0).
+	/// 64-bit hash used to index stream state (a hash of 0 is taken as 1).
 	#[inline]
-	fn hash(&self) -> u64 {
+	fn hash(&self) -> NonZeroU64 {
 		// FNV-1a followed by a murmur3 finalizer.
-		let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+		let mut h = FNV_OFFSET_BASIS;
 		for &b in self.as_bytes() {
-			h ^= u64::from(b);
-			h = h.wrapping_mul(0x0000_0100_0000_01b3);
+			h = fnv1a(h, u64::from(b));
 		}
 		h ^= h >> 33;
 		h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
 		h ^= h >> 33;
 		h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
 		h ^= h >> 33;
-		if h == 0 { 1 } else { h }
+		NonZeroU64::new(h).unwrap_or(NonZeroU64::MIN)
 	}
 }
 
@@ -237,6 +246,9 @@ impl Default for Key {
 }
 
 impl From<&str> for Key {
+	/// # Panics
+	///
+	/// Panics if `s` is longer than [`Key::CAPACITY`] bytes.
 	#[inline]
 	fn from(s: &str) -> Self {
 		let mut k = Key::new();
@@ -245,8 +257,8 @@ impl From<&str> for Key {
 	}
 }
 
-impl std::fmt::Debug for Key {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Key {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "Key({:?})", String::from_utf8_lossy(self.as_bytes()))
 	}
 }
@@ -258,14 +270,14 @@ impl std::fmt::Debug for Key {
 /// timeline entry.
 #[cfg(feature = "trace-keys")]
 #[derive(Clone, Debug)]
-pub struct Trace {
+pub(crate) struct Trace {
 	/// Whether entries are recorded (on by default in feature builds).
-	pub enabled: bool,
+	enabled: bool,
 	/// Frame of the current action, stamped on every entry.
-	pub frame: u32,
-	pub entries: Vec<String>,
+	frame: u32,
+	entries: Vec<String>,
 	/// Completed-event log, when enabled.
-	pub evlog: Option<Vec<String>>,
+	event_log: Option<Vec<String>>,
 }
 
 #[cfg(feature = "trace-keys")]
@@ -275,7 +287,7 @@ impl Default for Trace {
 			enabled: true,
 			frame: 0,
 			entries: Vec::new(),
-			evlog: None,
+			event_log: None,
 		}
 	}
 }
@@ -283,10 +295,79 @@ impl Default for Trace {
 #[cfg(feature = "trace-keys")]
 impl Trace {
 	#[inline]
-	pub fn record(&mut self, what: std::fmt::Arguments<'_>) {
+	pub(crate) fn record(&mut self, what: fmt::Arguments<'_>) {
 		if self.enabled {
 			self.entries.push(format!("{} {what}", self.frame));
 		}
+	}
+
+	/// Stamps the entries that follow with `frame`.
+	#[inline]
+	pub(crate) fn set_frame(&mut self, frame: u32) {
+		self.frame = frame;
+	}
+
+	/// Starts the timeline of a new action.
+	pub(crate) fn clear(&mut self) {
+		self.frame = 0;
+		self.entries.clear();
+		if let Some(l) = self.event_log.as_mut() {
+			l.clear();
+		}
+	}
+
+	/// Turns recording on or off; off also drops the timeline.
+	pub(crate) fn set_enabled(&mut self, on: bool) {
+		self.enabled = on;
+		if !on {
+			self.entries = Vec::new();
+		}
+	}
+
+	pub(crate) fn entries(&self) -> &[String] {
+		&self.entries
+	}
+
+	/// Starts logging the completed events of each action.
+	pub(crate) fn enable_event_log(&mut self) {
+		self.event_log = Some(Vec::new());
+	}
+
+	/// The completed events of the current action, if logging is on.
+	pub(crate) fn event_log(&self) -> &[String] {
+		self.event_log.as_deref().unwrap_or(&[])
+	}
+
+	/// Logs a completed event, if logging is on.
+	pub(crate) fn log_event(&mut self, what: fmt::Arguments<'_>) {
+		if let Some(log) = self.event_log.as_mut() {
+			log.push(what.to_string());
+		}
+	}
+}
+
+/// Without `trace-keys` there is no timeline: an empty stand-in whose
+/// methods do nothing.
+#[cfg(not(feature = "trace-keys"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Trace {}
+
+#[cfg(not(feature = "trace-keys"))]
+#[expect(
+	clippy::unused_self,
+	reason = "the stand-in records nothing, so its methods have nothing in `self` to use"
+)]
+impl Trace {
+	#[inline]
+	pub(crate) fn set_frame(&mut self, _frame: u32) {}
+
+	#[inline]
+	pub(crate) fn clear(&mut self) {}
+
+	pub(crate) fn set_enabled(&mut self, _on: bool) {}
+
+	pub(crate) fn entries(&self) -> &[String] {
+		&[]
 	}
 }
 
@@ -329,23 +410,77 @@ mod names {
 	}
 }
 
+/// The slot a stream with hash `h` starts probing at, in a table of
+/// `mask + 1` slots.
+#[inline]
+#[expect(
+	clippy::cast_possible_truncation,
+	reason = "only the hash's low bits index the table"
+)]
+const fn home(h: NonZeroU64, mask: usize) -> usize {
+	(h.get() as usize) & mask
+}
+
+/// A slot of the stream table: a stream's key hash and state, or empty.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+	hash: Option<NonZeroU64>,
+	state: f64,
+}
+
+impl Slot {
+	const EMPTY: Slot = Slot {
+		hash: None,
+		state: 0.0,
+	};
+}
+
 /// Per-key stream states (`G.GAME.pseudorandom`) plus the run seed.
 ///
-/// Stored as an open-addressing table of `(hash, state)` pairs so cloning a
-/// snapshot copies one contiguous buffer.
-#[derive(Clone, Debug)]
+/// Stored as an open-addressing table of [`Slot`]s so cloning a snapshot
+/// copies one contiguous buffer.
+#[derive(Debug)]
 pub struct PseudoRandom {
 	seed: Key,
 	hashed_seed: f64,
 	len: usize,
-	slots: Vec<(u64, f64)>,
+	slots: Vec<Slot>,
 	/// Number of `pseudoseed` calls so far (any random draw).
 	draws: u64,
-	#[cfg(feature = "trace-keys")]
-	pub trace: Trace,
+	pub(crate) trace: Trace,
+}
+
+impl Clone for PseudoRandom {
+	fn clone(&self) -> PseudoRandom {
+		PseudoRandom {
+			slots: self.slots.clone(),
+			trace: self.trace.clone(),
+			..*self
+		}
+	}
+
+	fn clone_from(&mut self, source: &PseudoRandom) {
+		let PseudoRandom {
+			seed,
+			hashed_seed,
+			len,
+			slots,
+			draws,
+			trace,
+		} = self;
+		*seed = source.seed;
+		*hashed_seed = source.hashed_seed;
+		*len = source.len;
+		slots.clone_from(&source.slots);
+		*draws = source.draws;
+		trace.clone_from(&source.trace);
+	}
 }
 
 impl PseudoRandom {
+	/// # Panics
+	///
+	/// Panics if `seed` is longer than [`Key::CAPACITY`] bytes.
 	#[must_use]
 	pub fn new(seed: &str) -> Self {
 		let seed_key = Key::from(seed);
@@ -353,68 +488,70 @@ impl PseudoRandom {
 			seed: seed_key,
 			hashed_seed: pseudohash(seed_key.as_bytes()),
 			len: 0,
-			slots: vec![(0, 0.0); 256],
+			slots: vec![Slot::EMPTY; 256],
 			draws: 0,
-			#[cfg(feature = "trace-keys")]
 			trace: Trace::default(),
 		}
 	}
 
+	/// Starts over from `seed`; a trace carries on.
+	pub(crate) fn reseed(&mut self, seed: &str) {
+		*self = PseudoRandom {
+			trace: mem::take(&mut self.trace),
+			..PseudoRandom::new(seed)
+		};
+	}
+
 	/// A generator whose calls are never traced (scratch scenarios).
+	///
+	/// # Panics
+	///
+	/// Panics if `seed` is longer than [`Key::CAPACITY`] bytes.
 	#[must_use]
 	pub fn new_untraced(seed: &str) -> Self {
-		#[cfg_attr(
-			not(feature = "trace-keys"),
-			expect(unused_mut, reason = "only trace builds change it")
-		)]
 		let mut r = Self::new(seed);
-		#[cfg(feature = "trace-keys")]
-		{
-			r.trace.enabled = false;
-		}
+		r.trace.set_enabled(false);
 		r
 	}
 
 	/// Slot of the stream with hash `h`: `Ok(index)` if present, else
 	/// `Err(index)` of the empty slot where it would be inserted.
 	#[inline]
-	fn find(&self, h: u64) -> Result<usize, usize> {
+	fn find(&self, h: NonZeroU64) -> Result<usize, usize> {
 		let mask = self.slots.len() - 1;
-		#[expect(
-			clippy::cast_possible_truncation,
-			reason = "only the hash's low bits index the table"
-		)]
-		let mut i = (h as usize) & mask;
+		let mut i = home(h, mask);
 		loop {
-			match self.slots[i].0 {
-				s if s == h => return Ok(i),
-				0 => return Err(i),
-				_ => i = (i + 1) & mask,
+			match self.slots[i].hash {
+				Some(s) if s == h => return Ok(i),
+				None => return Err(i),
+				Some(_) => i = (i + 1) & mask,
 			}
 		}
 	}
 
-	/// Current state of the stream `key` (None if never used).
-	#[must_use]
-	pub fn stream_value(&self, key: &str) -> Option<f64> {
-		self.find(Key::from(key).hash())
-			.ok()
-			.map(|i| self.slots[i].1)
+	/// Every stream used so far, by name, with its state (in table order).
+	///
+	/// # Panics
+	///
+	/// Panics on a stream whose name was never registered (a bug: every
+	/// stream registers its name when it is created).
+	pub fn named_streams(&self) -> impl Iterator<Item = (String, f64)> + '_ {
+		self.slots.iter().filter_map(|slot| {
+			let name = names::get(slot.hash?.get())
+				.expect("every stream registers its name when it is created");
+			Some((name, slot.state))
+		})
 	}
 
-	/// Names of all streams used so far (in table order).
-	#[must_use]
-	pub fn stream_names(&self) -> Vec<String> {
-		self.slots
-			.iter()
-			.filter(|s| s.0 != 0)
-			.filter_map(|s| names::get(s.0))
-			.collect()
-	}
-
+	/// The run's seed.
+	///
+	/// # Panics
+	///
+	/// Never: the key holds a whole copy of the `&str` the generator was
+	/// seeded with.
 	#[must_use]
 	pub fn seed(&self) -> &str {
-		std::str::from_utf8(self.seed.as_bytes()).unwrap_or("")
+		str::from_utf8(self.seed.as_bytes()).expect("the seed key is a whole copy of a `&str`")
 	}
 
 	#[must_use]
@@ -428,9 +565,9 @@ impl PseudoRandom {
 		self.draws
 	}
 
-	/// Number of streams touched so far.
+	/// The number of streams used so far.
 	#[must_use]
-	pub fn streams(&self) -> usize {
+	pub fn stream_count(&self) -> usize {
 		self.len
 	}
 
@@ -438,7 +575,7 @@ impl PseudoRandom {
 	fn slot(&mut self, key: &Key) -> &mut f64 {
 		let h = key.hash();
 		let i = match self.find(h) {
-			Ok(i) => return &mut self.slots[i].1,
+			Ok(i) => return &mut self.slots[i].state,
 			Err(i) => i,
 		};
 		// First use of this stream: state = pseudohash(key .. seed).
@@ -448,27 +585,26 @@ impl PseudoRandom {
 		}
 		let mut full = *key;
 		full.push_bytes(self.seed.as_bytes());
-		self.slots[i] = (h, pseudohash(full.as_bytes()));
+		self.slots[i] = Slot {
+			hash: Some(h),
+			state: pseudohash(full.as_bytes()),
+		};
 		self.len += 1;
-		names::note(h, key);
-		&mut self.slots[i].1
+		names::note(h.get(), key);
+		&mut self.slots[i].state
 	}
 
 	fn grow(&mut self) {
 		let cap = self.slots.len() * 2;
-		let old = std::mem::replace(&mut self.slots, vec![(0, 0.0); cap]);
+		let old = mem::replace(&mut self.slots, vec![Slot::EMPTY; cap]);
 		let mask = self.slots.len() - 1;
-		for (h, v) in old {
-			if h != 0 {
-				#[expect(
-					clippy::cast_possible_truncation,
-					reason = "only the hash's low bits index the table"
-				)]
-				let mut i = (h as usize) & mask;
-				while self.slots[i].0 != 0 {
+		for slot in old {
+			if let Some(h) = slot.hash {
+				let mut i = home(h, mask);
+				while self.slots[i].hash.is_some() {
 					i = (i + 1) & mask;
 				}
-				self.slots[i] = (h, v);
+				self.slots[i] = slot;
 			}
 		}
 	}
@@ -485,15 +621,15 @@ impl PseudoRandom {
 		let hashed = self.hashed_seed;
 		let st = self.slot(key);
 		*st = round13(lua_mod(2.134_453_429_141 + *st * 1.724_312_34, 1.0)).abs();
-		#[expect(
-			clippy::manual_midpoint,
-			reason = "the game's own arithmetic, kept bit for bit"
-		)]
-		let seed = (*st + hashed) / 2.0;
-		seed
+		// `midpoint` is `(a + b) / 2`, as the game computes it, for values this small.
+		st.midpoint(hashed)
 	}
 
 	/// `pseudoseed(str)` convenience.
+	///
+	/// # Panics
+	///
+	/// Panics if `key` is longer than [`Key::CAPACITY`] bytes.
 	#[inline]
 	pub fn seed_str(&mut self, key: &str) -> f64 {
 		self.seed_for(&Key::from(key))
@@ -523,9 +659,89 @@ impl PseudoRandom {
 		LuaRandom::new(self.seed_for(key)).index(len)
 	}
 
+	/// [`PseudoRandom::element`] with the key given as a string.
+	///
+	/// # Panics
+	///
+	/// Panics if `len` is 0 or `key` is longer than [`Key::CAPACITY`] bytes.
 	#[inline]
 	pub fn element_str(&mut self, key: &str, len: usize) -> usize {
 		self.element(&Key::from(key), len)
+	}
+}
+
+/// FNV-1a's 64-bit offset basis, the hash of nothing.
+pub const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a step: `h` with `x` folded in.
+#[inline]
+#[must_use]
+pub fn fnv1a(h: u64, x: u64) -> u64 {
+	(h ^ x).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// `SplitMix64`'s increment, the odd integer nearest 2^64 over the golden ratio.
+pub const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// One `SplitMix64` output for the state `n`: a well spread hash of `n`, for
+/// arbitrary, repeatable choices like [`Xorshift`]'s. Never the game's own
+/// randomness.
+#[must_use]
+pub fn splitmix64(n: u64) -> u64 {
+	let mut z = n.wrapping_add(SPLITMIX_GAMMA);
+	z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+	z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+	z ^ (z >> 31)
+}
+
+/// Shuffles `v` (Fisher-Yates) with the `SplitMix64` outputs that follow
+/// `seed`: an arbitrary, repeatable order, never the game's own randomness.
+pub(crate) fn splitmix_shuffle<T>(v: &mut [T], mut seed: u64) {
+	for i in (1..v.len()).rev() {
+		let z = splitmix64(seed);
+		seed = seed.wrapping_add(SPLITMIX_GAMMA);
+		v.swap(i, num::pick(z, i + 1));
+	}
+}
+
+/// A xorshift64 generator for arbitrary, repeatable choices: the policies
+/// of tests, benchmarks and rollouts. Never the game's own randomness.
+#[derive(Clone, Debug)]
+pub struct Xorshift(u64);
+
+impl Xorshift {
+	/// A generator started from `seed` made odd: a zero state would stay
+	/// zero, so every draw would be zero.
+	#[must_use]
+	pub fn new(seed: u64) -> Xorshift {
+		Xorshift(seed | 1)
+	}
+
+	pub fn next_u64(&mut self) -> u64 {
+		let mut x = self.0;
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		self.0 = x;
+		x
+	}
+
+	/// An index below `n`.
+	///
+	/// # Panics
+	///
+	/// If `n` is 0.
+	pub fn below(&mut self, n: usize) -> usize {
+		num::pick(self.next_u64(), n)
+	}
+
+	/// `true` with probability `p`.
+	#[expect(
+		clippy::cast_precision_loss,
+		reason = "the draw is shifted below 2^53 and 2^53 is a power of two, so both casts are exact"
+	)]
+	pub fn chance(&mut self, p: f64) -> bool {
+		((self.next_u64() >> 11) as f64 / (1u64 << 53) as f64) < p
 	}
 }
 
@@ -536,8 +752,8 @@ pub fn shuffle<T>(list: &mut [T], seed: f64) {
 	let mut r = LuaRandom::new(seed);
 	let mut i = list.len();
 	while i >= 2 {
-		let j = num::trunc(r.random_int(num::float(i)));
-		list.swap(i - 1, j - 1);
+		let j = r.index(i);
+		list.swap(i - 1, j);
 		i -= 1;
 	}
 }
@@ -557,7 +773,6 @@ mod tests {
 	}
 
 	#[test]
-	#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 	fn round13_basic() {
 		assert_eq!(round13(0.5), 0.5);
 		assert_eq!(round13(0.123_456_789_012_345_67), 0.123_456_789_012_3);
@@ -569,7 +784,6 @@ mod tests {
 	}
 
 	#[test]
-	#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 	fn streams_are_independent_and_stable() {
 		let mut a = PseudoRandom::new("ABCDEFGH");
 		let mut b = PseudoRandom::new("ABCDEFGH");
@@ -582,7 +796,6 @@ mod tests {
 	}
 
 	#[test]
-	#[expect(clippy::float_cmp, reason = "the test compares exact values")]
 	fn table_growth_preserves_state() {
 		let key = |i: i64| {
 			let mut k = Key::from("k");
@@ -590,25 +803,17 @@ mod tests {
 			k
 		};
 		let mut a = PseudoRandom::new("SEED");
-		let mut states = Vec::new();
 		for i in 0..2000 {
 			a.seed_for(&key(i));
-			states.push(
-				a.stream_value(std::str::from_utf8(key(i).as_bytes()).unwrap())
-					.unwrap(),
-			);
 		}
-		assert_eq!(a.streams(), 2000);
-		// Every stream keeps its state across the table growths, and advancing
-		// an early stream matches a table that only ever held that stream.
-		for (i, &state) in (0..).zip(&states) {
-			assert_eq!(
-				a.stream_value(std::str::from_utf8(key(i).as_bytes()).unwrap()),
-				Some(state)
-			);
+		assert_eq!(a.stream_count(), 2000);
+		assert_eq!(a.named_streams().count(), 2000);
+		// Every stream keeps its state across the table growths: advancing it
+		// again matches a table that only ever held that stream.
+		for i in 0..2000 {
+			let mut b = PseudoRandom::new("SEED");
+			b.seed_for(&key(i));
+			assert_eq!(a.seed_for(&key(i)), b.seed_for(&key(i)), "stream {i}");
 		}
-		let mut b = PseudoRandom::new("SEED");
-		b.seed_for(&key(3));
-		assert_eq!(a.seed_for(&key(3)), b.seed_for(&key(3)));
 	}
 }

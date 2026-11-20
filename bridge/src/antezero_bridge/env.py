@@ -50,8 +50,6 @@ def stake_num(stake: int | str) -> int:
 
 @runtime_checkable
 class Env(Protocol):
-    """What every backend implements."""
-
     def reset(self, seed: str, deck: str = "b_red", stake: int | str = 1) -> Obs:
         """Start a seeded run (``deck`` = back key or BalatroBot enum) and
         return the observation at the first decision point (BLIND_SELECT)."""

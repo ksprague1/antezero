@@ -1,178 +1,199 @@
 //! Port of `blind.lua`.
 
+use crate::areas::Pile;
 use crate::card::Card;
-use crate::data::{BlindKind, HandType, Suit, blind_amount};
-use crate::ev::{Ev, Pile};
-use crate::game::{Blind, BlindSlot, Game};
-use crate::rng::Key;
-use crate::{cards, events, flow};
+use crate::data::{BlindKind, HandType, Joker, Suit};
+use crate::event::Event;
+use crate::event_queue::{Blocks, EventQueue, Trigger};
+use crate::flow::FlowEvent;
+use crate::game::{Areas, Blind, BlindSlot, Game, HandLevels};
+use crate::playing_card::{PlayingCard, SuitTest};
+use crate::rng::{Key, PseudoRandom};
+use crate::round::Round;
+use crate::run::Run;
+use crate::{areas, calculate_joker, card_lifecycle, event_queue, flow, num, rng};
 
-/// Whether `blind` debuffs the playing card `c` (`Blind:debuff_card`), given
-/// whether Smeared Joker and Pareidolia are in effect.
-pub(crate) fn debuffs(blind: &Blind, smeared: bool, pareidolia: bool, c: &Card) -> bool {
-	if blind.disabled {
-		return false;
+/// What decides whether the blind debuffs a playing card
+/// (`Blind:debuff_card`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CardDebuff {
+	/// The blind, unless it is disabled.
+	blind: Option<BlindKind>,
+	smeared: bool,
+	pareidolia: bool,
+}
+
+impl CardDebuff {
+	pub(crate) fn new(blind: &Blind, jokers: &[Card]) -> CardDebuff {
+		CardDebuff {
+			blind: if blind.disabled { None } else { blind.kind },
+			smeared: calculate_joker::has_joker(jokers, Joker::Smeared),
+			pareidolia: calculate_joker::has_joker(jokers, Joker::Pareidolia),
+		}
 	}
-	let suit = match blind.kind {
-		Some(BlindKind::Club) => Some(Suit::Clubs),
-		Some(BlindKind::Goad) => Some(Suit::Spades),
-		Some(BlindKind::Head) => Some(Suit::Hearts),
-		Some(BlindKind::Window) => Some(Suit::Diamonds),
-		_ => None,
-	};
-	if let Some(s) = suit
-		&& c.is_suit(s, true, false, smeared)
-	{
-		return true;
+
+	fn debuffs(self, c: &PlayingCard) -> bool {
+		let suit = match self.blind {
+			Some(BlindKind::Club) => Some(Suit::Clubs),
+			Some(BlindKind::Goad) => Some(Suit::Spades),
+			Some(BlindKind::Head) => Some(Suit::Hearts),
+			Some(BlindKind::Window) => Some(Suit::Diamonds),
+			_ => None,
+		};
+		if let Some(s) = suit
+			&& c.is_suit(s, SuitTest::IgnoreDebuff, self.smeared)
+		{
+			return true;
+		}
+		match self.blind {
+			Some(BlindKind::Plant) => c.is_face_from_boss(self.pareidolia),
+			Some(BlindKind::Pillar) => c.played_this_ante,
+			Some(BlindKind::FinalLeaf) => true,
+			_ => false,
+		}
 	}
-	match blind.kind {
-		Some(BlindKind::Plant) => c.is_face(true, pareidolia),
-		Some(BlindKind::Pillar) => c.ab.played_this_ante,
-		Some(BlindKind::FinalLeaf) => true,
-		_ => false,
+
+	/// `Blind:debuff_card(card)` for a playing card (`Card:set_debuff`, which
+	/// has no side effects for one).
+	pub(crate) fn apply(self, c: &mut PlayingCard) {
+		c.core.debuff = self.debuffs(c);
 	}
 }
 
 /// `Blind:set_blind(blind, reset=false)`.
 pub(crate) fn set_blind(g: &mut Game, blind: Option<BlindKind>) {
-	let mut b = Blind::empty();
-	b.kind = blind;
+	let mut b = Blind {
+		kind: blind,
+		..Blind::default()
+	};
 	if let Some(k) = blind {
 		let d = k.def();
 		b.dollars = f64::from(d.dollars);
 		b.mult = d.mult;
-		b.boss = d.boss;
-		if g.modifiers.no_blind_reward[BlindSlot::of(k) as usize] {
+		if g.setup.modifiers.no_blind_reward[BlindSlot::of(k)] {
 			b.dollars = 0.0;
 		}
-		b.chips =
-			blind_amount(g.ante, g.modifiers.scaling) * b.mult * g.starting_params.ante_scaling;
+		b.chips = blind_amount(g.run.ante, g.setup.modifiers.scaling)
+			* b.mult
+			* g.setup.starting_params.ante_scaling;
 	}
 	b.prepped = true;
-	g.last_blind_boss = b.boss;
+	g.round.last_blind_boss = b.is_boss();
 	g.blind = b;
 	if blind.is_some() {
-		g.events.push_ev(
-			Ev::BlindSetHud,
-			crate::events::Trig::After(0.05),
-			true,
-			false,
+		g.events.push_event(
+			Event::Flow(FlowEvent::BlindSetHud),
+			Trigger::After(0.05),
+			Blocks::Barrier,
 		);
 	}
 	match blind {
 		Some(BlindKind::Fish) => g.blind.prepped = false,
 		Some(BlindKind::Water) => {
-			g.blind.discards_sub = g.discards_left;
-			let d = g.blind.discards_sub;
-			g.events.push(Ev::EaseDiscard(-d));
+			g.blind.discards_sub = g.round.discards_left;
+			g.events.push(Event::EaseDiscard(-g.blind.discards_sub));
 		}
 		Some(BlindKind::Needle) => {
-			g.blind.hands_sub = g.rr_hands - 1.0;
-			let h = g.blind.hands_sub;
-			g.events.push(Ev::EaseHands(-h));
+			g.blind.hands_sub = g.round.base_hands - 1.0;
+			g.events.push(Event::EaseHands(-g.blind.hands_sub));
 		}
-		Some(BlindKind::Manacle) => cards::change_hand_size(g, -1.0),
-		Some(BlindKind::FinalAcorn) if !g.jokers.is_empty() => {
-			for c in &mut g.jokers {
-				c.face_down = !c.face_down;
+		Some(BlindKind::Manacle) => flow::change_hand_size(&mut g.events, -1.0),
+		Some(BlindKind::FinalAcorn) if !g.areas.jokers.is_empty() => {
+			for c in &mut g.areas.jokers {
+				c.core.face_down = !c.core.face_down;
 			}
-			if g.jokers.len() > 1 {
-				g.events.push_after(0.2, Ev::AcornOuter);
+			if g.areas.jokers.len() > 1 {
+				g.events.push_after(0.2, Event::Flow(FlowEvent::AcornOuter));
 			}
 		}
 		_ => {}
 	}
-	flow::refresh_playing_debuffs(g);
-	for i in 0..g.jokers.len() {
-		debuff_joker(g, i);
+	refresh_debuffs(g);
+}
+
+/// The blind's debuffs on every playing card and joker, once it changed
+/// (the loops of `Blind:set_blind` and `Blind:disable`).
+fn refresh_debuffs(g: &mut Game) {
+	flow::refresh_playing_debuffs(&mut g.areas, &g.blind);
+	// By index: lifting a joker's debuff can bring Chicot back, which
+	// disables the blind (the whole game).
+	for i in 0..g.areas.jokers.len() {
+		lift_joker_debuff(g, i);
 	}
 }
 
-/// `Blind:debuff_card(card)` for a card outside the joker area.
-pub(crate) fn debuff_card(g: &Game, c: &mut Card) {
-	let debuffed = debuffs(&g.blind, g.smeared(), g.pareidolia(), c);
-	cards::set_debuff_playing(c, debuffed);
-}
-
-/// [`Self::debuff_card`] on the `i`-th hand card.
-pub(crate) fn debuff_hand_card(g: &mut Game, i: usize) {
-	let debuffed = debuffs(&g.blind, g.smeared(), g.pareidolia(), &g.hand[i]);
-	cards::set_debuff_playing(&mut g.hand[i], debuffed);
-}
-
-/// `Blind:debuff_card(joker)`.
-pub(crate) fn debuff_joker(g: &mut Game, i: usize) {
+/// `Blind:debuff_card(joker)`, which lifts the joker's debuff unless The
+/// Crimson Heart is active (it picks the debuffed joker itself).
+fn lift_joker_debuff(g: &mut Game, i: usize) {
 	if g.blind.kind == Some(BlindKind::FinalHeart) && !g.blind.disabled {
 		return;
 	}
-	cards::set_debuff_joker(g, i, false);
+	card_lifecycle::set_debuff_joker(g, i, false);
 }
 
 /// `Blind:disable()`.
 pub(crate) fn disable_blind(g: &mut Game) {
 	g.blind.disabled = true;
-	for c in &mut g.jokers {
-		c.face_down = false;
+	for c in &mut g.areas.jokers {
+		c.core.face_down = false;
 	}
 	match g.blind.kind {
-		Some(BlindKind::Water) => {
-			let d = g.blind.discards_sub;
-			g.events.push(Ev::EaseDiscard(d));
-		}
+		Some(BlindKind::Water) => g.events.push(Event::EaseDiscard(g.blind.discards_sub)),
 		Some(BlindKind::Wheel | BlindKind::House | BlindKind::Mark | BlindKind::Fish) => {
-			for c in &mut g.hand {
-				c.face_down = false;
+			for c in &mut g.areas.hand.cards {
+				c.core.face_down = false;
 			}
-			for c in g.playing_cards_mut() {
-				c.ab.wheel_flipped = false;
+			for c in g.areas.playing_cards_mut() {
+				c.wheel_flipped = false;
 			}
 		}
-		Some(BlindKind::Needle) => {
-			let h = g.blind.hands_sub;
-			g.events.push(Ev::EaseHands(h));
-		}
+		Some(BlindKind::Needle) => g.events.push(Event::EaseHands(g.blind.hands_sub)),
 		Some(BlindKind::Wall) => g.blind.chips /= 2.0,
 		Some(BlindKind::FinalBell) => {
-			for c in g.playing_cards_mut() {
-				c.ab.forced_selection = false;
+			for c in g.areas.playing_cards_mut() {
+				c.forced_selection = false;
 			}
 		}
 		Some(BlindKind::Manacle) => {
-			cards::change_hand_size(g, 1.0);
-			flow::draw_from_deck_to_hand(g, Some(1));
+			flow::change_hand_size(&mut g.events, 1.0);
+			flow::draw_from_deck_to_hand(
+				&mut g.flow,
+				&g.areas,
+				&g.round,
+				&g.blind,
+				&mut g.events,
+				Some(1),
+			);
 		}
 		Some(BlindKind::FinalVessel) => g.blind.chips /= 3.0,
 		_ => {}
 	}
-	g.events.push(Ev::BlindDisableCheck);
-	flow::refresh_playing_debuffs(g);
-	for i in 0..g.jokers.len() {
-		debuff_joker(g, i);
-	}
+	g.events.push(Event::Flow(FlowEvent::BlindDisableCheck));
+	refresh_debuffs(g);
 }
 
 /// `Blind:press_play()`; returns its (truthy) result.
-pub(crate) fn press_play(g: &mut Game) -> bool {
-	if g.blind.disabled {
+pub(crate) fn press_play(jokers: &[Card], blind: &mut Blind, events: &mut EventQueue) -> bool {
+	if blind.disabled {
 		return false;
 	}
-	match g.blind.kind {
+	match blind.kind {
 		Some(BlindKind::Hook) => {
-			g.events.push(Ev::HookDiscard);
-			g.blind.triggered = true;
-			g.events.delay(0.7);
+			events.push(Event::Flow(FlowEvent::HookDiscard));
+			blind.triggered = true;
+			events.delay(0.7);
 			return true;
 		}
 		Some(BlindKind::FinalHeart) => {
-			if !g.jokers.is_empty() {
-				g.blind.triggered = true;
-				g.blind.prepped = true;
+			if !jokers.is_empty() {
+				blind.triggered = true;
+				blind.prepped = true;
 			}
 		}
-		Some(BlindKind::Fish) => g.blind.prepped = true,
+		Some(BlindKind::Fish) => blind.prepped = true,
 		Some(BlindKind::Tooth) => {
-			g.events.push_after(0.2, Ev::ToothOuter);
-			g.blind.triggered = true;
+			events.push_after(0.2, Event::Flow(FlowEvent::ToothOuter));
+			blind.triggered = true;
 			return true;
 		}
 		_ => {}
@@ -181,12 +202,12 @@ pub(crate) fn press_play(g: &mut Game) -> bool {
 }
 
 /// `Blind:modify_hand` → `(mult, chips)`.
-pub(crate) fn modify_hand(g: &mut Game, mult: f64, chips: f64) -> (f64, f64) {
-	if g.blind.disabled {
+pub(crate) fn modify_hand(blind: &mut Blind, mult: f64, chips: f64) -> (f64, f64) {
+	if blind.disabled {
 		return (mult, chips);
 	}
-	if g.blind.kind == Some(BlindKind::Flint) {
-		g.blind.triggered = true;
+	if blind.kind == Some(BlindKind::Flint) {
+		blind.triggered = true;
 		return (
 			(mult * 0.5 + 0.5).floor().max(1.0),
 			(chips * 0.5 + 0.5).floor().max(0.0),
@@ -198,48 +219,47 @@ pub(crate) fn modify_hand(g: &mut Game, mult: f64, chips: f64) -> (f64, f64) {
 /// Whether The Psychic, The Eye or The Mouth makes a play of `n_cards`
 /// cards of hand `name` score nothing (`debuff_hand` without its
 /// side effects).
-pub(crate) fn debuffs_play(g: &Game, n_cards: usize, name: HandType) -> bool {
-	!g.blind.disabled
-		&& match g.blind.kind {
+pub(crate) fn debuffs_play(blind: &Blind, n_cards: usize, name: HandType) -> bool {
+	!blind.disabled
+		&& match blind.kind {
 			Some(BlindKind::Psychic) => n_cards < 5,
-			Some(BlindKind::Eye) => g.blind.eye_hands >> (name as u16) & 1 == 1,
-			Some(BlindKind::Mouth) => g.blind.only_hand.is_some_and(|only| only != name),
+			Some(BlindKind::Eye) => blind.eye_hands.contains(name),
+			Some(BlindKind::Mouth) => blind.only_hand.is_some_and(|only| only != name),
 			_ => false,
 		}
 }
 
-/// `Blind:debuff_hand(cards, hand, handname, check)`.
-pub(crate) fn debuff_hand(g: &mut Game, n_cards: usize, name: HandType, check: bool) -> bool {
-	if g.blind.disabled {
+/// `Blind:debuff_hand(cards, hand, handname)` for a hand that is played.
+pub(crate) fn debuff_hand(
+	run: &mut Run, most_played_hand: HandType, blind: &mut Blind, hands: &mut HandLevels,
+	events: &mut EventQueue, n_cards: usize, name: HandType,
+) -> bool {
+	if blind.disabled {
 		return false;
 	}
-	g.blind.triggered = false;
-	if debuffs_play(g, n_cards, name) {
-		g.blind.triggered = true;
+	blind.triggered = false;
+	if debuffs_play(blind, n_cards, name) {
+		blind.triggered = true;
 		return true;
 	}
-	match g.blind.kind {
-		Some(BlindKind::Eye) if !check => g.blind.eye_hands |= 1 << (name as u16),
-		Some(BlindKind::Mouth) if !check => g.blind.only_hand = Some(name),
+	match blind.kind {
+		Some(BlindKind::Eye) => blind.eye_hands.insert(name),
+		Some(BlindKind::Mouth) => blind.only_hand = Some(name),
 		_ => {}
 	}
-	if g.blind.kind == Some(BlindKind::Arm) {
-		g.blind.triggered = false;
-		if g.hands[name as usize].level > 1.0 {
-			g.blind.triggered = true;
-			if !check {
-				events::level_up_hand_ev(g, name, -1.0, false);
-			}
+	if blind.kind == Some(BlindKind::Arm) {
+		blind.triggered = false;
+		if hands[name].level > 1.0 {
+			blind.triggered = true;
+			event_queue::level_up_hand(hands, events, name, -1.0);
 		}
 	}
-	if g.blind.kind == Some(BlindKind::Ox) {
-		g.blind.triggered = false;
-		if name == g.most_played_hand {
-			g.blind.triggered = true;
-			if !check {
-				let d = g.dollars;
-				cards::ease_dollars(g, -d);
-			}
+	if blind.kind == Some(BlindKind::Ox) {
+		blind.triggered = false;
+		if name == most_played_hand {
+			blind.triggered = true;
+			let d = run.dollars;
+			flow::ease_dollars(run, -d);
 		}
 	}
 	false
@@ -248,30 +268,33 @@ pub(crate) fn debuff_hand(g: &mut Game, n_cards: usize, name: HandType, check: b
 /// `Blind:drawn_to_hand()`.
 pub(crate) fn drawn_to_hand(g: &mut Game) {
 	if !g.blind.disabled {
-		if g.blind.kind == Some(BlindKind::FinalBell) && !g.hand.is_empty() {
-			let any = g.hand.iter().any(|c| c.ab.forced_selection);
-			if !any {
-				let mut order: Vec<usize> = (0..g.hand.len()).collect();
-				order.sort_by_key(|&i| g.hand[i].id);
-				let k = Key::from("cerulean_bell");
-				let pick = order[g.rng.element(&k, order.len())];
-				g.hand[pick].ab.forced_selection = true;
+		if g.blind.kind == Some(BlindKind::FinalBell) && !g.areas.hand.cards.is_empty() {
+			let any = g.areas.hand.cards.iter().any(|c| c.forced_selection);
+			if !any
+				&& let Some(pick) =
+					areas::pick_card(&mut g.rng, "cerulean_bell", &g.areas.hand.cards, |_, _| {
+						true
+					}) {
+				g.areas.hand.cards[pick].forced_selection = true;
 			}
 		}
-		if g.blind.kind == Some(BlindKind::FinalHeart) && g.blind.prepped && !g.jokers.is_empty() {
-			let n = g.jokers.len();
-			let mut cands: Vec<usize> = Vec::new();
-			for i in 0..n {
-				if !g.jokers[i].debuff || n < 2 {
-					cands.push(i);
-				}
-				cards::set_debuff_joker(g, i, false);
+		if g.blind.kind == Some(BlindKind::FinalHeart)
+			&& g.blind.prepped
+			&& !g.areas.jokers.is_empty()
+		{
+			let n = g.areas.jokers.len();
+			// Whether each joker was debuffed is read just before its own
+			// debuff is lifted: lifting an earlier one can lift the others.
+			let mut eligible = vec![false; n];
+			for (i, is_eligible) in eligible.iter_mut().enumerate() {
+				*is_eligible = !g.areas.jokers[i].core.debuff || n < 2;
+				card_lifecycle::set_debuff_joker(g, i, false);
 			}
-			if !cands.is_empty() {
-				cands.sort_by_key(|&i| g.jokers[i].id);
-				let k = Key::from("crimson_heart");
-				let pick = cands[g.rng.element(&k, cands.len())];
-				cards::set_debuff_joker(g, pick, true);
+			let picked = areas::pick_card(&mut g.rng, "crimson_heart", &g.areas.jokers, |i, _| {
+				eligible[i]
+			});
+			if let Some(pick) = picked {
+				card_lifecycle::set_debuff_joker(g, pick, true);
 			}
 		}
 	}
@@ -279,30 +302,77 @@ pub(crate) fn drawn_to_hand(g: &mut Game) {
 }
 
 /// `Blind:stay_flipped(area, card)`.
-pub(crate) fn stay_flipped(g: &mut Game, to: Pile, c: &Card) -> bool {
-	if g.blind.disabled || to != Pile::Hand {
+pub(crate) fn stay_flipped(
+	areas: &Areas, probabilities: f64, round: &Round, blind: &Blind, rng: &mut PseudoRandom,
+	to: Pile, c: &PlayingCard,
+) -> bool {
+	if blind.disabled || to != Pile::Hand {
 		return false;
 	}
-	match g.blind.kind {
+	match blind.kind {
 		Some(BlindKind::Wheel) => {
 			let k = Key::from("wheel");
-			g.rng.random(&k) < g.probabilities / 7.0
+			rng.random(&k) < probabilities / 7.0
 		}
-		Some(BlindKind::House) => g.hands_played_round == 0.0 && g.discards_used == 0.0,
-		Some(BlindKind::Mark) => c.is_face(true, g.pareidolia()),
-		Some(BlindKind::Fish) => g.blind.prepped,
+		Some(BlindKind::House) => round.hands_played == 0.0 && round.discards_used == 0.0,
+		Some(BlindKind::Mark) => c.is_face_from_boss(areas.pareidolia()),
+		Some(BlindKind::Fish) => blind.prepped,
 		_ => false,
 	}
 }
 
 /// `Blind:defeat()` (the parts with game effects).
-pub(crate) fn defeat(g: &mut Game) {
-	for c in &mut g.jokers {
-		c.face_down = false;
+pub(crate) fn defeat(jokers: &mut [Card], blind: &Blind, events: &mut EventQueue) {
+	for c in jokers {
+		c.core.face_down = false;
 	}
-	if g.blind.kind == Some(BlindKind::Manacle) && !g.blind.disabled {
-		cards::change_hand_size(g, 1.0);
+	if blind.kind == Some(BlindKind::Manacle) && !blind.disabled {
+		flow::change_hand_size(events, 1.0);
 	}
 	// `set_blind(nil)` runs at the end of the defeat animation.
-	g.events.push(Ev::BlindReset);
+	events.push(Event::BlindReset);
+}
+
+/// Which table of blind sizes a stake uses (`G.GAME.modifiers.scaling`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BlindScaling {
+	#[default]
+	Base,
+	/// Green Stake and above.
+	Faster,
+	/// Purple Stake and above.
+	Fastest,
+}
+
+/// Base chips required for an ante (`get_blind_amount`).
+#[must_use]
+pub(crate) fn blind_amount(ante: i32, scaling: BlindScaling) -> f64 {
+	const BASE: [f64; 8] = [
+		300.0, 800.0, 2000.0, 5000.0, 11000.0, 20000.0, 35000.0, 50000.0,
+	];
+	const FASTER: [f64; 8] = [
+		300.0, 900.0, 2600.0, 8000.0, 20000.0, 36000.0, 60000.0, 100_000.0,
+	];
+	const FASTEST: [f64; 8] = [
+		300.0, 1000.0, 3200.0, 9000.0, 25000.0, 60000.0, 110_000.0, 200_000.0,
+	];
+	let amounts = match scaling {
+		BlindScaling::Base => &BASE,
+		BlindScaling::Faster => &FASTER,
+		BlindScaling::Fastest => &FASTEST,
+	};
+	let Ok(index) = usize::try_from(ante - 1) else {
+		return 100.0;
+	};
+	if let Some(&amount) = amounts.get(index) {
+		return amount;
+	}
+	// `a * (b + (k * c) ^ d) ^ c` in the game's names: `a` the last listed
+	// amount, `c` the antes past the table.
+	let past = f64::from(ante - num::id(amounts.len()));
+	let power = 1.0 + 0.2 * past;
+	let last = amounts[amounts.len() - 1];
+	let mut amount = (last * (1.6f64 + (0.75f64 * past).powf(power)).powf(past)).floor();
+	amount -= rng::lua_mod(amount, 10f64.powf((amount.log10() - 1.0).floor()));
+	amount
 }

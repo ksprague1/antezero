@@ -14,13 +14,14 @@ mod rows;
 mod vecenv;
 
 use pyo3::prelude::*;
-use sim::obs;
+use sim::obs::{self, OpKind, Zone};
 
 #[pymodule]
 fn antezero_sim(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_class::<game::Game>()?;
 	m.add_class::<vecenv::VecEnv>()?;
 	m.add_function(wrap_pyfunction!(game::backs, m)?)?;
+	m.add_function(wrap_pyfunction!(game::centers, m)?)?;
 	m.add("MAX_TOKENS", obs::MAX_TOKENS)?;
 	m.add("TOK_INT", obs::TOK_INT)?;
 	m.add("TOK_FLOAT", obs::TOK_FLOAT)?;
@@ -29,18 +30,20 @@ fn antezero_sim(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add("MAX_OPS", obs::MAX_OPS)?;
 	m.add("OP_INT", obs::OP_INT)?;
 	m.add("OP_FLOAT", obs::OP_FLOAT)?;
+	m.add("OP_ORDER_GAIN", obs::OP_ORDER_GAIN)?;
+	m.add("ORDER_JOKERS", obs::ORDER_JOKERS)?;
 	m.add("MAX_CANDIDATES", obs::MAX_CANDIDATES)?;
 	m.add("TOK_VOCAB", obs::TOK_VOCAB.to_vec())?;
 	m.add("GLOB_VOCAB", obs::GLOB_VOCAB.to_vec())?;
-	m.add("OP_PLAY_TOP", obs::op::PLAY_TOP)?;
+	m.add("OP_PLAY_TOP", OpKind::PlayTop.id())?;
 	m.add("MAX_HAND", obs::MAX_HAND)?;
-	m.add("N_ZONES", obs::zone::COUNT)?;
+	m.add("N_ZONES", Zone::COUNT)?;
 	m.add("N_CENTERS", obs::center::COUNT)?;
-	m.add("N_OPS_KINDS", obs::op::COUNT)?;
-	m.add("OP_PLAY", obs::op::PLAY)?;
-	m.add("OP_DISCARD", obs::op::DISCARD)?;
-	m.add("OP_MOVE_HAND", obs::op::MOVE_HAND)?;
-	m.add("OP_MOVE_JOKER", obs::op::MOVE_JOKER)?;
+	m.add("N_OPS_KINDS", OpKind::COUNT)?;
+	m.add("OP_PLAY", OpKind::Play.id())?;
+	m.add("OP_DISCARD", OpKind::Discard.id())?;
+	m.add("OP_MOVE_HAND", OpKind::MoveHand.id())?;
+	m.add("OP_MOVE_JOKER", OpKind::MoveJoker.id())?;
 	m.add("PREVIEW_BUDGET", obs::PREVIEW_BUDGET)?;
 	m.add("PREVIEW_SAMPLES", obs::PREVIEW_SAMPLES)?;
 	m.add("PREVIEW_HANDS", obs::PREVIEW_HANDS)?;

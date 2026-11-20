@@ -1,6 +1,3 @@
-"""Offline tests: action/inject codes, harness translation, canon formatting,
-and the parts of the real-game stack that work without the game."""
-
 import importlib.util
 import json
 import os
@@ -65,7 +62,6 @@ INJECT_CORPUS = [
 
 
 def test_codes_match_rust_parsers():
-    """The Python codecs accept exactly what the simulator's parsers accept."""
     az = pytest.importorskip("antezero_sim")
     for code in ACTION_CORPUS:
         g = az.Game("CODES", "b_red", 1)
@@ -89,8 +85,6 @@ def test_codes_match_rust_parsers():
 
 
 def test_generated_tables_match_rust():
-    """Every index of the generated tables names the card the simulator
-    injects for it."""
     az = pytest.importorskip("antezero_sim")
     for i, key in enumerate(_codes.JOKERS):
         g = az.Game("TABLES", "b_red", 1)
@@ -159,8 +153,8 @@ def test_canon_port_matches_rust_on_oracle_dumps():
         oracle.close()
 
 
-def test_harness_tables_match_diff_rs():
-    # sim/oracle/src/diff.rs action_to_lua (1-based indices, cards = mask bits + 1)
+def test_harness_tables_match_the_oracle():
+    # sim/oracle/src/command.rs Command::to_lua (1-based indices, cards = mask bits + 1)
     assert Action.parse("play 30").harness_lua() == "H.act({type='play', cards={2,3,4,5}})"
     assert Action.parse("use 0 0").harness_lua() == "H.act({type='use', index=1, cards={}})"
     assert Action.parse("buy_use 2 1").harness_lua() == "H.act({type='buy_and_use', index=3, cards={1}})"

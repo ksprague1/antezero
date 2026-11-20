@@ -1,243 +1,205 @@
 //! Canonical state from the oracle's JSON dump, and diffing against the
 //! simulator's (see `sim::canon`).
 
+use std::collections::BTreeSet;
+use std::fmt;
+
 pub use sim::canon::{Canon, from_sim};
-use sim::canon::{JOKER_COMMON, b, f, joker_fields, normalize_key};
+use sim::canon::{CanonArea, JokerField, canon_number, normalize_key};
 use sim::data::{HandType, Joker};
 use sim::game::Game;
 
 use crate::json::Json;
 
-fn lua_field(ab: &Json, name: &str) -> String {
-	let v = if let Some(rest) = name.strip_prefix("extra.") {
+/// The game's value at `path` of a joker's `ability` table, `absent` if it
+/// has none.
+fn lua_ability(ab: &Json, path: &str, absent: &str) -> String {
+	let v = if let Some(rest) = path.strip_prefix("extra.") {
 		ab.get("extra").get(rest)
 	} else {
-		ab.get(name)
+		ab.get(path)
 	};
 	match v {
-		Json::Null => {
-			if matches!(name, "eternal" | "rental" | "couponed" | "perishable") {
-				"false".into()
-			} else {
-				"nil".into()
-			}
-		}
-		Json::Bool(x) => b(*x),
-		Json::Num(n) => f(*n),
+		Json::Null => absent.into(),
+		Json::Bool(x) => x.to_string(),
+		Json::Num(n) => canon_number(*n),
 		Json::Str(s) => s.clone(),
 		_ => "?".into(),
 	}
 }
 
-fn lua_card(out: &mut Canon, p: &str, c: &Json, area: &str) {
+fn lua_card(out: &mut Canon, p: &str, c: &Json, area: CanonArea) {
 	let ab = c.get("ability");
-	out.insert(format!("{p}.id"), f(c.get("sort_id").num().unwrap_or(-1.0)));
+	let number = |field: &Json| field.as_f64().map_or("nil".into(), canon_number);
+	out.insert(format!("{p}.id"), number(c.get("sort_id")));
 	out.insert(
 		format!("{p}.key"),
-		normalize_key(c.get("key").str().unwrap_or("?")).to_string(),
+		normalize_key(c.get("key").as_str().unwrap_or("?")).to_string(),
 	);
 	out.insert(
 		format!("{p}.edition"),
-		c.get("edition").str().unwrap_or("nil").to_string(),
+		c.get("edition").as_str().unwrap_or("nil").to_string(),
 	);
-	if !matches!(area, "deck" | "discard") {
-		out.insert(format!("{p}.cost"), f(c.get("cost").num().unwrap_or(-1.0)));
-		out.insert(
-			format!("{p}.sell_cost"),
-			f(c.get("sell_cost").num().unwrap_or(-1.0)),
-		);
+	if area.shows_cost() {
+		out.insert(format!("{p}.cost"), number(c.get("cost")));
+		out.insert(format!("{p}.sell_cost"), number(c.get("sell_cost")));
 	}
-	let set = ab.get("set").str().unwrap_or("");
+	let set = ab.get("set").as_str().unwrap_or("");
 	if set == "Default" || set == "Enhanced" {
 		out.insert(
 			format!("{p}.card"),
-			c.get("card").str().unwrap_or("?").to_string(),
+			c.get("card").as_str().unwrap_or("?").to_string(),
 		);
 		out.insert(
 			format!("{p}.seal"),
-			c.get("seal").str().unwrap_or("nil").to_string(),
+			c.get("seal").as_str().unwrap_or("nil").to_string(),
 		);
-		out.insert(
-			format!("{p}.perma_bonus"),
-			f(ab.get("perma_bonus").num().unwrap_or(0.0)),
-		);
-		if area != "pack" {
-			out.insert(format!("{p}.debuff"), b(c.get("debuff").bool()));
+		out.insert(format!("{p}.perma_bonus"), number(ab.get("perma_bonus")));
+		if area.shows_playing_debuff() {
+			out.insert(format!("{p}.debuff"), c.get("debuff").as_flag().to_string());
 		}
-		if area == "hand" {
+		if area.shows_facing() {
 			out.insert(
 				format!("{p}.facing"),
-				c.get("facing").str().unwrap_or("?").to_string(),
+				c.get("facing").as_str().unwrap_or("?").to_string(),
 			);
-			out.insert(format!("{p}.forced"), b(ab.get("forced_selection").bool()));
+			out.insert(
+				format!("{p}.forced"),
+				ab.get("forced_selection").as_flag().to_string(),
+			);
 		}
 		out.insert(
 			format!("{p}.played_this_ante"),
-			b(ab.get("played_this_ante").bool()),
+			ab.get("played_this_ante").as_flag().to_string(),
 		);
 	}
 	if set == "Joker" {
-		out.insert(format!("{p}.debuff"), b(c.get("debuff").bool()));
-		if area == "jokers" {
+		out.insert(format!("{p}.debuff"), c.get("debuff").as_flag().to_string());
+		if area.shows_facing() {
 			out.insert(
 				format!("{p}.facing"),
-				c.get("facing").str().unwrap_or("?").to_string(),
+				c.get("facing").as_str().unwrap_or("?").to_string(),
 			);
 		}
-		let key = c.get("key").str().unwrap_or("");
-		let fields: &[&str] = Joker::from_key(key).map_or(&[], joker_fields);
-		for name in JOKER_COMMON.iter().chain(fields) {
-			out.insert(format!("{p}.ab.{name}"), lua_field(ab, name));
+		let key = c.get("key").as_str().unwrap_or("");
+		let fields: &[JokerField] = Joker::from_key(key).map_or(&[], JokerField::of);
+		for field in JokerField::COMMON.iter().chain(fields) {
+			let path = field.path();
+			let absent = if field.is_flag() { "false" } else { "nil" };
+			out.insert(format!("{p}.ab.{path}"), lua_ability(ab, path, absent));
 		}
-		if ab.get("perishable").bool() {
+		if ab.get("perishable").as_flag() {
 			out.insert(
 				format!("{p}.ab.perish_tally"),
-				lua_field(ab, "perish_tally"),
+				lua_ability(ab, "perish_tally", "nil"),
 			);
 		}
 	}
 	if set == "Tarot" || set == "Planet" || set == "Spectral" {
-		out.insert(
-			format!("{p}.ab.extra_value"),
-			f(ab.get("extra_value").num().unwrap_or(0.0)),
-		);
+		out.insert(format!("{p}.ab.extra_value"), number(ab.get("extra_value")));
 	}
 }
 
+/// The dump's value at a dotted `path` (`Null` if any part is missing).
+fn at<'a>(j: &'a Json, path: &str) -> &'a Json {
+	path.split('.').fold(j, |j, key| j.get(key))
+}
+
+/// Number fields, compared at their own path (`nil` when absent).
+const NUMBERS: [&str; 39] = [
+	"ante",
+	"round",
+	"dollars",
+	"chips",
+	"hands_left",
+	"discards_left",
+	"reroll_cost",
+	"free_rerolls",
+	"rr_hands",
+	"rr_discards",
+	"rr_reroll_cost",
+	"skips",
+	"interest_cap",
+	"interest_amount",
+	"discount_percent",
+	"bankrupt_at",
+	"probabilities",
+	"shop_joker_max",
+	"tarot_rate",
+	"planet_rate",
+	"edition_rate",
+	"playing_card_rate",
+	"spectral_rate",
+	"joker_limit",
+	"consumable_limit",
+	"hand_limit",
+	"hands_played",
+	"hands_played_round",
+	"discards_used",
+	"unused_discards",
+	"ecto_minus",
+	"starting_deck_size",
+	"round_dollars",
+	"pack_size",
+	"pack_choices",
+	"blind.chips",
+	"blind.dollars",
+	"idol.rank",
+	"mail",
+];
+
+/// String fields, compared at their own path (`nil` when absent).
+const STRINGS: [&str; 14] = [
+	"blind_on_deck",
+	"blind_states.Small",
+	"blind_states.Big",
+	"blind_states.Boss",
+	"blind_choices.Boss",
+	"blind_tags.Small",
+	"blind_tags.Big",
+	"voucher",
+	"last_hand_played",
+	"last_tarot_planet",
+	"most_played",
+	"idol.suit",
+	"ancient",
+	"castle",
+];
+
+/// Flags, compared at their own path (false when absent).
+const FLAGS: [&str; 4] = [
+	"blind.disabled",
+	"won",
+	"boss_rerolled",
+	"gros_michel_extinct",
+];
+
 /// Canonical view of the oracle's JSON dump.
-#[expect(clippy::too_many_lines, reason = "one line per compared field")]
 pub fn from_lua(j: &Json) -> Canon {
 	let mut o = Canon::new();
-	o.insert("state".into(), j.get("state").str().unwrap_or("?").into());
-	let nums = [
-		"ante",
-		"round",
-		"dollars",
-		"chips",
-		"hands_left",
-		"discards_left",
-		"reroll_cost",
-		"free_rerolls",
-		"rr_hands",
-		"rr_discards",
-		"rr_reroll_cost",
-		"skips",
-		"interest_cap",
-		"interest_amount",
-		"discount_percent",
-		"bankrupt_at",
-		"probabilities",
-		"shop_joker_max",
-		"tarot_rate",
-		"planet_rate",
-		"edition_rate",
-		"playing_card_rate",
-		"spectral_rate",
-		"joker_limit",
-		"consumable_limit",
-		"hand_limit",
-		"hands_played",
-		"hands_played_round",
-		"discards_used",
-		"unused_discards",
-		"ecto_minus",
-		"starting_deck_size",
-		"round_dollars",
-		"pack_size",
-	];
-	for k in nums {
-		o.insert(k.into(), j.get(k).num().map_or("nil".into(), f));
+	for path in NUMBERS {
+		o.insert(
+			path.into(),
+			at(j, path).as_f64().map_or("nil".into(), canon_number),
+		);
+	}
+	for path in STRINGS {
+		o.insert(path.into(), at(j, path).as_str().unwrap_or("nil").into());
+	}
+	for path in FLAGS {
+		o.insert(path.into(), at(j, path).as_flag().to_string());
 	}
 	o.insert(
-		"pack_choices".into(),
-		j.get("pack_choices").num().map_or("nil".into(), f),
-	);
-	let bl = j.get("blind");
-	o.insert(
-		"blind.chips".into(),
-		bl.get("chips").num().map_or("nil".into(), f),
-	);
-	o.insert(
-		"blind.dollars".into(),
-		bl.get("dollars").num().map_or("nil".into(), f),
+		"state".into(),
+		j.get("state").as_str().unwrap_or("?").into(),
 	);
 	o.insert(
 		"blind.name".into(),
-		bl.get("name").str().unwrap_or("").into(),
-	);
-	o.insert("blind.disabled".into(), b(bl.get("disabled").bool()));
-	o.insert(
-		"blind_on_deck".into(),
-		j.get("blind_on_deck").str().unwrap_or("nil").into(),
-	);
-	for n in ["Small", "Big", "Boss"] {
-		o.insert(
-			format!("blind_states.{n}"),
-			j.get("blind_states").get(n).str().unwrap_or("nil").into(),
-		);
-	}
-	o.insert(
-		"blind_choices.Boss".into(),
-		j.get("blind_choices")
-			.get("Boss")
-			.str()
-			.unwrap_or("nil")
-			.into(),
-	);
-	o.insert(
-		"blind_tags.Small".into(),
-		j.get("blind_tags")
-			.get("Small")
-			.str()
-			.unwrap_or("nil")
-			.into(),
-	);
-	o.insert(
-		"blind_tags.Big".into(),
-		j.get("blind_tags").get("Big").str().unwrap_or("nil").into(),
-	);
-	o.insert(
-		"voucher".into(),
-		j.get("voucher").str().unwrap_or("nil").into(),
-	);
-	o.insert("won".into(), b(j.get("won").bool()));
-	o.insert("boss_rerolled".into(), b(j.get("boss_rerolled").bool()));
-	o.insert(
-		"gros_michel_extinct".into(),
-		b(j.get("gros_michel_extinct").bool()),
-	);
-	o.insert(
-		"last_hand_played".into(),
-		j.get("last_hand_played").str().unwrap_or("nil").into(),
-	);
-	o.insert(
-		"last_tarot_planet".into(),
-		j.get("last_tarot_planet").str().unwrap_or("nil").into(),
-	);
-	o.insert(
-		"most_played".into(),
-		j.get("most_played").str().unwrap_or("nil").into(),
-	);
-	o.insert(
-		"idol.rank".into(),
-		j.get("idol").get("rank").num().map_or("nil".into(), f),
-	);
-	o.insert(
-		"idol.suit".into(),
-		j.get("idol").get("suit").str().unwrap_or("nil").into(),
-	);
-	o.insert("mail".into(), j.get("mail").num().map_or("nil".into(), f));
-	o.insert(
-		"ancient".into(),
-		j.get("ancient").str().unwrap_or("nil").into(),
-	);
-	o.insert(
-		"castle".into(),
-		j.get("castle").str().unwrap_or("nil").into(),
+		at(j, "blind.name").as_str().unwrap_or("").into(),
 	);
 	o.insert(
 		"sort_mode".into(),
-		j.get("sort_mode").str().unwrap_or("desc").into(),
+		j.get("sort_mode").as_str().unwrap_or("nil").into(),
 	);
 	for h in HandType::ALL {
 		let n = h.name();
@@ -245,34 +207,40 @@ pub fn from_lua(j: &Json) -> Canon {
 		for k in ["level", "chips", "mult", "played", "played_this_round"] {
 			o.insert(
 				format!("hands.{n}.{k}"),
-				l.get(k).num().map_or("nil".into(), f),
+				l.get(k).as_f64().map_or("nil".into(), canon_number),
 			);
 		}
-		o.insert(format!("hands.{n}.visible"), b(l.get("visible").bool()));
+		o.insert(
+			format!("hands.{n}.visible"),
+			l.get("visible").as_flag().to_string(),
+		);
 	}
-	for (i, t) in j.get("tag_info").arr().iter().enumerate() {
-		let key = t.get("key").str().unwrap_or("?");
+	for (i, t) in j.get("tag_info").as_list().iter().enumerate() {
+		let key = t.get("key").as_str().unwrap_or("?");
 		o.insert(format!("tags.{i}.key"), key.into());
-		o.insert(format!("tags.{i}.triggered"), b(t.get("triggered").bool()));
+		o.insert(
+			format!("tags.{i}.triggered"),
+			t.get("triggered").as_flag().to_string(),
+		);
 		if key == "tag_orbital" {
 			o.insert(
 				format!("tags.{i}.orbital"),
-				t.get("orbital").str().unwrap_or("nil").into(),
+				t.get("orbital").as_str().unwrap_or("nil").into(),
 			);
 		}
 	}
 	let uv: Vec<&str> = j
 		.get("used_vouchers")
-		.arr()
+		.as_list()
 		.iter()
-		.filter_map(|v| v.str())
+		.filter_map(|v| v.as_str())
 		.collect();
 	o.insert("used_vouchers".into(), uv.join(","));
 	let mut uj: Vec<&str> = j
 		.get("used_jokers")
-		.arr()
+		.as_list()
 		.iter()
-		.filter_map(|v| v.str())
+		.filter_map(|v| v.as_str())
 		.filter(|k| {
 			(k.starts_with("j_")
 				|| k.starts_with("c_")
@@ -283,113 +251,178 @@ pub fn from_lua(j: &Json) -> Canon {
 		.collect();
 	uj.sort_unstable();
 	o.insert("used_jokers".into(), uj.join(","));
-	let areas = [
-		("hand", "hand"),
-		("deck", "deck"),
-		("discard", "discard"),
-		("jokers", "jokers"),
-		("consumables", "consumables"),
-		("shop_jokers", "shop_jokers"),
-		("shop_vouchers", "shop_vouchers"),
-		("shop_booster", "shop_booster"),
-		("pack", "pack_cards"),
-	];
-	for (name, key) in areas {
-		let v = j.get(key).arr();
+	for area in CanonArea::ALL {
+		// The dump's key for the area: the canonical name but for the pack.
+		let key = match area {
+			CanonArea::Pack => "pack_cards",
+			_ => area.name(),
+		};
+		let v = j.get(key).as_list();
+		let name = area.name();
 		o.insert(format!("{name}.len"), v.len().to_string());
 		for (i, c) in v.iter().enumerate() {
-			lua_card(&mut o, &format!("{name}.{i}"), c, name);
+			lua_card(&mut o, &format!("{name}.{i}"), c, area);
 		}
 	}
-	if let Some(m) = j.get("rng").obj() {
+	if let Some(m) = j.get("rng").as_object() {
 		for (k, v) in m {
 			if k == "seed" || k == "hashed_seed" {
 				continue;
 			}
-			if let Some(n) = v.num() {
-				o.insert(format!("rng.{k}"), f(n));
+			if let Some(n) = v.as_f64() {
+				o.insert(format!("rng.{k}"), canon_number(n));
 			}
 		}
 	}
 	o
 }
 
-/// One difference between the engines: what the simulator and the game hold
-/// at `path`.
+/// One canonical field as both engines hold it (`None` where an engine has
+/// no such field).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field<'a> {
+	pub path: &'a str,
+	pub sim: Option<&'a str>,
+	pub game: Option<&'a str>,
+}
+
+impl Field<'_> {
+	#[must_use]
+	pub fn differs(&self) -> bool {
+		self.sim != self.game
+	}
+
+	#[must_use]
+	pub fn to_diff(&self) -> Diff {
+		Diff {
+			path: self.path.to_string(),
+			sim: self.sim.map(str::to_string),
+			game: self.game.map(str::to_string),
+		}
+	}
+}
+
+impl fmt::Display for Field<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		const MISSING: &str = "<missing>";
+		write!(
+			f,
+			"{}: sim={} game={}",
+			self.path,
+			self.sim.unwrap_or(MISSING),
+			self.game.unwrap_or(MISSING)
+		)
+	}
+}
+
+/// Every field of either canonical state, in path order.
+pub fn fields<'a>(sim: &'a Canon, lua: &'a Canon) -> impl Iterator<Item = Field<'a>> {
+	let paths: BTreeSet<&str> = sim.keys().chain(lua.keys()).map(String::as_str).collect();
+	paths.into_iter().map(|path| Field {
+		path,
+		sim: sim.get(path).map(String::as_str),
+		game: lua.get(path).map(String::as_str),
+	})
+}
+
+/// A field the engines disagree on (see [`Field`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diff {
 	pub path: String,
-	pub sim: String,
-	pub game: String,
+	pub sim: Option<String>,
+	pub game: Option<String>,
 }
 
-impl std::fmt::Display for Diff {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}: sim={} game={}", self.path, self.sim, self.game)
+impl fmt::Display for Diff {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let field = Field {
+			path: &self.path,
+			sim: self.sim.as_deref(),
+			game: self.game.as_deref(),
+		};
+		fmt::Display::fmt(&field, f)
 	}
 }
 
 /// The differences between the two canonical states.
 #[must_use]
 pub fn diff(sim: &Canon, lua: &Canon) -> Vec<Diff> {
-	let mut out = Vec::new();
 	// The real game pauses on GAME_OVER (pending events never run); only the
 	// outcome itself is comparable.
-	if sim.get("state").map(std::string::String::as_str) == Some("GAME_OVER")
-		|| lua.get("state").map(std::string::String::as_str) == Some("GAME_OVER")
-	{
-		if sim.get("state") != lua.get("state") {
-			out.push(Diff {
-				path: "state".into(),
-				sim: sim["state"].clone(),
-				game: lua["state"].clone(),
-			});
-		}
-		return out;
+	let state = Field {
+		path: "state",
+		sim: sim.get("state").map(String::as_str),
+		game: lua.get("state").map(String::as_str),
+	};
+	if state.sim == Some("GAME_OVER") || state.game == Some("GAME_OVER") {
+		return if state.differs() {
+			vec![state.to_diff()]
+		} else {
+			Vec::new()
+		};
 	}
-	for (k, v) in sim {
-		match lua.get(k) {
-			Some(w) if w == v => {}
-			Some(w) => out.push(Diff {
-				path: k.clone(),
-				sim: v.clone(),
-				game: w.clone(),
-			}),
-			None => out.push(Diff {
-				path: k.clone(),
-				sim: v.clone(),
-				game: "<missing>".into(),
-			}),
-		}
-	}
-	for (k, w) in lua {
-		if !sim.contains_key(k) {
-			out.push(Diff {
-				path: k.clone(),
-				sim: "<missing>".into(),
-				game: w.clone(),
-			});
-		}
-	}
-	out
+	fields(sim, lua)
+		.filter(Field::differs)
+		.map(|field| field.to_diff())
+		.collect()
 }
 
 /// How the current action's timeline differs between the engines.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimelineDiff {
-	/// The order of `pseudoseed` calls, card draws or card removals differs:
-	/// `timeline[i]` with each engine's entries around the first mismatch.
-	Order(Diff),
+	/// The order of `pseudoseed` calls, card draws or card removals differs.
+	Order(OrderDiff),
 	/// Same order, but an entry happened on another frame.
-	Frame(String),
+	Frame(FrameOffset),
 }
 
-/// The oracle's timeline entries for the last command.
+/// The first entry at which the timelines' order differs, with each
+/// engine's entries around it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderDiff {
+	pub index: usize,
+	pub sim: String,
+	pub game: String,
+}
+
+impl fmt::Display for OrderDiff {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"timeline[{}]\n  sim:  {}\n  game: {}",
+			self.index, self.sim, self.game
+		)
+	}
+}
+
+/// The first timeline entry that each engine has on a different frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameOffset {
+	pub sim: String,
+	pub game: String,
+}
+
+impl FrameOffset {
+	/// How many frames after the simulator's entry the game's happened
+	/// (`None` if an entry has no frame number).
+	#[must_use]
+	pub fn frames(&self) -> Option<i64> {
+		let frame = |entry: &str| entry_frame(entry)?.parse::<i64>().ok();
+		Some(frame(&self.game)? - frame(&self.sim)?)
+	}
+}
+
+impl fmt::Display for FrameOffset {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "sim `{}` game `{}`", self.sim, self.game)
+	}
+}
+
 fn lua_trace(lua: &Json) -> Vec<&str> {
 	lua.get("trace")
-		.arr()
+		.as_list()
 		.iter()
-		.filter_map(|j| j.str())
+		.filter_map(|j| j.as_str())
 		.collect()
 }
 
@@ -398,40 +431,51 @@ fn lua_trace(lua: &Json) -> Vec<&str> {
 /// compared once the game is over (the game pauses there).
 #[must_use]
 pub fn timeline_diff(g: &Game, lua: &Json) -> Option<TimelineDiff> {
-	if lua.get("state").str() == Some("GAME_OVER") {
+	if lua.get("state").as_str() == Some("GAME_OVER") {
 		return None;
 	}
 	let sim = g.timeline();
 	let game = lua_trace(lua);
-	let body = |s: &str| {
-		s.split_once(' ')
-			.map(|(_, b)| b.to_string())
-			.unwrap_or_default()
-	};
 	let n = sim.len().max(game.len());
 	for i in 0..n {
-		let a = sim.get(i).map(std::string::String::as_str);
+		let a = sim.get(i).map(String::as_str);
 		let b = game.get(i).copied();
-		if a.map(body) != b.map(body) {
-			let ctx = |v: &dyn Fn(usize) -> Option<String>| {
-				(i.saturating_sub(3)..(i + 3).min(n))
-					.filter_map(|k| v(k).map(|s| format!("[{k}] {s}")))
-					.collect::<Vec<_>>()
-					.join(" | ")
-			};
-			let sa = ctx(&|k| sim.get(k).cloned());
-			let sb = ctx(&|k| game.get(k).map(std::string::ToString::to_string));
-			return Some(TimelineDiff::Order(Diff {
-				path: format!("timeline[{i}]"),
-				sim: sa,
-				game: sb,
+		if a.map(entry_body) != b.map(entry_body) {
+			return Some(TimelineDiff::Order(OrderDiff {
+				index: i,
+				sim: around(i, n, |k| sim.get(k).map(String::as_str)),
+				game: around(i, n, |k| game.get(k).copied()),
 			}));
 		}
 	}
 	sim.iter()
 		.zip(&game)
 		.find(|(a, b)| a.as_str() != **b)
-		.map(|(a, b)| TimelineDiff::Frame(format!("sim `{a}` game `{b}`")))
+		.map(|(a, b)| {
+			TimelineDiff::Frame(FrameOffset {
+				sim: a.clone(),
+				game: (*b).to_string(),
+			})
+		})
+}
+
+/// The entries around the `i`-th of a timeline of `n` (`entry(k)` is the
+/// `k`-th, if there is one), numbered.
+fn around<'a>(i: usize, n: usize, entry: impl Fn(usize) -> Option<&'a str>) -> String {
+	(i.saturating_sub(3)..(i + 3).min(n))
+		.filter_map(|k| entry(k).map(|s| format!("[{k}] {s}")))
+		.collect::<Vec<_>>()
+		.join(" | ")
+}
+
+/// What a timeline entry (`<frame> <what happened>`) says happened: all of
+/// it if it has no frame.
+fn entry_body(entry: &str) -> &str {
+	entry.split_once(' ').map_or(entry, |(_, body)| body)
+}
+
+fn entry_frame(entry: &str) -> Option<&str> {
+	entry.split_once(' ').map(|(frame, _)| frame)
 }
 
 /// Both timelines side by side, `!` marking entries on different frames
@@ -440,12 +484,15 @@ pub fn timeline_diff(g: &Game, lua: &Json) -> Option<TimelineDiff> {
 pub fn timeline_frames(g: &Game, lua: &Json) -> Vec<String> {
 	let sim = g.timeline();
 	let game = lua_trace(lua);
-	let frame = |s: &str| s.split_once(' ').map(|x| x.0.to_string());
 	(0..sim.len().max(game.len()))
 		.map(|i| {
-			let a = sim.get(i).map_or("-", std::string::String::as_str);
+			let a = sim.get(i).map_or("-", String::as_str);
 			let b = game.get(i).copied().unwrap_or("-");
-			let mark = if frame(a) == frame(b) { " " } else { "!" };
+			let mark = if entry_frame(a) == entry_frame(b) {
+				" "
+			} else {
+				"!"
+			};
 			format!("{mark} sim {a:<40} game {b}")
 		})
 		.collect()

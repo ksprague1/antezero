@@ -1,7 +1,7 @@
 """Replay a sim history file in the real game and record the state after
 every step as JSONL.
 
-History format (``sim/oracle/src/diff.rs`` ``Failure::codes``)::
+History format (``sim/oracle/src/difftest.rs`` ``Failure::codes``)::
 
     start <seed> <back_key> <stake>
     <action code>        e.g. "play 30", "buy 1", "pick 1 0"
@@ -23,7 +23,7 @@ headless vanilla oracle and the canonical states are diffed after every step
 
 Examples::
 
-    uv run python -m antezero_bridge.replay .scratch/fail_T0006000_b_blue_2.txt -o out.jsonl
+    uv run python -m antezero_bridge.replay hist.txt -o out.jsonl
     uv run python -m antezero_bridge.replay hist.txt --attach --oracle-cli target/release/ocli.exe
 """
 
@@ -49,7 +49,6 @@ from .launch import FAST, PARITY, attach, launch, save_fingerprint
 
 
 def read_history(path: Path) -> tuple[tuple[str, str, int], list[str]]:
-    """The ``(seed, back, stake)`` of a history file and its step lines."""
     lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()]
     lines = [ln for ln in lines if ln and not ln.startswith("#")]
     head = lines[0].split() if lines else []
@@ -137,7 +136,6 @@ def main(argv: list[str] | None = None) -> int:
     diverged = None
     errors = 0
     t_all = time.monotonic()
-    # Every resource is released (in reverse order) however the replay ends.
     with contextlib.ExitStack() as stack:
         if a.attach:
             try:

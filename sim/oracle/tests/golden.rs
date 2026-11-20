@@ -12,11 +12,15 @@
 //! Re-record after an intended change with `GOLDEN_BLESS=obs` (observation
 //! only; the simulator must still match) or `GOLDEN_BLESS=all`.
 
-use oracle::diff::{Xs, choose, random_inject};
-use sim::data::{ALL_BACKS, Back};
-use sim::game::{Game, Phase};
-use sim::num;
-use sim::obs::{self, ObsMut};
+use std::env::{self, VarError};
+use std::fs;
+use std::path::Path;
+
+use oracle::policy::Policy;
+use sim::data::Back;
+use sim::game::Game;
+use sim::obs::{self, ObsBuf};
+use sim::{Stake, canon, num, rng};
 
 const GAMES: u64 = 200;
 const STEPS: usize = 300;
@@ -25,13 +29,12 @@ struct Fnv(u64);
 
 impl Fnv {
 	fn new() -> Fnv {
-		Fnv(0xcbf2_9ce4_8422_2325)
+		Fnv(rng::FNV_OFFSET_BASIS)
 	}
 
 	fn bytes(&mut self, b: &[u8]) {
 		for &x in b {
-			self.0 ^= u64::from(x);
-			self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+			self.0 = rng::fnv1a(self.0, u64::from(x));
 		}
 	}
 
@@ -41,11 +44,19 @@ impl Fnv {
 	}
 }
 
-/// Fingerprints of the state after a step: (simulator, learning interface).
-fn fingerprint(g: &mut Game, action: &str) -> (u64, u64) {
+/// Fingerprints of the state after a step.
+#[derive(Clone, Copy)]
+struct Fingerprint {
+	/// The simulator: canonical state and timeline.
+	sim: u64,
+	/// The learning interface: observation and ops.
+	obs: u64,
+}
+
+fn fingerprint(g: &mut Game, action: &str) -> Fingerprint {
 	let mut h = Fnv::new();
 	h.str(action);
-	for (k, v) in sim::canon::from_sim(g) {
+	for (k, v) in canon::from_sim(g) {
 		h.str(&k);
 		h.str(&v);
 	}
@@ -54,21 +65,9 @@ fn fingerprint(g: &mut Game, action: &str) -> (u64, u64) {
 	}
 	let sim = h.0;
 	let mut h = Fnv::new();
-	let mut ti = vec![0i32; obs::MAX_TOKENS * obs::TOK_INT];
-	let mut tf = vec![0f32; obs::MAX_TOKENS * obs::TOK_FLOAT];
-	let mut gi = vec![0i32; obs::GLOB_INT];
-	let mut gf = vec![0f32; obs::GLOB_FLOAT];
-	let lay = obs::encode_opts(
-		g,
-		&mut ObsMut {
-			tok_i: &mut ti,
-			tok_f: &mut tf,
-			glob_i: &mut gi,
-			glob_f: &mut gf,
-		},
-		true,
-	);
-	let of = obs::Layout::of(g);
+	let mut buf = ObsBuf::new();
+	let lay = obs::encode_opts(g, &mut buf.as_mut(), /* deck_tokens= */ true);
+	let of = obs::Layout::of(&g.areas, &g.tags);
 	assert!(
 		of == obs::Layout {
 			n_tokens: of.n_tokens,
@@ -76,14 +75,23 @@ fn fingerprint(g: &mut Game, action: &str) -> (u64, u64) {
 		} && of.n_tokens <= lay.n_tokens,
 		"Layout::of {of:?} vs encoded {lay:?}"
 	);
-	for x in ti.iter().chain(&gi) {
+	for x in buf.tok_i.iter().chain(&buf.glob_i) {
 		h.bytes(&x.to_le_bytes());
 	}
-	for x in tf.iter().chain(&gf) {
+	for x in buf.tok_f.iter().chain(&buf.glob_f) {
 		h.bytes(&x.to_bits().to_le_bytes());
 	}
 	let mut ops = Vec::new();
-	obs::ops(g, &lay, 4, &mut ops);
+	obs::ops(
+		g,
+		&lay,
+		obs::OpOptions {
+			candidates: 4,
+			..Default::default()
+		},
+		&mut ops,
+	);
+	obs::order_gain(g, &mut ops);
 	for o in &ops {
 		for x in o.ints() {
 			h.bytes(&x.to_le_bytes());
@@ -92,79 +100,114 @@ fn fingerprint(g: &mut Game, action: &str) -> (u64, u64) {
 			h.bytes(&x.to_bits().to_le_bytes());
 		}
 	}
-	(sim, h.0)
+	Fingerprint { sim, obs: h.0 }
 }
 
-fn play(n: u64) -> Vec<(u64, u64)> {
-	let backs: Vec<Back> = ALL_BACKS
-		.iter()
-		.copied()
-		.filter(|&b| b != Back::Challenge)
-		.collect();
+fn play(n: u64) -> Vec<Fingerprint> {
+	let backs: Vec<Back> = Back::simulated().collect();
 	let back = backs[num::pick(n, backs.len())];
-	let stake = num::byte(num::pick(n, 8)) + 1;
+	let stake = Stake::ALL[num::pick(n, Stake::ALL.len())];
 	let mut g = Game::new_run(&format!("GOLD{n:04}"), back, stake);
-	let mut rng = Xs(n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-	let mut rerolls = 0;
+	let mut policy = Policy::for_game(n, 0.1);
 	let mut out = vec![fingerprint(&mut g, "start")];
 	for _ in 0..STEPS {
-		if g.phase == Phase::GameOver {
-			break;
-		}
-		if g.phase != Phase::Shop {
-			rerolls = 0;
-		}
-		if rng.chance(0.1)
-			&& let Some(inj) = random_inject(&g, &mut rng)
-		{
-			g.inject(&inj);
-			out.push(fingerprint(&mut g, &inj.to_string()));
-			continue;
-		}
-		let Some(a) = choose(&g, &mut rng, &mut rerolls) else {
+		let Some(command) = policy.next(&g) else {
 			break;
 		};
-		g.step(a)
-			.unwrap_or_else(|e| panic!("game {n}: {a:?} rejected: {e}"));
-		out.push(fingerprint(&mut g, &a.to_string()));
+		command
+			.apply(&mut g)
+			.unwrap_or_else(|e| panic!("game {n}: {command:?} rejected: {e}"));
+		out.push(fingerprint(&mut g, &command.to_string()));
 	}
 	out
 }
 
-/// Compares `games` (one fingerprint list per game) with the recording at
-/// `file`, or re-records it; returns the diverging games.
-fn check(file: &str, games: &[Vec<u64>], bless: bool) -> Vec<String> {
+/// A golden file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+	Sim,
+	Obs,
+}
+
+impl Part {
+	fn file(self) -> &'static str {
+		match self {
+			Part::Sim => "golden_sim.txt",
+			Part::Obs => "golden_obs.txt",
+		}
+	}
+
+	fn of(self, f: Fingerprint) -> u64 {
+		match self {
+			Part::Sim => f.sim,
+			Part::Obs => f.obs,
+		}
+	}
+}
+
+/// What `GOLDEN_BLESS` re-records.
+#[derive(Clone, Copy)]
+enum Bless {
+	Nothing,
+	Obs,
+	All,
+}
+
+impl Bless {
+	fn from_env() -> Bless {
+		match env::var("GOLDEN_BLESS") {
+			Err(VarError::NotPresent) => Bless::Nothing,
+			Ok(v) if v.is_empty() => Bless::Nothing,
+			Ok(v) if v == "obs" => Bless::Obs,
+			Ok(v) if v == "all" => Bless::All,
+			other => panic!("GOLDEN_BLESS must be `obs` or `all`, got {other:?}"),
+		}
+	}
+
+	fn records(self, part: Part) -> bool {
+		match self {
+			Bless::Nothing => false,
+			Bless::Obs => part == Part::Obs,
+			Bless::All => true,
+		}
+	}
+}
+
+/// Compares `part` of `games` (one fingerprint list per game) with its
+/// recording, or re-records it; returns the diverging games.
+fn check(part: Part, games: &[Vec<Fingerprint>], bless: Bless) -> Vec<String> {
 	use std::fmt::Write;
 
-	let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+	let file = part.file();
+	let path = Path::new(env!("CARGO_MANIFEST_DIR"))
 		.join("tests")
 		.join(file);
 	let mut text = String::new();
 	for (i, v) in games.iter().enumerate() {
-		let hashes: Vec<String> = v.iter().map(|h| format!("{h:016x}")).collect();
+		let hashes: Vec<String> = v.iter().map(|&f| format!("{:016x}", part.of(f))).collect();
 		writeln!(text, "{i} {}", hashes.join(" ")).expect("writing to a String cannot fail");
 	}
-	if bless {
-		std::fs::write(&path, &text).expect("the golden file is writable");
+	if bless.records(part) {
+		fs::write(&path, &text).expect("the golden file is writable");
 		eprintln!(
 			"recorded {file}: {} games, {} steps",
 			games.len(),
-			games.iter().map(std::vec::Vec::len).sum::<usize>()
+			games.iter().map(Vec::len).sum::<usize>()
 		);
 		return Vec::new();
 	}
-	let want = std::fs::read_to_string(&path)
+	let want = fs::read_to_string(&path)
 		.unwrap_or_else(|_| panic!("tests/{file} missing; run with GOLDEN_BLESS=all"));
 	let mut bad = Vec::new();
 	for (i, (got, exp)) in text.lines().zip(want.lines()).enumerate() {
 		if got != exp {
 			let a: Vec<&str> = got.split(' ').skip(1).collect();
 			let b: Vec<&str> = exp.split(' ').skip(1).collect();
-			let step = (0..a.len().max(b.len()))
+			let at = (0..a.len().max(b.len()))
 				.find(|&k| a.get(k) != b.get(k))
-				.unwrap_or(0);
+				.map_or("its game number".to_string(), |step| format!("step {step}"));
 			bad.push(format!(
-				"{file}: game {i} at step {step} (of {} vs {} recorded)",
+				"{file}: game {i} at {at} (of {} vs {} recorded)",
 				a.len(),
 				b.len()
 			));
@@ -178,24 +221,10 @@ fn check(file: &str, games: &[Vec<u64>], bless: bool) -> Vec<String> {
 
 #[test]
 fn golden_trajectories() {
-	let bless = std::env::var("GOLDEN_BLESS").unwrap_or_default();
-	assert!(
-		matches!(bless.as_str(), "" | "obs" | "all"),
-		"GOLDEN_BLESS must be `obs` or `all`"
-	);
-	let games: Vec<Vec<(u64, u64)>> = (0..GAMES).map(play).collect();
-	let part = |f: fn(&(u64, u64)) -> u64| {
-		games
-			.iter()
-			.map(|v| v.iter().map(f).collect())
-			.collect::<Vec<Vec<u64>>>()
-	};
-	let mut bad = check("golden_sim.txt", &part(|h| h.0), bless == "all");
-	bad.extend(check(
-		"golden_obs.txt",
-		&part(|h| h.1),
-		bless == "obs" || bless == "all",
-	));
+	let bless = Bless::from_env();
+	let games: Vec<Vec<Fingerprint>> = (0..GAMES).map(play).collect();
+	let mut bad = check(Part::Sim, &games, bless);
+	bad.extend(check(Part::Obs, &games, bless));
 	assert!(
 		bad.is_empty(),
 		"{} games diverge from the golden trajectories: {}",

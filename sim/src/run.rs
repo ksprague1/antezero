@@ -1,369 +1,483 @@
 //! `Game:start_run` / `init_game_object` / `Back:apply_to_run`.
 
+use std::error::Error;
+use std::fmt;
+use std::ops::RangeInclusive;
+
+use crate::blind::{BlindScaling, CardDebuff};
 use crate::card::Kind;
-use crate::consumables::CEv;
 use crate::data::{
-	ACE, Back, BlindKind, CenterSet, Enhancement, HandType, JACK, KING, P_CARDS_SORTED, QUEEN,
-	Rank, Spectral, Suit, Tarot, Voucher, rank_char,
+	Back, Enhancement, HandType, P_CARDS_SORTED, Rank, Spectral, Suit, Tarot, Voucher,
 };
-use crate::ev::Ev;
-use crate::events::{EventQueue, St};
+use crate::enum_sets::{CenterSet, PlanetSet, VoucherSet};
+use crate::event::Event;
+use crate::event_queue::EventQueue;
 use crate::game::{
-	Area, Blind, BlindSlot, BlindStatus, CardSet, Game, HandLevel, IdolCard, Limit, MailRank,
-	Modifiers, PackSlot, Phase, StartingParams,
+	Areas, Blind, BlindSelect, BlindSlot, Flow, Game, HandLevel, HandLevels, Limit, PackState,
+	PerBlind, Round, Shop, State, Tags,
 };
+use crate::pools::{NewCard, OwnedArea, VoucherRoll};
 use crate::rng::{Key, PseudoRandom};
-use crate::{blind, cards, events, flow, num, pools, round_end, shop};
+use crate::round::JokerTargets;
+use crate::shop::VoucherSource;
+use crate::{blind, card_lifecycle, event_queue, flow, num, pools, round_end, shop};
 
 /// Longest supported seed (the game's own seeds have 8 characters; stream
 /// keys are the stream name followed by the seed).
 pub const MAX_SEED_LEN: usize = 32;
 
+/// The numbers of the stakes, from White (1) to Gold (8).
+pub const STAKES: RangeInclusive<u8> = Stake::White as u8..=Stake::Gold as u8;
+
+/// A stake. Each has the rules of the ones below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Stake {
+	White = 1,
+	Red = 2,
+	Green = 3,
+	Black = 4,
+	Blue = 5,
+	Purple = 6,
+	Orange = 7,
+	Gold = 8,
+}
+
+impl Stake {
+	/// Every stake, from White to Gold.
+	pub const ALL: [Stake; 8] = [
+		Stake::White,
+		Stake::Red,
+		Stake::Green,
+		Stake::Black,
+		Stake::Blue,
+		Stake::Purple,
+		Stake::Orange,
+		Stake::Gold,
+	];
+}
+
+impl From<Stake> for u8 {
+	/// The stake's number, from 1 (White) to 8 (Gold).
+	fn from(stake: Stake) -> u8 {
+		stake as u8
+	}
+}
+
+impl TryFrom<u8> for Stake {
+	type Error = InvalidStake;
+
+	/// The stake numbered `n`.
+	///
+	/// # Errors
+	///
+	/// Returns [`InvalidStake`] if `n` is not in [`STAKES`].
+	fn try_from(n: u8) -> Result<Stake, InvalidStake> {
+		Stake::ALL
+			.into_iter()
+			.find(|&s| u8::from(s) == n)
+			.ok_or(InvalidStake(n))
+	}
+}
+
+/// A stake number outside [`STAKES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidStake(pub u8);
+
+impl fmt::Display for InvalidStake {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "stake {} is not in {STAKES:?}", self.0)
+	}
+}
+
+impl Error for InvalidStake {}
+
 /// See [`Game::new_run`].
-pub(crate) fn new_run(seed: &str, back: Back, stake: u8) -> Game {
+pub(crate) fn new_run(seed: &str, back: Back, stake: Stake) -> Game {
 	assert!(
 		seed.len() <= MAX_SEED_LEN,
-		"seed longer than {MAX_SEED_LEN} bytes"
+		"seed is {} bytes, longer than {MAX_SEED_LEN}",
+		seed.len()
 	);
-	assert!((1..=8).contains(&stake), "stake {stake} is not 1..=8");
 	let mut g = blank(seed, back, stake);
-	events::begin_action(&mut g);
+	event_queue::begin_action(&mut g.rng, &mut g.events);
 	start_run(&mut g);
-	events::run_queue(&mut g);
+	event_queue::run_queue(&mut g);
 	g
 }
 
-#[expect(
-	clippy::too_many_lines,
-	reason = "one line per field of the game state"
-)]
-fn blank(seed: &str, back: Back, stake: u8) -> Game {
-	let mut hands = [HandLevel {
-		level: 1.0,
-		chips: 0.0,
-		mult: 0.0,
-		played: 0.0,
-		played_this_round: 0.0,
-		visible: false,
-	}; 12];
-	for h in HandType::ALL {
+/// The poker hands at level 1 (`G.GAME.hands` of a new run).
+fn starting_hands() -> HandLevels {
+	HandLevels(HandType::ALL.map(|h| {
 		let base = h.base();
-		hands[h as usize] = HandLevel {
+		HandLevel {
 			level: 1.0,
 			chips: base.chips,
 			mult: base.mult,
 			played: 0.0,
 			played_this_round: 0.0,
 			visible: base.visible,
-		};
+		}
+	}))
+}
+
+/// The stake's and the deck's changes to the rules.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Modifiers {
+	pub no_blind_reward: PerBlind<bool>,
+	pub scaling: BlindScaling,
+	pub enable_eternals_in_shop: bool,
+	pub enable_perishables_in_shop: bool,
+	pub enable_rentals_in_shop: bool,
+	pub no_interest: bool,
+	pub money_per_hand: Option<f64>,
+	pub money_per_discard: Option<f64>,
+}
+
+/// What the deck starts the run with (`G.GAME.starting_params`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartingParams {
+	pub dollars: f64,
+	pub hand_size: f64,
+	pub discards: f64,
+	pub hands: f64,
+	pub reroll_cost: f64,
+	pub joker_slots: f64,
+	pub ante_scaling: f64,
+	pub consumable_slots: f64,
+	pub no_faces: bool,
+	pub erratic_suits_and_ranks: bool,
+}
+
+impl Default for StartingParams {
+	fn default() -> Self {
+		StartingParams {
+			dollars: 4.0,
+			hand_size: 8.0,
+			discards: 3.0,
+			hands: 4.0,
+			reroll_cost: 5.0,
+			joker_slots: 5.0,
+			ante_scaling: 1.0,
+			consumable_slots: 2.0,
+			no_faces: false,
+			erratic_suits_and_ranks: false,
+		}
 	}
+}
+
+/// What the run was started with (deck, stake and the stake's modifiers)
+/// and the switches the caller sets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Setup {
+	pub back: Back,
+	pub stake: Stake,
+	pub modifiers: Modifiers,
+	pub starting_params: StartingParams,
+	pub win_ante: i32,
+	/// Keep playing after winning ("Endless mode"); otherwise the run is
+	/// terminal once the winning round is evaluated.
+	pub endless: bool,
+	/// Round ×Mult like Steamodded, which the real game runs under the bridge
+	/// (see `scoring::apply_x_mult`); off, like vanilla and the oracle.
+	pub steamodded: bool,
+}
+
+/// The run's progress and economy (`G.GAME`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Run {
+	pub ante: i32,
+	pub round: i32,
+	pub dollars: f64,
+	/// Dollars a joker has earned but not paid yet (`G.GAME.dollar_buffer`).
+	pub dollar_buffer: f64,
+	pub interest_cap: f64,
+	pub interest_amount: f64,
+	pub bankrupt_at: f64,
+	pub rental_rate: f64,
+	pub perishable_rounds: f64,
+	pub ecto_minus: f64,
+	pub probabilities: f64,
+	pub hands_played: f64,
+	pub unused_discards: f64,
+	pub skips: f64,
+	pub starting_deck_size: f64,
+	/// Blinds defeated or skipped so far (progress measure for agents).
+	pub blinds_cleared: u32,
+	/// `G.GAME.won`: set at the end of the final boss's round, whether it was
+	/// won or lost; [`Game::run_won`] tells whether the run was won.
+	pub won: bool,
+	/// `G.GAME.win_notified`: the run was won.
+	pub(crate) win_notified: bool,
+	pub last_hand_score: f64,
+}
+
+impl Default for Run {
+	fn default() -> Run {
+		Run {
+			ante: 1,
+			round: 0,
+			dollars: 0.0,
+			dollar_buffer: 0.0,
+			interest_cap: 25.0,
+			interest_amount: 1.0,
+			bankrupt_at: 0.0,
+			rental_rate: 3.0,
+			perishable_rounds: 5.0,
+			ecto_minus: 1.0,
+			probabilities: 1.0,
+			hands_played: 0.0,
+			unused_discards: 0.0,
+			skips: 0.0,
+			starting_deck_size: 52.0,
+			blinds_cleared: 0,
+			won: false,
+			win_notified: false,
+			last_hand_score: 0.0,
+		}
+	}
+}
+
+impl Run {
+	/// `base .. ante`.
+	#[inline]
+	pub(crate) fn key_ante(&self, base: &str) -> Key {
+		let mut k = Key::from(base);
+		k.push_int(i64::from(self.ante));
+		k
+	}
+
+	/// `base .. append .. ante`.
+	#[inline]
+	pub(crate) fn key_append_ante(&self, base: &str, append: &str) -> Key {
+		let mut k = Key::from(base);
+		k.push(append).push_int(i64::from(self.ante));
+		k
+	}
+}
+
+/// What the run has used, for the pools and the jokers that count it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct History {
+	pub used_jokers: CenterSet,
+	pub used_vouchers: VoucherSet,
+	pub planets_used: PlanetSet,
+	pub gros_michel_extinct: bool,
+	pub consumable_usage_tarot: f64,
+	pub consumable_usage_planet: f64,
+	pub consumable_usage_spectral: f64,
+	pub last_tarot_planet: Option<Kind>,
+	pub last_hand_played: Option<HandType>,
+}
+
+fn blank(seed: &str, back: Back, stake: Stake) -> Game {
 	Game {
 		rng: PseudoRandom::new(seed),
-		back,
-		stake,
-		modifiers: Modifiers::default(),
-		starting_params: StartingParams::default(),
-		phase: Phase::BlindSelect,
-		won: false,
-		endless: false,
-		blinds_cleared: 0,
-		win_notified: false,
-		pause_rest: false,
-		scored: false,
-		hand_text_cleared: false,
-		next_sort_id: 0,
-		deck: Vec::with_capacity(64),
-		hand: Vec::with_capacity(16),
-		play: Vec::with_capacity(8),
-		discard: Vec::with_capacity(64),
-		jokers: Vec::with_capacity(8),
-		consumables: Vec::with_capacity(4),
-		shop_jokers: Vec::with_capacity(4),
-		shop_vouchers: Vec::with_capacity(2),
-		shop_boosters: Vec::with_capacity(2),
-		pack_cards: Vec::with_capacity(5),
-		joker_limit: Limit::new(5.0),
-		consumable_limit: Limit::new(2.0),
-		hand_limit: Limit::new(8.0),
-		hand_sort_by_suit: false,
-		pack: None,
-		ante: 1,
-		blind_ante: 1,
-		win_ante: 8,
-		round: 0,
-		dollars: 0.0,
-		chips: 0.0,
-		hands_left: 0.0,
-		discards_left: 0.0,
-		hands_played_round: 0.0,
-		discards_used: 0.0,
-		hands_played: 0.0,
-		unused_discards: 0.0,
-		skips: 0.0,
-		reroll_cost: 5.0,
-		reroll_cost_increase: 0.0,
-		free_rerolls: 0.0,
-		used_packs: [PackSlot::Unrolled; 2],
-		current_voucher: None,
-		voucher_seen: false,
-		rearranges: 0,
-		allow_skip: true,
-		steamodded: false,
-		idol_card: IdolCard {
-			rank: ACE,
-			suit: Suit::Spades,
-			id: None,
-		},
-		mail_rank: MailRank {
-			rank: ACE,
-			id: None,
-		},
-		ancient_suit: Some(Suit::Spades),
-		castle_suit: Suit::Spades,
-		most_played_hand: HandType::HighCard,
-		round_dollars: 0.0,
-		rr_hands: 1.0,
-		rr_discards: 1.0,
-		rr_reroll_cost: 1.0,
-		temp_reroll_cost: None,
-		temp_handsize: None,
-		blind_states: [
-			BlindStatus::Select,
-			BlindStatus::Upcoming,
-			BlindStatus::Upcoming,
-		],
-		boss_choice: BlindKind::Small,
-		blind_tags: [None, None],
-		boss_rerolled: false,
-		selected_blind: None,
-		blind_on_deck: None,
-		round_bonus_next_hands: 0.0,
-		round_bonus_discards: 0.0,
-		hands,
-		probabilities: 1.0,
-		bosses_used: [0; 30],
-		used_jokers: CenterSet::default(),
-		used_vouchers: 0,
-		banned: CenterSet::default(),
-		banned_tags: 0,
-		banned_blinds: 0,
-		gros_michel_extinct: false,
-		planets_used: 0,
-		consumable_usage_tarot: 0.0,
-		consumable_usage_planet: 0.0,
-		consumable_usage_spectral: 0.0,
-		last_tarot_planet: None,
-		last_hand_played: None,
-		tags: Vec::new(),
-		next_tag_id: 0,
-		shop_joker_max: 2.0,
-		edition_rate: 1.0,
-		joker_rate: 20.0,
-		tarot_rate: 4.0,
-		planet_rate: 4.0,
-		spectral_rate: 0.0,
-		playing_card_rate: 0.0,
-		consumeable_buffer: 0.0,
-		joker_buffer: 0.0,
-		dollar_buffer: 0.0,
-		discount_percent: 0.0,
-		interest_cap: 25.0,
-		interest_amount: 1.0,
-		bankrupt_at: 0.0,
-		perishable_rounds: 5.0,
-		rental_rate: 3.0,
-		ecto_minus: 1.0,
-		pack_size: 2,
-		pack_choices: 0,
-		first_shop_buffoon: false,
-		orbital_choices: Vec::new(),
-		shop_free: false,
-		shop_d6ed: false,
-		starting_deck_size: 52.0,
-		last_blind_boss: false,
-		facing_blind: false,
-		blind: Blind::empty(),
-		state: St::BlindSelect,
-		state_complete: false,
 		events: EventQueue::new(),
-		consumed: Vec::new(),
-		in_flight: None,
-		pending_highlight: Vec::new(),
-		pack_interrupt: None,
-		end_round_pending: false,
-		burnt_hand: None,
-		shop_open: false,
-		shop_exists_at_open: false,
-		ankh_deletable: Vec::new(),
-		last_scoring: Vec::new(),
-		last_hand_score: 0.0,
+		setup: Setup {
+			back,
+			stake,
+			modifiers: Modifiers::default(),
+			starting_params: StartingParams::default(),
+			win_ante: 8,
+			endless: false,
+			steamodded: false,
+		},
+		flow: Flow::default(),
+		areas: Areas::default(),
+		run: Run::default(),
+		history: History::default(),
+		round: Round::default(),
+		blind_select: BlindSelect::default(),
+		blind: Blind::default(),
+		shop: Shop::default(),
+		pack: PackState::default(),
+		hands: starting_hands(),
+		tags: Tags::default(),
 	}
 }
 
 fn start_run(g: &mut Game) {
-	let stake = g.stake;
-	if stake >= 2 {
-		g.modifiers.no_blind_reward[BlindSlot::Small as usize] = true;
+	let stake = g.setup.stake;
+	if stake >= Stake::Red {
+		g.setup.modifiers.no_blind_reward[BlindSlot::Small] = true;
 	}
-	if stake >= 3 {
-		g.modifiers.scaling = 2;
+	if stake >= Stake::Green {
+		g.setup.modifiers.scaling = BlindScaling::Faster;
 	}
-	if stake >= 4 {
-		g.modifiers.enable_eternals_in_shop = true;
+	if stake >= Stake::Black {
+		g.setup.modifiers.enable_eternals_in_shop = true;
 	}
-	if stake >= 5 {
-		g.starting_params.discards -= 1.0;
+	if stake >= Stake::Blue {
+		g.setup.starting_params.discards -= 1.0;
 	}
-	if stake >= 6 {
-		g.modifiers.scaling = 3;
+	if stake >= Stake::Purple {
+		g.setup.modifiers.scaling = BlindScaling::Fastest;
 	}
-	if stake >= 7 {
-		g.modifiers.enable_perishables_in_shop = true;
+	if stake >= Stake::Orange {
+		g.setup.modifiers.enable_perishables_in_shop = true;
 	}
-	if stake >= 8 {
-		g.modifiers.enable_rentals_in_shop = true;
+	if stake >= Stake::Gold {
+		g.setup.modifiers.enable_rentals_in_shop = true;
 	}
-	apply_back(g);
+	apply_back(
+		&mut g.setup,
+		&mut g.history,
+		&mut g.round,
+		&mut g.shop,
+		&mut g.events,
+	);
 
-	let sp = g.starting_params;
-	g.rr_hands = sp.hands;
-	g.rr_discards = sp.discards;
-	g.dollars = sp.dollars;
-	g.rr_reroll_cost = sp.reroll_cost;
-	g.reroll_cost = sp.reroll_cost;
+	let sp = g.setup.starting_params;
+	g.round.base_hands = sp.hands;
+	g.round.base_discards = sp.discards;
+	g.run.dollars = sp.dollars;
+	g.shop.base_reroll_cost = sp.reroll_cost;
+	g.shop.reroll_cost = sp.reroll_cost;
 
-	g.boss_choice = pools::get_new_boss(g);
-	g.current_voucher = Some(pools::get_next_voucher(g, false));
-	g.blind_tags[0] = Some(pools::get_next_tag(g, ""));
-	g.blind_tags[1] = Some(pools::get_next_tag(g, ""));
+	g.blind_select.boss = pools::get_new_boss(
+		g.setup.win_ante,
+		g.run.ante,
+		&mut g.blind_select,
+		&mut g.rng,
+	);
+	g.shop.voucher = Some(pools::get_next_voucher(
+		&g.areas,
+		&g.run,
+		&g.history,
+		&mut g.rng,
+		VoucherRoll::Ante,
+	));
+	g.blind_select.skip_tags.small = Some(pools::get_next_tag(&g.run, &mut g.rng));
+	g.blind_select.skip_tags.big = Some(pools::get_next_tag(&g.run, &mut g.rng));
 
-	g.consumable_limit = Limit::new(sp.consumable_slots);
-	g.joker_limit = Limit::new(sp.joker_slots);
-	g.hand_limit = Limit::new(sp.hand_size);
+	g.areas.limits.consumables = Limit::new(sp.consumable_slots);
+	g.areas.limits.jokers = Limit::new(sp.joker_slots);
+	g.areas.hand.limit = Limit::new(sp.hand_size);
 
 	// Deck: card prototypes sorted by `P_CARDS` key ("C_2" < ... < "S_T").
-	let mut protos: Vec<(Suit, Rank)> = Vec::with_capacity(52);
+	let mut protos: Vec<(Suit, Rank)> = Vec::with_capacity(P_CARDS_SORTED.len());
 	for &(s, r) in &P_CARDS_SORTED {
 		let (s, r) = if sp.erratic_suits_and_ranks {
-			let i = g.rng.element_str("erratic", 52);
-			P_CARDS_SORTED[i]
+			pools::random_front(&mut g.rng, &Key::from("erratic"))
 		} else {
 			(s, r)
 		};
-		if sp.no_faces && matches!(r, JACK | QUEEN | KING) {
+		if sp.no_faces && r.is_face() {
 			continue;
 		}
 		protos.push((s, r));
 	}
-	protos.sort_by_key(|&(s, r)| (s.letter(), rank_char(r)));
+	protos.sort_by_key(|&(s, r)| (s.letter(), r.letter()));
 	for (s, r) in protos {
-		let mut c = cards::make_playing_card(g, s, r, Enhancement::Base);
-		c.face_down = true;
-		g.deck.insert(0, c);
+		let mut c = card_lifecycle::make_playing_card(
+			&mut g.areas,
+			g.run.hands_played,
+			g.shop.discount_percent,
+			s,
+			r,
+			Enhancement::Base,
+		);
+		c.core.face_down = true;
+		g.areas.deck.insert(0, c);
 	}
-	g.starting_deck_size = num::float(g.playing_card_count());
+	g.run.starting_deck_size = num::float(g.areas.playing_card_count());
 	g.events.delay(0.5);
 
-	g.discards_left = g.rr_discards;
-	g.hands_left = g.rr_hands;
+	g.round.discards_left = g.round.base_discards;
+	g.round.hands_left = g.round.base_hands;
 	let k = Key::from("shuffle");
-	flow::shuffle_deck(g, &k);
-	pools::reset_idol_card(g);
-	pools::reset_mail_rank(g);
-	g.ancient_suit = None;
-	pools::reset_ancient_card(g);
-	pools::reset_castle_card(g);
+	flow::shuffle_area(&mut g.areas.deck, &mut g.rng, &k);
+	g.round
+		.reset_joker_targets(&g.areas, &g.run, &mut g.rng, JokerTargets::RunStart);
 	blind::set_blind(g, None);
-	round_end::reset_blinds(g);
+	round_end::reset_blinds(
+		g.setup.win_ante,
+		g.run.ante,
+		&mut g.blind_select,
+		&mut g.rng,
+	);
 	// unlock_notify
-	g.events.push(Ev::Wait);
+	g.events.push(Event::Wait);
 
-	g.state = St::BlindSelect;
-	g.state_complete = false;
+	g.flow.state = State::BlindSelect;
+	g.flow.state_complete = false;
+}
+
+/// A voucher the deck starts with.
+fn deck_voucher(history: &mut History, round: &mut Round, events: &mut EventQueue, v: Voucher) {
+	history.used_vouchers.insert(v);
+	shop::apply_voucher(round, events, v, VoucherSource::Deck);
 }
 
 /// `Back:apply_to_run()`.
-fn apply_back(g: &mut Game) {
-	use Back as B;
-	let b = g.back;
-	let voucher = |g: &mut Game, v: Voucher| {
-		g.set_voucher_used(v);
-		shop::apply_voucher(g, v, true);
-	};
-	match b {
-		B::Magic => voucher(g, Voucher::CrystalBall),
-		B::Nebula => voucher(g, Voucher::Telescope),
-		_ => {}
-	}
-	if b == B::Blue {
-		g.starting_params.hands += 1.0;
-	}
-	if b == B::Black {
-		g.starting_params.hands += -1.0;
-	}
-	match b {
-		B::Magic => {
+fn apply_back(
+	setup: &mut Setup, history: &mut History, round: &mut Round, shop: &mut Shop,
+	events: &mut EventQueue,
+) {
+	let params = &mut setup.starting_params;
+	let deck_card =
+		|kind: Kind| Event::Create(NewCard::forced(kind, OwnedArea::Consumables, "deck"));
+	match setup.back {
+		Back::Red => params.discards += 1.0,
+		Back::Blue => params.hands += 1.0,
+		Back::Yellow => params.dollars += 10.0,
+		Back::Green => {
+			setup.modifiers.no_interest = true;
+			setup.modifiers.money_per_hand = Some(2.0);
+			setup.modifiers.money_per_discard = Some(1.0);
+		}
+		Back::Black => {
+			params.hands -= 1.0;
+			params.joker_slots += 1.0;
+		}
+		Back::Magic => {
+			deck_voucher(history, round, events, Voucher::CrystalBall);
 			for _ in 0..2 {
-				g.events.push(Ev::Create {
-					set: CardSet::Tarot,
-					area: Area::Consumables,
-					forced: Some(Kind::Tarot(Tarot::Fool)),
-					append: "deck",
-					rarity: None,
-					legendary: false,
-				});
+				events.push(deck_card(Kind::Tarot(Tarot::Fool)));
 			}
 		}
-		B::Ghost => g.events.push(Ev::Create {
-			set: CardSet::Tarot,
-			area: Area::Consumables,
-			forced: Some(Kind::Spectral(Spectral::Hex)),
-			append: "deck",
-			rarity: None,
-			legendary: false,
-		}),
-		_ => {}
-	}
-	if b == B::Yellow {
-		g.starting_params.dollars += 10.0;
-	}
-	if b == B::Abandoned {
-		g.starting_params.no_faces = true;
-	}
-	if b == B::Ghost {
-		g.spectral_rate = 2.0;
-	}
-	if b == B::Red {
-		g.starting_params.discards += 1.0;
-	}
-	if b == B::Zodiac {
-		for v in [
-			Voucher::TarotMerchant,
-			Voucher::PlanetMerchant,
-			Voucher::OverstockNorm,
-		] {
-			voucher(g, v);
+		Back::Nebula => {
+			deck_voucher(history, round, events, Voucher::Telescope);
+			params.consumable_slots -= 1.0;
 		}
-	}
-	if b == B::Checkered {
-		g.events.push(Ev::Consumable(CEv::Checkered));
-	}
-	if b == B::Erratic {
-		g.starting_params.erratic_suits_and_ranks = true;
-	}
-	match b {
-		B::Black => g.starting_params.joker_slots += 1.0,
-		B::Painted => {
-			g.starting_params.joker_slots += -1.0;
-			g.starting_params.hand_size += 2.0;
+		Back::Ghost => {
+			events.push(deck_card(Kind::Spectral(Spectral::Hex)));
+			shop.spectral_rate = 2.0;
 		}
-		B::Plasma => g.starting_params.ante_scaling = 2.0,
-		B::Nebula => g.starting_params.consumable_slots += -1.0,
-		B::Green => {
-			g.modifiers.no_interest = true;
-			g.modifiers.money_per_hand = Some(2.0);
-			g.modifiers.money_per_discard = Some(1.0);
+		Back::Abandoned => params.no_faces = true,
+		Back::Checkered => events.push(Event::CheckeredDeck),
+		Back::Zodiac => {
+			for v in [
+				Voucher::TarotMerchant,
+				Voucher::PlanetMerchant,
+				Voucher::OverstockNorm,
+			] {
+				deck_voucher(history, round, events, v);
+			}
 		}
-		_ => {}
+		Back::Painted => {
+			params.joker_slots -= 1.0;
+			params.hand_size += 2.0;
+		}
+		Back::Plasma => params.ante_scaling = 2.0,
+		Back::Erratic => params.erratic_suits_and_ranks = true,
+		Back::Anaglyph | Back::Challenge => {}
+	}
+}
+
+/// Checkered Deck: Clubs become Spades and Diamonds become Hearts.
+pub(crate) fn checkered_deck(areas: &mut Areas, blind: &Blind) {
+	let debuff = CardDebuff::new(blind, &areas.jokers);
+	for c in &mut areas.deck {
+		let to = match c.suit {
+			Suit::Clubs => Some(Suit::Spades),
+			Suit::Diamonds => Some(Suit::Hearts),
+			_ => None,
+		};
+		if let Some(s) = to {
+			c.set_base(s, c.rank);
+			debuff.apply(c);
+		}
 	}
 }

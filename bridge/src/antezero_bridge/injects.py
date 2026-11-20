@@ -51,8 +51,6 @@ def rank_char(r: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Inject:
-    """A parsed injection: ``kind`` + the oracle harness table."""
-
     code: str
     kind: str  # joker | consumable | card | dollars | voucher
     table: dict[str, Any]
@@ -104,11 +102,10 @@ class Inject:
         return Inject(code, t["kind"], t)
 
     def harness(self) -> dict[str, Any]:
-        """``H.inject`` table (nil fields dropped)."""
         return {k: v for k, v in self.table.items() if v is not None}
 
     def harness_lua(self) -> str:
-        """The exact ``H.inject{...}`` Lua command (as diff.rs inject_to_lua)."""
+        """The exact ``H.inject{...}`` Lua command (as command.rs ``Command::to_lua``)."""
         return f"H.inject({lua_table(self.table)})"
 
     def balatrobot(self, dollars_now: float | None = None) -> tuple[str, dict[str, Any]] | None:

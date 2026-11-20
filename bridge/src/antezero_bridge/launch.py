@@ -108,7 +108,6 @@ class LaunchConfig:
 
 
 PARITY = LaunchConfig()
-"""Settings for sim-parity replays (dt 1/60, GAMESPEED 1, fps cap 2000)."""
 
 FAST = LaunchConfig(fast=True, headless=True, render_on_api=False)
 """BalatroBot ``--fast --headless`` (GAMESPEED 10, dt 4.99/60, no fps cap):
@@ -169,7 +168,6 @@ def install_companion_mod(src: Path = MOD_SRC, mods_dir: Path = MODS_DIR) -> Pat
 
 
 def check_stack() -> dict[str, object]:
-    """What is installed where (no side effects)."""
     def mod_version(name: str, manifest: str) -> str | None:
         m = MODS_DIR / name / manifest
         if not m.exists():
@@ -208,8 +206,6 @@ def save_fingerprint() -> dict[str, str]:
 
 
 class GameProcess:
-    """A running Balatro + BalatroBot + companion instance."""
-
     def __init__(self, cfg: LaunchConfig, proc: subprocess.Popen, log_path: Path):
         self.cfg = cfg
         self.proc = proc
@@ -294,7 +290,6 @@ def _launch(cfg: LaunchConfig, install: bool) -> GameProcess:
 
 
 def attach(port: int = DEFAULT_PORT) -> BridgeClient:
-    """A client of a game that is already running (with the companion)."""
     c = BridgeClient(port=port)
     if not c.health():
         c.close()

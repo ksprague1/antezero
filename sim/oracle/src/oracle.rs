@@ -1,11 +1,15 @@
-//! The oracle: a live `LuaJIT` state, optionally running the Balatro harness,
-//! and where its DLL and scripts are found.
-
+use std::env;
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+
+use crate::lua::State;
+
+/// The harness' entry point: it evaluates one Lua expression (see `lua/harness.lua`).
+const HARNESS_ENTRY: &CStr = c"oracle";
 
 #[must_use]
 pub fn default_dll() -> PathBuf {
-	if let Ok(p) = std::env::var("BALATRO_LUA51") {
+	if let Some(p) = env::var_os("BALATRO_LUA51") {
 		return PathBuf::from(p);
 	}
 	PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Balatro\lua51.dll")
@@ -13,7 +17,7 @@ pub fn default_dll() -> PathBuf {
 
 #[must_use]
 pub fn default_src() -> PathBuf {
-	if let Ok(p) = std::env::var("BALATRO_SRC") {
+	if let Some(p) = env::var_os("BALATRO_SRC") {
 		return PathBuf::from(p);
 	}
 	Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/balatro")
@@ -46,7 +50,7 @@ pub fn lua_str(s: &str) -> String {
 		match b {
 			b'"' => out.push_str("\\\""),
 			b'\\' => out.push_str("\\\\"),
-			0x20..=0x7e => out.push(b as char),
+			0x20..=0x7e => out.push(char::from(b)),
 			// Control and non-ASCII bytes as decimal escapes (byte exact).
 			_ => write!(out, "\\{b:03}").expect("writing to a String cannot fail"),
 		}
@@ -55,10 +59,17 @@ pub fn lua_str(s: &str) -> String {
 	out
 }
 
+/// The path `p` as a Lua string literal, with forward slashes (which Lua's
+/// `dofile` and `package.path` take on Windows too).
+#[must_use]
+pub fn lua_path(p: &Path) -> String {
+	lua_str(&p.display().to_string().replace('\\', "/"))
+}
+
 /// A live `LuaJIT` state, optionally running the Balatro harness.
+#[derive(Debug)]
 pub struct Oracle {
-	#[cfg(windows)]
-	lua: crate::lua::State,
+	lua: State,
 }
 
 impl Oracle {
@@ -67,17 +78,10 @@ impl Oracle {
 	/// # Errors
 	///
 	/// Returns why the DLL could not be loaded or the state not created.
-	pub fn raw() -> Result<Self, String> {
-		#[cfg(windows)]
-		{
-			Ok(Oracle {
-				lua: crate::lua::State::new(&default_dll())?,
-			})
-		}
-		#[cfg(not(windows))]
-		{
-			Err("the oracle needs Windows (it runs the game's lua51.dll)".into())
-		}
+	pub fn new_bare() -> Result<Self, String> {
+		Ok(Oracle {
+			lua: State::new(&default_dll())?,
+		})
 	}
 
 	/// Loads the full headless game harness.
@@ -86,12 +90,11 @@ impl Oracle {
 	///
 	/// Returns why the DLL or the harness could not be loaded.
 	pub fn new() -> Result<Self, String> {
-		let o = Self::raw()?;
-		let dir = |p: PathBuf| lua_str(&p.display().to_string().replace('\\', "/"));
+		let mut o = Self::new_bare()?;
 		let boot = format!(
 			"HARNESS_SRC = {}\nHARNESS_DIR = {}\npackage.path = HARNESS_DIR..'/?.lua;'..HARNESS_SRC..'/?.lua;'..package.path\nrequire('harness')",
-			dir(default_src()),
-			dir(lua_dir())
+			lua_path(&default_src()),
+			lua_path(&lua_dir())
 		);
 		o.exec(&boot)?;
 		Ok(o)
@@ -102,16 +105,8 @@ impl Oracle {
 	/// # Errors
 	///
 	/// Returns the Lua error message.
-	pub fn exec(&self, code: &str) -> Result<(), String> {
-		#[cfg(windows)]
-		{
-			self.lua.exec(code)
-		}
-		#[cfg(not(windows))]
-		{
-			let _ = code;
-			unreachable!("no oracle off Windows")
-		}
+	pub fn exec(&mut self, code: &str) -> Result<(), String> {
+		self.lua.exec(code)
 	}
 
 	/// Evaluates a Lua chunk that returns a string (or a number; `nil`
@@ -120,33 +115,18 @@ impl Oracle {
 	/// # Errors
 	///
 	/// Returns the Lua error message, or what the chunk returned instead.
-	pub fn eval(&self, code: &str) -> Result<String, String> {
-		#[cfg(windows)]
-		{
-			self.lua.eval(code)
-		}
-		#[cfg(not(windows))]
-		{
-			let _ = code;
-			unreachable!("no oracle off Windows")
-		}
+	pub fn eval(&mut self, code: &str) -> Result<String, String> {
+		self.lua.eval(code)
 	}
 
-	/// Calls the global function `name(arg)` and returns its string result
-	/// (as [`eval`](Self::eval)).
+	/// Evaluates the harness expression `expr` (such as `H.act{...}`) and
+	/// returns its string result (as [`eval`](Self::eval)), with a traceback
+	/// on errors.
 	///
 	/// # Errors
 	///
-	/// Returns the Lua error message, or what the function returned instead.
-	pub fn call(&self, name: &str, arg: &str) -> Result<String, String> {
-		#[cfg(windows)]
-		{
-			self.lua.call(name, arg)
-		}
-		#[cfg(not(windows))]
-		{
-			let _ = (name, arg);
-			unreachable!("no oracle off Windows")
-		}
+	/// Returns the Lua error message, or what the expression returned instead.
+	pub fn command(&mut self, expr: &str) -> Result<String, String> {
+		self.lua.call(HARNESS_ENTRY, expr)
 	}
 }

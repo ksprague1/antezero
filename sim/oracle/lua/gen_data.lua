@@ -42,7 +42,6 @@ function GEN()
   w('use super::data::{BackDef, BlindDef, BoosterDef, ConsumableDef, Enhancement, HandType, JokerDef, PackKind, TagDef, VoucherDef};')
   w('')
 
-  -- Jokers
   local J = G.P_CENTER_POOLS.Joker
   w('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]')
   w('#[repr(u8)]')
@@ -92,7 +91,6 @@ function GEN()
   consumable_set('Planet', 'Planet')
   consumable_set('Spectral', 'Spectral')
 
-  -- Vouchers
   local V = G.P_CENTER_POOLS.Voucher
   w('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]')
   w('#[repr(u8)]')
@@ -111,7 +109,6 @@ function GEN()
   w('];')
   w('')
 
-  -- Boosters
   local B = G.P_CENTER_POOLS.Booster
   w('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]')
   w('#[repr(u8)]')
@@ -129,7 +126,6 @@ function GEN()
   w('];')
   w('')
 
-  -- Tags
   local T = G.P_CENTER_POOLS.Tag
   w('#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]')
   w('#[repr(u8)]')
@@ -147,7 +143,7 @@ function GEN()
   w('];')
   w('')
 
-  -- Blinds (sorted by key, which is the order pseudorandom_element uses)
+  -- Sorted by key, which is the order pseudorandom_element uses.
   local keys = {}
   for k, v in pairs(G.P_BLINDS) do keys[#keys+1] = k end
   table.sort(keys)
@@ -168,7 +164,6 @@ function GEN()
   w('];')
   w('')
 
-  -- Backs
   local K = G.P_CENTER_POOLS.Back
   local backs = {}
   for _, v in ipairs(K) do backs[#backs+1] = v end

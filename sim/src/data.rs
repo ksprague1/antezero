@@ -1,7 +1,13 @@
 //! Static game data: enums, prototype definitions and the orderings the game
 //! uses when sampling. Large tables live in the generated `data_gen.rs`.
 
-pub use crate::data_gen::*;
+pub use crate::data_gen::{
+	ALL_BACKS, ALL_BLINDS, ALL_BOOSTERS, ALL_JOKERS, ALL_PLANETS, ALL_SPECTRALS, ALL_TAGS,
+	ALL_TAROTS, ALL_VOUCHERS, BACK_DEFS, BLIND_DEFS, BOOSTER_DEFS, Back, BlindKind, Booster,
+	JOKER_COUNT, JOKER_DEFS, Joker, PLANET_DEFS, Planet, RARITY_POOL_1, RARITY_POOL_2,
+	RARITY_POOL_3, RARITY_POOL_4, SPECTRAL_DEFS, Spectral, TAG_DEFS, TAROT_DEFS, TagKind, Tarot,
+	VOUCHER_DEFS, Voucher,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
@@ -38,13 +44,7 @@ impl Suit {
 
 	#[must_use]
 	pub fn from_name(s: &str) -> Option<Suit> {
-		Some(match s {
-			"Spades" => Suit::Spades,
-			"Hearts" => Suit::Hearts,
-			"Clubs" => Suit::Clubs,
-			"Diamonds" => Suit::Diamonds,
-			_ => return None,
-		})
+		Suit::ALL.into_iter().find(|suit| suit.name() == s)
 	}
 
 	/// `base.suit_nominal`.
@@ -78,79 +78,151 @@ impl Suit {
 	}
 }
 
-/// Card ranks use the game's `base.id` values: 2..=10, J=11, Q=12, K=13, A=14.
-pub type Rank = u8;
-pub const JACK: Rank = 11;
-pub const QUEEN: Rank = 12;
-pub const KING: Rank = 13;
-pub const ACE: Rank = 14;
-
-/// `base.nominal` (chip value) for a rank.
-#[inline]
-#[must_use]
-pub fn rank_nominal(r: Rank) -> f64 {
-	match r {
-		2..=10 => f64::from(r),
-		JACK | QUEEN | KING => 10.0,
-		_ => 11.0,
-	}
+/// A card rank; the discriminant is the game's `base.id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Rank {
+	Two = 2,
+	Three,
+	Four,
+	Five,
+	Six,
+	Seven,
+	Eight,
+	Nine,
+	Ten,
+	Jack,
+	Queen,
+	King,
+	Ace,
 }
 
-/// `base.face_nominal`.
-#[inline]
-#[must_use]
-pub fn rank_face_nominal(r: Rank) -> f64 {
-	match r {
-		JACK => 0.1,
-		QUEEN => 0.2,
-		KING => 0.3,
-		ACE => 0.4,
-		_ => 0.0,
-	}
-}
+impl Rank {
+	/// Every rank, from the 2 up to the Ace: the list the game's rank rolls
+	/// index.
+	pub const ALL: [Rank; 13] = [
+		Rank::Two,
+		Rank::Three,
+		Rank::Four,
+		Rank::Five,
+		Rank::Six,
+		Rank::Seven,
+		Rank::Eight,
+		Rank::Nine,
+		Rank::Ten,
+		Rank::Jack,
+		Rank::Queen,
+		Rank::King,
+		Rank::Ace,
+	];
+	/// The face ranks, in [`Rank::ALL`] order.
+	pub const FACES: [Rank; 3] = [Rank::Jack, Rank::Queen, Rank::King];
+	/// The numbered ranks, from the 2 up to the 10, in [`Rank::ALL`] order.
+	pub const NUMBERED: [Rank; 9] = [
+		Rank::Two,
+		Rank::Three,
+		Rank::Four,
+		Rank::Five,
+		Rank::Six,
+		Rank::Seven,
+		Rank::Eight,
+		Rank::Nine,
+		Rank::Ten,
+	];
 
-/// The `P_CARDS` key suffix character for a rank.
-#[must_use]
-pub fn rank_char(r: Rank) -> u8 {
-	match r {
-		2..=9 => b'0' + r,
-		10 => b'T',
-		JACK => b'J',
-		QUEEN => b'Q',
-		KING => b'K',
-		_ => b'A',
+	/// `base.id`: 2 to 10, then Jack 11, Queen 12, King 13 and Ace 14.
+	#[inline]
+	#[must_use]
+	pub const fn id(self) -> u8 {
+		self as u8
 	}
-}
 
-/// `base.value` strings (used by the `Pillar/cards_played` bookkeeping and the oracle).
-#[must_use]
-pub fn rank_value(r: Rank) -> &'static str {
-	match r {
-		2 => "2",
-		3 => "3",
-		4 => "4",
-		5 => "5",
-		6 => "6",
-		7 => "7",
-		8 => "8",
-		9 => "9",
-		10 => "10",
-		JACK => "Jack",
-		QUEEN => "Queen",
-		KING => "King",
-		_ => "Ace",
+	/// The rank's position in [`Rank::ALL`].
+	#[inline]
+	#[must_use]
+	pub const fn index(self) -> usize {
+		self as usize - Rank::Two as usize
+	}
+
+	/// The rank with the `base.id` `id`.
+	#[must_use]
+	pub fn from_id(id: u8) -> Option<Rank> {
+		Rank::ALL.get(usize::from(id).checked_sub(2)?).copied()
+	}
+
+	#[inline]
+	#[must_use]
+	pub fn is_face(self) -> bool {
+		Rank::FACES.contains(&self)
+	}
+
+	/// `base.nominal` (chip value).
+	#[inline]
+	#[must_use]
+	pub fn nominal(self) -> f64 {
+		match self {
+			Rank::Jack | Rank::Queen | Rank::King => 10.0,
+			Rank::Ace => 11.0,
+			pip => f64::from(pip.id()),
+		}
+	}
+
+	/// `base.face_nominal`.
+	#[inline]
+	#[must_use]
+	pub fn face_nominal(self) -> f64 {
+		match self {
+			Rank::Jack => 0.1,
+			Rank::Queen => 0.2,
+			Rank::King => 0.3,
+			Rank::Ace => 0.4,
+			_ => 0.0,
+		}
+	}
+
+	/// The `P_CARDS` key suffix character.
+	#[must_use]
+	pub fn letter(self) -> u8 {
+		match self {
+			Rank::Ten => b'T',
+			Rank::Jack => b'J',
+			Rank::Queen => b'Q',
+			Rank::King => b'K',
+			Rank::Ace => b'A',
+			pip => b'0' + pip.id(),
+		}
+	}
+
+	/// Strength's rank: one higher, and a 2 for an Ace.
+	#[must_use]
+	pub fn raised(self) -> Rank {
+		Rank::ALL[(usize::from(self.id()) - 1) % Rank::ALL.len()]
 	}
 }
 
 /// `G.P_CARDS` sorted by key (`"C_2" < ... < "S_T"`), the order
 /// `pseudorandom_element(G.P_CARDS, ...)` samples from.
-pub const P_CARDS_SORTED: [(Suit, Rank); 52] = {
-	const RANKS: [Rank; 13] = [2, 3, 4, 5, 6, 7, 8, 9, ACE, JACK, KING, QUEEN, 10];
+pub const P_CARDS_SORTED: [(Suit, Rank); Suit::ALL.len() * Rank::ALL.len()] = {
+	const RANKS: [Rank; Rank::ALL.len()] = [
+		Rank::Two,
+		Rank::Three,
+		Rank::Four,
+		Rank::Five,
+		Rank::Six,
+		Rank::Seven,
+		Rank::Eight,
+		Rank::Nine,
+		Rank::Ace,
+		Rank::Jack,
+		Rank::King,
+		Rank::Queen,
+		Rank::Ten,
+	];
 	const SUITS: [Suit; 4] = [Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades];
-	let mut out = [(Suit::Clubs, 2u8); 52];
+	let mut out = [(Suit::Clubs, Rank::Two); Suit::ALL.len() * Rank::ALL.len()];
 	let mut i = 0;
-	while i < 52 {
-		out[i] = (SUITS[i / 13], RANKS[i % 13]);
+	while i < out.len() {
+		out[i] = (SUITS[i / RANKS.len()], RANKS[i % RANKS.len()]);
 		i += 1;
 	}
 	out
@@ -331,18 +403,7 @@ impl Enhancement {
 
 	#[must_use]
 	pub fn from_key(k: &str) -> Option<Enhancement> {
-		Some(match k {
-			"c_base" => Enhancement::Base,
-			"m_bonus" => Enhancement::Bonus,
-			"m_mult" => Enhancement::Mult,
-			"m_wild" => Enhancement::Wild,
-			"m_glass" => Enhancement::Glass,
-			"m_steel" => Enhancement::Steel,
-			"m_stone" => Enhancement::Stone,
-			"m_gold" => Enhancement::Gold,
-			"m_lucky" => Enhancement::Lucky,
-			_ => return None,
-		})
+		Enhancement::ALL.into_iter().find(|e| e.key() == k)
 	}
 
 	/// `config.bonus` (chips added by the enhancement).
@@ -400,11 +461,11 @@ impl Enhancement {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+/// A card's edition (`card.edition`, which a card without one has `nil`
+/// for: `None` here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Edition {
-	#[default]
-	None = 0,
 	Foil = 1,
 	Holo = 2,
 	Polychrome = 3,
@@ -412,24 +473,64 @@ pub enum Edition {
 }
 
 impl Edition {
-	/// Every edition, by discriminant.
-	pub const ALL: [Edition; 5] = [
-		Edition::None,
+	/// Every edition, in discriminant order.
+	pub const ALL: [Edition; 4] = [
 		Edition::Foil,
 		Edition::Holo,
 		Edition::Polychrome,
 		Edition::Negative,
 	];
+	/// How many numbers [`Edition::id`] gives: one for no edition and one for
+	/// each edition.
+	pub const ID_COUNT: usize = Edition::ALL.len() + 1;
+
+	/// The number of a card's edition in codes and observations: 0 for none,
+	/// else the discriminant (1 to 4).
+	#[inline]
+	#[must_use]
+	pub fn id(edition: Option<Edition>) -> u8 {
+		edition.map_or(0, |e| e as u8)
+	}
+
+	/// The card edition numbered `id` by [`Edition::id`], or `None` if no
+	/// edition has that number.
+	#[must_use]
+	pub fn from_id(id: u8) -> Option<Option<Edition>> {
+		if id == 0 {
+			return Some(None);
+		}
+		Edition::ALL.into_iter().find(|&e| e as u8 == id).map(Some)
+	}
 
 	#[must_use]
-	pub fn name(self) -> Option<&'static str> {
+	pub fn name(self) -> &'static str {
 		match self {
-			Edition::None => None,
-			Edition::Foil => Some("foil"),
-			Edition::Holo => Some("holo"),
-			Edition::Polychrome => Some("polychrome"),
-			Edition::Negative => Some("negative"),
+			Edition::Foil => "foil",
+			Edition::Holo => "holo",
+			Edition::Polychrome => "polychrome",
+			Edition::Negative => "negative",
 		}
+	}
+
+	/// `edition.chips`: what Foil adds to the chips.
+	#[inline]
+	#[must_use]
+	pub fn chips(self) -> Option<f64> {
+		(self == Edition::Foil).then_some(50.0)
+	}
+
+	/// `edition.mult`: what Holographic adds to the mult.
+	#[inline]
+	#[must_use]
+	pub fn mult(self) -> Option<f64> {
+		(self == Edition::Holo).then_some(10.0)
+	}
+
+	/// `edition.x_mult`: what Polychrome multiplies the mult by.
+	#[inline]
+	#[must_use]
+	pub fn x_mult(self) -> Option<f64> {
+		(self == Edition::Polychrome).then_some(1.5)
 	}
 
 	/// Shop price surcharge in `Card:set_cost`.
@@ -437,7 +538,6 @@ impl Edition {
 	#[must_use]
 	pub fn extra_cost(self) -> f64 {
 		match self {
-			Edition::None => 0.0,
 			Edition::Foil => 2.0,
 			Edition::Holo => 3.0,
 			Edition::Polychrome | Edition::Negative => 5.0,
@@ -479,49 +579,66 @@ pub enum PackKind {
 	Buffoon,
 }
 
+/// A joker's prototype (`G.P_CENTERS.j_*`).
 #[derive(Clone, Copy, Debug)]
 pub struct JokerDef {
 	pub key: &'static str,
 	pub name: &'static str,
+	/// The game's rarity code, 1 to 4 (see [`Joker::rarity`]).
 	pub rarity: u8,
 	pub cost: u32,
 	pub perishable_compat: bool,
 	pub eternal_compat: bool,
+	/// The joker is offered only while a playing card has this enhancement.
 	pub enhancement_gate: Option<Enhancement>,
+	/// `no_pool_flag` and `yes_pool_flag` (see [`Joker::pool_flag`]).
 	pub no_pool_flag: Option<&'static str>,
 	pub yes_pool_flag: Option<&'static str>,
 }
 
+/// A tarot's, planet's or spectral card's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct ConsumableDef {
 	pub key: &'static str,
 	pub name: &'static str,
 	pub cost: u32,
+	/// A planet's poker hand (`config.hand_type`; see [`Planet::hand`]).
 	pub hand_type: Option<HandType>,
+	/// `config.max_highlighted` and `config.min_highlighted`, 0 where the
+	/// game has none.
 	pub max_highlighted: u8,
 	pub min_highlighted: u8,
 }
 
+/// A voucher's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct VoucherDef {
 	pub key: &'static str,
 	pub name: &'static str,
 	pub cost: u32,
+	/// The voucher that must be redeemed first.
 	pub requires: Option<Voucher>,
+	/// `config.extra`: the voucher's amount (a discount percent, a rate, a
+	/// number of slots, ...).
 	pub extra: f64,
 }
 
+/// A booster pack's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct BoosterDef {
 	pub key: &'static str,
 	pub name: &'static str,
 	pub kind: PackKind,
 	pub cost: u32,
+	/// The pack's weight in the shop's booster roll.
 	pub weight: f64,
+	/// `config.extra`: the cards the pack shows.
 	pub extra: u8,
+	/// `config.choose`: the cards one may take from it.
 	pub choose: u8,
 }
 
+/// A tag's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct TagDef {
 	pub key: &'static str,
@@ -529,17 +646,22 @@ pub struct TagDef {
 	pub min_ante: i32,
 }
 
+/// A blind's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct BlindDef {
 	pub key: &'static str,
 	pub name: &'static str,
+	/// The reward for beating it.
 	pub dollars: i32,
+	/// Its chips as a multiple of the ante's base amount (`get_blind_amount`).
 	pub mult: f64,
+	/// `boss` and `boss.showdown` (see [`BlindKind::boss`]).
 	pub boss: bool,
 	pub showdown: bool,
 	pub min_ante: i32,
 }
 
+/// A deck's prototype.
 #[derive(Clone, Copy, Debug)]
 pub struct BackDef {
 	pub key: &'static str,
@@ -547,86 +669,264 @@ pub struct BackDef {
 }
 
 macro_rules! def_accessors {
-	($ty:ident, $all:ident, $defs:ident, $def:ty) => {
+	($ty:ident, $all:ident, $defs:ident, $def:ty $(, { $($extra:item)* })?) => {
 		impl $ty {
+			/// The prototype.
 			#[inline]
+			#[must_use]
 			pub fn def(self) -> &'static $def {
 				&$defs[self as usize]
 			}
 
+			/// The prototype's key, e.g. `j_joker`.
 			#[inline]
+			#[must_use]
 			pub fn key(self) -> &'static str {
 				self.def().key
 			}
 
+			/// The name the game's code looks it up by.
 			#[inline]
+			#[must_use]
 			pub fn name(self) -> &'static str {
 				self.def().name
 			}
 
+			/// The variant whose key is `k`.
+			#[must_use]
 			pub fn from_key(k: &str) -> Option<$ty> {
 				$all.iter().copied().find(|x| x.key() == k)
 			}
+
+			$($($extra)*)?
 		}
 	};
 }
 
-def_accessors!(Joker, ALL_JOKERS, JOKER_DEFS, JokerDef);
+def_accessors!(Joker, ALL_JOKERS, JOKER_DEFS, JokerDef, {
+	#[inline]
+	#[must_use]
+	pub fn rarity(self) -> Rarity {
+		JOKER_RARITIES[self as usize]
+	}
+
+	/// What the joker's place in the shop's pool depends on beyond its
+	/// rarity, if anything.
+	#[inline]
+	#[must_use]
+	pub fn pool_flag(self) -> Option<PoolFlag> {
+		JOKER_POOL_FLAGS[self as usize]
+	}
+});
 def_accessors!(Tarot, ALL_TAROTS, TAROT_DEFS, ConsumableDef);
-def_accessors!(Planet, ALL_PLANETS, PLANET_DEFS, ConsumableDef);
+def_accessors!(Planet, ALL_PLANETS, PLANET_DEFS, ConsumableDef, {
+	/// The poker hand the planet levels up.
+	#[inline]
+	#[must_use]
+	pub fn hand(self) -> HandType {
+		PLANET_HANDS[self as usize]
+	}
+
+	#[inline]
+	#[must_use]
+	pub fn for_hand(h: HandType) -> Planet {
+		HAND_PLANETS[h as usize]
+	}
+});
 def_accessors!(Spectral, ALL_SPECTRALS, SPECTRAL_DEFS, ConsumableDef);
 def_accessors!(Voucher, ALL_VOUCHERS, VOUCHER_DEFS, VoucherDef);
-def_accessors!(Booster, ALL_BOOSTERS, BOOSTER_DEFS, BoosterDef);
-def_accessors!(TagKind, ALL_TAGS, TAG_DEFS, TagDef);
-def_accessors!(BlindKind, ALL_BLINDS, BLIND_DEFS, BlindDef);
-def_accessors!(Back, ALL_BACKS, BACK_DEFS, BackDef);
-
-impl Joker {
-	#[inline]
-	#[must_use]
-	pub fn rarity(self) -> u8 {
-		self.def().rarity
-	}
-}
-impl Planet {
-	#[inline]
-	#[must_use]
-	#[expect(
-		clippy::missing_panics_doc,
-		reason = "the generated table gives every planet a hand"
-	)]
-	pub fn hand(self) -> HandType {
-		self.def()
-			.hand_type
-			.expect("every planet levels up one poker hand")
-	}
-
-	#[must_use]
-	#[expect(
-		clippy::missing_panics_doc,
-		reason = "the generated table has a planet for every hand"
-	)]
-	pub fn for_hand(h: HandType) -> Planet {
-		*ALL_PLANETS
-			.iter()
-			.find(|p| p.hand() == h)
-			.expect("every poker hand has its planet")
-	}
-}
-impl Booster {
+def_accessors!(Booster, ALL_BOOSTERS, BOOSTER_DEFS, BoosterDef, {
 	#[inline]
 	#[must_use]
 	pub fn kind(self) -> PackKind {
 		self.def().kind
 	}
-}
-impl BlindKind {
+});
+def_accessors!(TagKind, ALL_TAGS, TAG_DEFS, TagDef, {
+	/// The first ante the tag can come up in, if it has one (`min_ante`,
+	/// which the generated table writes as 0 for `nil`).
+	#[inline]
+	#[must_use]
+	pub fn min_ante(self) -> Option<i32> {
+		match self.def().min_ante {
+			0 => None,
+			ante => Some(ante),
+		}
+	}
+});
+def_accessors!(BlindKind, ALL_BLINDS, BLIND_DEFS, BlindDef, {
+	/// Which antes the blind can be the boss of; `None` for the small and the
+	/// big blind.
+	#[inline]
+	#[must_use]
+	pub fn boss(self) -> Option<Boss> {
+		BLIND_BOSSES[self as usize]
+	}
+
 	#[inline]
 	#[must_use]
 	pub fn is_boss(self) -> bool {
-		self.def().boss
+		self.boss().is_some()
+	}
+});
+def_accessors!(Back, ALL_BACKS, BACK_DEFS, BackDef, {
+	/// Whether the simulator plays this deck: all but the Challenge Deck,
+	/// which needs a challenge's rules.
+	#[inline]
+	#[must_use]
+	pub fn is_simulated(self) -> bool {
+		self != Back::Challenge
+	}
+
+	/// The decks the simulator plays, in the game's order.
+	pub fn simulated() -> impl Iterator<Item = Back> {
+		ALL_BACKS.into_iter().filter(|b| b.is_simulated())
+	}
+});
+
+/// A joker's rarity (1 to 4 in the game's data).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rarity {
+	Common = 1,
+	Uncommon = 2,
+	Rare = 3,
+	Legendary = 4,
+}
+
+impl Rarity {
+	/// The game's rarity number.
+	#[must_use]
+	pub const fn id(self) -> u8 {
+		self as u8
 	}
 }
+
+/// Each joker's rarity, by joker. Built when the crate compiles: a rarity
+/// code the generated table should not have does not build.
+const JOKER_RARITIES: [Rarity; ALL_JOKERS.len()] = {
+	let mut rarities = [Rarity::Common; ALL_JOKERS.len()];
+	let mut i = 0;
+	while i < rarities.len() {
+		rarities[i] = match JOKER_DEFS[i].rarity {
+			1 => Rarity::Common,
+			2 => Rarity::Uncommon,
+			3 => Rarity::Rare,
+			4 => Rarity::Legendary,
+			_ => panic!("a joker in the generated table has a rarity outside 1 to 4"),
+		};
+		i += 1;
+	}
+	rarities
+};
+
+/// A joker's pool flag: the game's only one, `gros_michel_extinct`, which
+/// Gros Michel sets when it goes extinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolFlag {
+	/// Offered only while Gros Michel is not extinct (`no_pool_flag`).
+	GrosMichelAlive,
+	/// Offered only once Gros Michel is extinct (`yes_pool_flag`).
+	GrosMichelExtinct,
+}
+
+/// Each joker's pool flag, by joker. Built when the crate compiles: a flag
+/// other than `gros_michel_extinct` in the generated table does not build.
+const JOKER_POOL_FLAGS: [Option<PoolFlag>; ALL_JOKERS.len()] = {
+	const fn is_gros_michel_extinct(flag: &str) -> bool {
+		let (flag, known) = (flag.as_bytes(), b"gros_michel_extinct".as_slice());
+		if flag.len() != known.len() {
+			return false;
+		}
+		let mut i = 0;
+		while i < flag.len() {
+			if flag[i] != known[i] {
+				return false;
+			}
+			i += 1;
+		}
+		true
+	}
+	let mut flags = [None; ALL_JOKERS.len()];
+	let mut i = 0;
+	while i < flags.len() {
+		flags[i] = match (JOKER_DEFS[i].no_pool_flag, JOKER_DEFS[i].yes_pool_flag) {
+			(None, None) => None,
+			(Some(flag), None) if is_gros_michel_extinct(flag) => Some(PoolFlag::GrosMichelAlive),
+			(None, Some(flag)) if is_gros_michel_extinct(flag) => Some(PoolFlag::GrosMichelExtinct),
+			_ => {
+				panic!("a joker in the generated table has a pool flag the simulator does not know")
+			}
+		};
+		i += 1;
+	}
+	flags
+};
+
+/// Each planet's poker hand (`config.hand_type`), by planet. Built when
+/// the crate compiles: a planet without a hand in the generated table does
+/// not build.
+const PLANET_HANDS: [HandType; ALL_PLANETS.len()] = {
+	let mut hands = [HandType::HighCard; ALL_PLANETS.len()];
+	let mut i = 0;
+	while i < hands.len() {
+		assert!(
+			ALL_PLANETS[i] as usize == i,
+			"`ALL_PLANETS` is in discriminant order"
+		);
+		hands[i] = match PLANET_DEFS[i].hand_type {
+			Some(hand) => hand,
+			None => panic!("a planet in the generated table has no poker hand"),
+		};
+		i += 1;
+	}
+	hands
+};
+
+/// Each poker hand's planet, by hand: the inverse of [`PLANET_HANDS`].
+const HAND_PLANETS: [Planet; HandType::ALL.len()] = {
+	let mut found = [None; HandType::ALL.len()];
+	let mut i = 0;
+	while i < ALL_PLANETS.len() {
+		found[PLANET_HANDS[i] as usize] = Some(ALL_PLANETS[i]);
+		i += 1;
+	}
+	let mut planets = [Planet::Pluto; HandType::ALL.len()];
+	let mut i = 0;
+	while i < planets.len() {
+		planets[i] = match found[i] {
+			Some(planet) => planet,
+			None => panic!("a poker hand has no planet in the generated table"),
+		};
+		i += 1;
+	}
+	planets
+};
+
+/// The antes a boss blind can come up in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boss {
+	/// The antes that are not a multiple of the winning ante.
+	Regular,
+	/// The final boss of every multiple of the winning ante (`boss.showdown`).
+	Showdown,
+}
+
+/// Each blind's boss kind, by blind. Built when the crate compiles: a
+/// showdown blind that is not a boss in the generated table does not build.
+const BLIND_BOSSES: [Option<Boss>; ALL_BLINDS.len()] = {
+	let mut bosses = [None; ALL_BLINDS.len()];
+	let mut i = 0;
+	while i < bosses.len() {
+		bosses[i] = match (BLIND_DEFS[i].boss, BLIND_DEFS[i].showdown) {
+			(false, false) => None,
+			(true, false) => Some(Boss::Regular),
+			(true, true) => Some(Boss::Showdown),
+			(false, true) => panic!("a blind in the generated table is a showdown but no boss"),
+		};
+		i += 1;
+	}
+	bosses
+};
 
 /// Identity of a `G.P_CENTERS` entry as far as `G.GAME.used_jokers` is
 /// concerned (the "no duplicates" bookkeeping covers every created card).
@@ -647,8 +947,9 @@ const PLANET_BASE: usize = TAROT_BASE + ALL_TAROTS.len();
 const SPECTRAL_BASE: usize = PLANET_BASE + ALL_PLANETS.len();
 const VOUCHER_BASE: usize = SPECTRAL_BASE + ALL_SPECTRALS.len();
 const BOOSTER_BASE: usize = VOUCHER_BASE + ALL_VOUCHERS.len();
-const ENHANCED_BASE: usize = BOOSTER_BASE + ALL_BOOSTERS.len();
-pub const CENTER_COUNT: usize = ENHANCED_BASE + 1 + Enhancement::POOL.len();
+/// The centers of cards other than playing cards come first: this many.
+pub(crate) const ENHANCED_BASE: usize = BOOSTER_BASE + ALL_BOOSTERS.len();
+pub const CENTER_COUNT: usize = ENHANCED_BASE + Enhancement::ALL.len();
 
 impl Center {
 	#[inline]
@@ -689,68 +990,4 @@ impl Center {
 			Center::Enhanced(e) => e.key(),
 		}
 	}
-}
-
-/// Fixed-size bitset over [`Center`]s.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct CenterSet([u64; CENTER_COUNT.div_ceil(64)]);
-
-impl CenterSet {
-	#[inline]
-	#[must_use]
-	pub fn contains(&self, c: Center) -> bool {
-		let i = c.index();
-		self.0[i >> 6] >> (i & 63) & 1 == 1
-	}
-
-	#[inline]
-	pub fn insert(&mut self, c: Center) {
-		let i = c.index();
-		self.0[i >> 6] |= 1 << (i & 63);
-	}
-
-	#[inline]
-	pub fn remove(&mut self, c: Center) {
-		let i = c.index();
-		self.0[i >> 6] &= !(1 << (i & 63));
-	}
-}
-
-/// Base chips required for an ante (`get_blind_amount`).
-#[must_use]
-#[expect(
-	clippy::many_single_char_names,
-	reason = "`a`, `b`, `c`, `d` and `k` are the names in `get_blind_amount`"
-)]
-pub fn blind_amount(ante: i32, scaling: u8) -> f64 {
-	const S1: [f64; 8] = [
-		300.0, 800.0, 2000.0, 5000.0, 11000.0, 20000.0, 35000.0, 50000.0,
-	];
-	const S2: [f64; 8] = [
-		300.0, 900.0, 2600.0, 8000.0, 20000.0, 36000.0, 60000.0, 100_000.0,
-	];
-	const S3: [f64; 8] = [
-		300.0, 1000.0, 3200.0, 9000.0, 25000.0, 60000.0, 110_000.0, 200_000.0,
-	];
-	let amounts = match scaling {
-		2 => &S2,
-		3 => &S3,
-		_ => &S1,
-	};
-	if ante < 1 {
-		return 100.0;
-	}
-	if let Some(&amount) = usize::try_from(ante - 1).ok().and_then(|i| amounts.get(i)) {
-		return amount;
-	}
-	let k = 0.75f64;
-	let (a, b, c, d) = (
-		amounts[7],
-		1.6f64,
-		f64::from(ante - 8),
-		1.0 + 0.2 * f64::from(ante - 8),
-	);
-	let mut amount = (a * (b + (k * c).powf(d)).powf(c)).floor();
-	amount -= crate::rng::lua_mod(amount, 10f64.powf((amount.log10() - 1.0).floor()));
-	amount
 }

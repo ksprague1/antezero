@@ -1,14 +1,18 @@
-//! Scored play candidates: previews of the most promising plays over shared
-//! chance scenarios.
+//! Play candidates: a cheap ranking of the legal plays, the shared chance
+//! scenarios they are previewed in, and the [`top_plays`] summary.
 
-use super::MAX_HAND;
-use super::encode::{edition_id, enh_id, seal_id, suit_id};
+use std::collections::HashSet;
+
+use super::digest::CardFace;
+use super::layout::shown_hand;
 use super::preview::PREVIEW_PLAYS;
-use crate::actions::{Action, CardMask};
-use crate::card::{Card, Kind};
-use crate::data::{HandType, Joker, Suit};
-use crate::game::{Game, Phase};
-use crate::{blind, num};
+use crate::actions::Action;
+use crate::card_mask::CardMask;
+use crate::data::{HandType, Joker};
+use crate::game::{Areas, Blind, Game, Hand, HandLevels, Phase, Scratch};
+use crate::hand_eval::EvalFlags;
+use crate::rng::{self, PseudoRandom};
+use crate::{areas, blind, hand_eval, num};
 
 /// Plays previewed per decision for candidates (ranked by a cheap
 /// joker-free estimate first).
@@ -26,19 +30,23 @@ pub struct PlayPreview {
 	pub chance: bool,
 }
 
-/// The preview of playing `mask` now on a copy of the game that uses the
-/// chance scenario `alt` (a reseeded RNG). `None` if the play is not legal.
+/// The preview of playing `mask` now on a copy of the game (made in
+/// `scratch`) that uses the chance scenario `alt` (a reseeded RNG). `None`
+/// if the play is not legal.
 #[must_use]
 pub fn preview_score(
-	g: &Game, mask: CardMask, alt: &crate::rng::PseudoRandom,
+	scratch: &mut Scratch, g: &Game, mask: CardMask, alt: &PseudoRandom,
 ) -> Option<PlayPreview> {
-	let mut c = g.clone();
-	c.rng = alt.clone();
-	let before = c.rng.draws();
-	let score = c.preview_play(mask).ok()?;
+	preview_in(scratch.copy(g, alt), mask)
+}
+
+/// The preview of playing `mask` in `copy`, which is spent on it.
+pub(super) fn preview_in(copy: &mut Game, mask: CardMask) -> Option<PlayPreview> {
+	let before = copy.rng.draws();
+	let score = copy.preview_play(mask).ok()?;
 	Some(PlayPreview {
 		score,
-		chance: c.rng.draws() != before,
+		chance: copy.rng.draws() != before,
 	})
 }
 
@@ -46,45 +54,11 @@ pub fn preview_score(
 /// `seed` and their ids only (not from their current, possibly hidden order).
 fn shuffled_jokers(g: &Game, seed: u64) -> Game {
 	let mut c = g.clone();
-	c.jokers.sort_by_key(|j| j.id);
-	super::digest::splitmix_shuffle(&mut c.jokers, seed);
+	c.areas.jokers.sort_by_key(|j| j.core.id);
+	rng::splitmix_shuffle(&mut c.areas.jokers, seed);
 	c
 }
 
-/// Redeals `v`'s face-down hand cards from the unseen pool (deck + face-down
-/// hand cards) put in a canonical order (visible content only) and shuffled
-/// with `seed`: a world consistent with what the player sees, independent of
-/// the hidden assignment.
-fn redeal_face_down(v: &mut Game, seed: u64) {
-	let down: Vec<usize> = (0..v.hand.len()).filter(|&i| v.hand[i].face_down).collect();
-	if down.is_empty() {
-		return;
-	}
-	let mut pool: Vec<Card> = down.iter().map(|&i| v.hand[i].clone()).collect();
-	pool.append(&mut v.deck);
-	let key = |c: &Card| {
-		(
-			suit_id(c.suit),
-			i32::from(c.rank),
-			enh_id(c.enhancement),
-			edition_id(c.edition),
-			seal_id(c.seal),
-			c.ab.perma_bonus.to_bits(),
-			c.debuff,
-		)
-	};
-	pool.sort_by_key(key);
-	super::digest::splitmix_shuffle(&mut pool, seed);
-	let rest = pool.split_off(down.len());
-	for (mut c, &i) in pool.into_iter().zip(&down) {
-		c.face_down = v.hand[i].face_down;
-		c.ab.wheel_flipped = v.hand[i].ab.wheel_flipped;
-		v.hand[i] = c;
-	}
-	v.deck = rest;
-}
-
-/// A scored play candidate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Candidate {
 	pub mask: CardMask,
@@ -95,7 +69,21 @@ pub struct Candidate {
 	pub p_clear: f64,
 }
 
-/// A play with its cheap estimate (see [`rough_score`]).
+impl Candidate {
+	/// The summary of the play `mask` over the scores it sampled; `need` is
+	/// the chips still needed to clear the blind.
+	fn of(mask: CardMask, scores: &[f64], need: f64) -> Candidate {
+		let n = num::float(scores.len());
+		Candidate {
+			mask,
+			mean: scores.iter().sum::<f64>() / n,
+			min: scores.iter().copied().fold(f64::INFINITY, f64::min),
+			max: scores.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+			p_clear: num::float(scores.iter().filter(|&&s| s >= need).count()) / n,
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Rough {
 	pub mask: CardMask,
@@ -109,105 +97,100 @@ pub(super) struct Rough {
 /// level chips plus the scoring cards' chips, times the hand level mult),
 /// and the play's scoring core: its hand type and scoring cards (plays with
 /// the same core differ only in kickers, which add nothing to the estimate).
-/// Plays the blind makes score nothing get (0, 0), behind every other play.
-pub(super) fn rough_score(g: &Game, mask: CardMask, flags: crate::hand_eval::EvalFlags) -> Rough {
-	// A play has at most 5 cards (stack arrays: this runs for every subset).
-	let (mut idx, mut cards, mut n, mut m) = (
-		[0usize; 5],
-		[&g.hand[mask.trailing_zeros() as usize]; 5],
+/// A play the blind makes score nothing gets an estimate of 0 and no core,
+/// behind every other play.
+pub(super) fn rough_score(
+	areas: &Areas, blind: &Blind, hands: &HandLevels, mask: CardMask, flags: EvalFlags,
+) -> Rough {
+	// Stack arrays as long as the longest play: this runs for every subset.
+	let first = mask.lowest().expect("a play selects a card");
+	let (mut idx, mut cards, mut n) = (
+		[0usize; Hand::HIGHLIGHT_LIMIT],
+		[&areas.hand.cards[first]; Hand::HIGHLIGHT_LIMIT],
 		0,
-		mask,
 	);
-	while m != 0 && n < 5 {
-		let i = m.trailing_zeros() as usize;
-		(idx[n], cards[n]) = (i, &g.hand[i]);
+	for i in mask.indices().take(Hand::HIGHLIGHT_LIMIT) {
+		(idx[n], cards[n]) = (i, &areas.hand.cards[i]);
 		n += 1;
-		m &= m - 1;
 	}
-	let ph = crate::hand_eval::evaluate(&cards[..n], &flags);
-	let nothing = Rough {
-		mask,
-		estimate: 0.0,
-		core: None,
-	};
-	let Some(top) = ph.top else { return nothing };
-	if blind::debuffs_play(g, n, top) {
-		return nothing;
+	let top = hand_eval::evaluate(&cards[..n], flags)
+		.top
+		.expect("a play of at least one card is a hand");
+	if blind::debuffs_play(blind, n, top.hand) {
+		return Rough {
+			mask,
+			estimate: 0.0,
+			core: None,
+		};
 	}
-	let l = &g.hands[top as usize];
+	let l = &hands[top.hand];
 	let mut chips = l.chips;
-	let mut core: CardMask = 0;
-	let splash = g.has_joker(Joker::Splash);
+	let mut core = CardMask::EMPTY;
+	let splash = areas.has_joker(Joker::Splash);
 	for (k, c) in cards[..n].iter().enumerate() {
-		if splash || ph.top_mask >> k & 1 == 1 || c.is_stone() {
+		if splash || top.mask >> k & 1 == 1 || c.is_stone() {
 			chips += c.chip_bonus();
-			core |= 1 << idx[k];
+			core.insert(idx[k]);
 		}
 	}
 	Rough {
 		mask,
 		estimate: chips * l.mult,
-		core: Some((top, core)),
+		core: Some((top.hand, core)),
 	}
 }
 
-/// The `n` plays worth simulating, from `(estimate, play, core)` (see
-/// `rough_score`): the smallest play of each scoring core first, best
-/// estimate first, then the other plays by estimate. Ranked by the estimate
+/// The `n` plays worth simulating, from their [`rough_score`]s: the smallest
+/// play of each scoring core first, best estimate first, then the other
+/// plays by estimate. Ranked by the estimate
 /// alone, kicker variants of one core fill the budget and crowd out the plays
 /// that hold cards back (Steel cards, Baron, Mime, Shoot the Moon).
 pub(super) fn shortlist(mut plays: Vec<Rough>, n: usize) -> Vec<CardMask> {
 	plays.sort_by(|a, b| {
 		b.estimate
-			.partial_cmp(&a.estimate)
-			.unwrap_or(std::cmp::Ordering::Equal)
-			.then(a.mask.count_ones().cmp(&b.mask.count_ones()))
+			.total_cmp(&a.estimate)
+			.then(a.mask.len().cmp(&b.mask.len()))
 			.then(a.mask.cmp(&b.mask))
 	});
-	let mut seen = std::collections::HashSet::new();
+	let mut seen = HashSet::new();
 	let (mut out, rest): (Vec<_>, Vec<_>) = plays.into_iter().partition(|p| seen.insert(p.core));
 	out.extend(rest);
 	out.truncate(n);
 	out.into_iter().map(|p| p.mask).collect()
 }
 
-pub(super) fn has_kind(g: &Game, j: Joker) -> bool {
-	g.jokers.iter().any(|c| c.kind == Kind::Joker(j))
-}
-
 /// Two jokers pay for what is no longer held, so their best play often
 /// carries kickers that no scoring core has: Blackboard (every card held is
 /// black) and Raised Fist (the lowest rank held). With them, the plays to
-/// try beside `cores` (the best scoring cores of `v`'s hand, best first):
+/// try beside `cores` (the best scoring cores of the hand, best first):
 /// for Blackboard the best two that can take every card that is not black
 /// along, for Raised Fist the best two with the lowest ranks added.
-pub(super) fn kicker_plays(v: &Game, cores: &[CardMask], nh: usize) -> Vec<CardMask> {
+pub(super) fn kicker_plays(areas: &Areas, cores: &[CardMask], nh: usize) -> Vec<CardMask> {
 	let (board, fist) = (
-		has_kind(v, Joker::Blackboard),
-		has_kind(v, Joker::RaisedFist),
+		areas.owns_joker(Joker::Blackboard),
+		areas.owns_joker(Joker::RaisedFist),
 	);
 	if !(board || fist) {
 		return Vec::new();
 	}
-	let smeared = v.eval_flags().smeared;
-	let black = |c: &Card| {
-		c.is_suit(Suit::Clubs, false, true, smeared)
-			|| c.is_suit(Suit::Spades, false, true, smeared)
-	};
-	let red = (0..nh)
-		.filter(|&i| !black(&v.hand[i]))
-		.fold(0u32, |m, i| m | 1 << i);
+	let smeared = areas.smeared();
+	let red: CardMask = (0..nh)
+		.filter(|&i| !areas.hand.cards[i].is_black(smeared))
+		.collect();
 	let mut low: Vec<usize> = (0..nh).collect();
-	low.sort_by_key(|&i| (v.hand[i].is_stone(), v.hand[i].rank, i));
+	low.sort_by_key(|&i| (areas.hand.cards[i].is_stone(), areas.hand.cards[i].rank, i));
 	let with_low = |m: CardMask| {
-		low.iter()
-			.filter(|&&i| m >> i & 1 == 0)
-			.take(5usize.saturating_sub(m.count_ones() as usize))
-			.fold(m, |m, &i| m | 1 << i)
+		let add: CardMask = low
+			.iter()
+			.copied()
+			.filter(|&i| !m.contains(i))
+			.take(Hand::HIGHLIGHT_LIMIT.saturating_sub(m.len()))
+			.collect();
+		m | add
 	};
 	let clears = cores
 		.iter()
-		.filter(|&&m| board && (red & !m).count_ones() + m.count_ones() <= 5)
+		.filter(|&&m| board && (red & !m).len() + m.len() <= Hand::HIGHLIGHT_LIMIT)
 		.take(2)
 		.map(|&m| m | red);
 	clears
@@ -220,76 +203,120 @@ pub(super) fn kicker_plays(v: &Game, cores: &[CardMask], nh: usize) -> Vec<CardM
 		.collect()
 }
 
-/// The `k` best plays (by probability of clearing the blind, then mean
-/// score) over shared chance scenarios. Plays are first ranked by a cheap
-/// estimate and only the best `PREVIEW_BUDGET` are simulated, once each;
-/// the `PREVIEW_REFINE` best plays whose score depended on chance are then
-/// simulated on `PREVIEW_SAMPLES` scenarios in total (the same scenarios for
-/// every play, seeded from visible state only, so they differ between
-/// decisions but not between candidates or under `resample_hidden`), and
-/// the other chance plays are dropped (a single sample is not a fair
-/// estimate). Nothing is previewed while hand cards are face down (the
-/// preview would reveal them). Face-down jokers (Amber Acorn) hide only
-/// their order: each scenario plays them in its own shuffle of a canonical
-/// order, so every play is a chance play and the hidden order stays hidden.
-#[expect(
-	clippy::too_many_lines,
-	reason = "one pass from ranking to refined candidates"
-)]
-pub fn top_plays(g: &Game, k: usize) -> Vec<Candidate> {
-	if k == 0 || g.phase != Phase::Round {
-		return Vec::new();
+/// The chance scenarios a decision's plays are previewed in: the same
+/// scenarios for every play, seeded from visible state only, so they differ
+/// between decisions but not between candidates or under `resample_hidden`.
+#[derive(Debug)]
+pub struct Scenarios<'game> {
+	g: &'game Game,
+	/// The reseeded RNG of each scenario.
+	alts: Vec<PseudoRandom>,
+	/// With something face down, each scenario's own world: face-down hand
+	/// cards redealt from the unseen pool, face-down jokers (which hide
+	/// only their order) in a shuffle of a canonical order. Else empty.
+	views: Vec<Game>,
+}
+
+impl<'game> Scenarios<'game> {
+	/// The first `samples` scenarios of `g`'s decision.
+	#[must_use]
+	pub fn new(g: &'game Game, samples: usize) -> Scenarios<'game> {
+		// The hand as the player sees it (card ids are hidden state).
+		let hand_id = g
+			.areas
+			.hand
+			.cards
+			.iter()
+			.fold(rng::FNV_OFFSET_BASIS, |h, c| {
+				let seen = if c.core.face_down {
+					[99, 0, 0, 0, 0, 0, 0]
+				} else {
+					let face = CardFace::of(c);
+					[
+						u64::from(face.suit) + 1,
+						u64::from(face.rank),
+						u64::from(face.enhancement),
+						u64::from(face.edition),
+						u64::from(face.seal),
+						u64::from(c.core.debuff),
+						face.perma_bonus,
+					]
+				};
+				seen.into_iter().fold(h, rng::fnv1a)
+			});
+		let base = format!(
+			"PV{}~{}~{}~{}~{hand_id:x}",
+			g.run.ante, g.run.round, g.round.hands_played, g.round.discards_used
+		);
+		let alts: Vec<PseudoRandom> = (0..samples)
+			.map(|i| PseudoRandom::new_untraced(&format!("{base}~{i}")))
+			.collect();
+		let hidden_hand = g.areas.hand.cards.iter().any(|c| c.core.face_down);
+		let shuffled = g.areas.jokers.iter().any(|c| c.core.face_down);
+		let views: Vec<Game> = if shuffled || hidden_hand {
+			(0..samples)
+				.map(|i| {
+					let mut v = if shuffled {
+						shuffled_jokers(g, hand_id ^ num::index64(i))
+					} else {
+						g.clone()
+					};
+					if hidden_hand {
+						// A world consistent with what the player sees, independent of the
+						// hidden assignment.
+						let seed = hand_id.rotate_left(17) ^ (num::index64(i) + 1);
+						areas::redeal_face_down(
+							&mut v.areas,
+							|c| (CardFace::of(c), c.core.debuff),
+							|pool| rng::splitmix_shuffle(pool, seed),
+						);
+					}
+					v
+				})
+				.collect()
+		} else {
+			Vec::new()
+		};
+		Scenarios { g, alts, views }
 	}
-	let hidden = g.hand.iter().any(|c| c.face_down);
-	let nh = g.hand.len().min(MAX_HAND);
-	let flags = g.eval_flags();
+
+	/// Whether something is face down, so that every play is a chance play.
+	fn hidden(&self) -> bool {
+		!self.views.is_empty()
+	}
+
+	/// The game of scenario `i`.
+	#[must_use]
+	pub fn view(&self, i: usize) -> &Game {
+		if self.hidden() {
+			&self.views[i]
+		} else {
+			self.g
+		}
+	}
+
+	/// The reseeded RNG of scenario `i`.
+	#[must_use]
+	pub fn alt(&self, i: usize) -> &PseudoRandom {
+		&self.alts[i]
+	}
+}
+
+/// A play and its preview in the first scenario.
+#[derive(Clone, Copy)]
+struct FirstPreview {
+	mask: CardMask,
+	preview: PlayPreview,
+}
+
+/// The plays to simulate: the `n` best by the cheap estimate (see
+/// [`shortlist`]), and the kicker plays Blackboard and Raised Fist ask for.
+/// Ranked on a view: face-down identities must not choose the previewed plays.
+fn plays_to_preview(g: &Game, view: &Game, n: usize) -> Vec<CardMask> {
+	let nh = shown_hand(&g.areas.hand.cards).len();
+	let flags = g.areas.eval_flags();
 	let mut legal = Vec::new();
 	g.legal_actions(&mut legal);
-	// The hand as the player sees it (card ids are hidden state).
-	let hand_id = g.hand.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, c| {
-		let seen = if c.face_down {
-			[99, 0, 0, 0, 0, 0, 0]
-		} else {
-			[
-				c.suit as u64 + 1,
-				u64::from(c.rank),
-				c.enhancement as u64,
-				c.edition as u64,
-				c.seal.map_or(0, |s| s as u64 + 1),
-				u64::from(c.debuff),
-				c.ab.perma_bonus.to_bits(),
-			]
-		};
-		seen.iter()
-			.fold(h, |h, &x| (h ^ x).wrapping_mul(0x100_0000_01b3))
-	});
-	let base = format!(
-		"PV{}~{}~{}~{}~{hand_id:x}",
-		g.ante, g.round, g.hands_played_round, g.discards_used
-	);
-	let alts: Vec<crate::rng::PseudoRandom> = (0..PREVIEW_SAMPLES)
-		.map(|i| crate::rng::PseudoRandom::new_untraced(&format!("{base}~{i}")))
-		.collect();
-	let shuffled = g.jokers.iter().any(|c| c.face_down);
-	let views: Vec<Game> = if shuffled || hidden {
-		(0..PREVIEW_SAMPLES)
-			.map(|i| {
-				let mut v = if shuffled {
-					shuffled_jokers(g, hand_id ^ i as u64)
-				} else {
-					g.clone()
-				};
-				if hidden {
-					redeal_face_down(&mut v, hand_id.rotate_left(17) ^ (i as u64 + 1));
-				}
-				v
-			})
-			.collect()
-	} else {
-		Vec::new()
-	};
-	let view = |i: usize| views.get(i).unwrap_or(g);
-	// Ranked on a view: face-down identities must not choose the previewed plays.
 	let mut plays = shortlist(
 		legal
 			.iter()
@@ -300,77 +327,77 @@ pub fn top_plays(g: &Game, k: usize) -> Vec<Candidate> {
 					None
 				}
 			})
-			.filter(|&m| crate::actions::mask_fits(m, nh))
-			.map(|m| rough_score(view(0), m, flags))
+			.filter(|&m| m.fits(nh))
+			.map(|m| rough_score(&view.areas, &view.blind, &view.hands, m, flags))
 			.collect(),
-		PREVIEW_BUDGET.max(k),
+		n,
 	);
 	// The cores come first in the shortlist; on a view, like the ranking.
-	for m in kicker_plays(view(0), &plays[..plays.len().min(PREVIEW_PLAYS)], nh) {
+	for m in kicker_plays(&view.areas, &plays[..plays.len().min(PREVIEW_PLAYS)], nh) {
 		if !plays.contains(&m) && legal.contains(&Action::Play(m)) {
 			plays.push(m);
 		}
 	}
-	let need = (g.blind.chips - g.chips).max(0.0);
-	let mut first: Vec<(CardMask, f64, bool)> = plays
+	plays
+}
+
+/// The `k` best plays (by probability of clearing the blind, then mean
+/// score) over shared chance scenarios. Plays are first ranked by a cheap
+/// estimate and only the best `PREVIEW_BUDGET` are simulated, once each;
+/// the `PREVIEW_REFINE` best plays whose score depended on chance are then
+/// simulated on `PREVIEW_SAMPLES` scenarios in total, and the other chance
+/// plays are dropped (a single sample is not a fair estimate). With
+/// face-down hand cards or jokers every play is a chance play, previewed in
+/// worlds that do not reveal them (see [`Scenarios`]).
+#[must_use]
+pub fn top_plays(g: &Game, k: usize) -> Vec<Candidate> {
+	if k == 0 || g.flow.phase != Phase::Round {
+		return Vec::new();
+	}
+	let scenarios = Scenarios::new(g, PREVIEW_SAMPLES);
+	let plays = plays_to_preview(g, scenarios.view(0), PREVIEW_BUDGET.max(k));
+	let need = (g.blind.chips - g.round.chips).max(0.0);
+	let mut scratch = Scratch::default();
+	let mut first: Vec<FirstPreview> = plays
 		.iter()
-		.filter_map(|&m| {
-			preview_score(view(0), m, &alts[0])
-				.map(|p| (m, p.score, p.chance || shuffled || hidden))
+		.filter_map(|&mask| {
+			let p = preview_in(scratch.copy(scenarios.view(0), &scenarios.alts[0]), mask)?;
+			let preview = PlayPreview {
+				chance: p.chance || scenarios.hidden(),
+				..p
+			};
+			Some(FirstPreview { mask, preview })
 		})
 		.collect();
-	// Refine the most promising chance plays.
-	let mut chance: Vec<usize> = (0..first.len()).filter(|&i| first[i].2).collect();
-	chance.sort_by(|&a, &b| {
-		first[b]
-			.1
-			.partial_cmp(&first[a].1)
-			.unwrap_or(std::cmp::Ordering::Equal)
-			.then(first[a].0.cmp(&first[b].0))
+	let mut chance: Vec<&FirstPreview> = first.iter().filter(|f| f.preview.chance).collect();
+	chance.sort_by(|a, b| {
+		b.preview
+			.score
+			.total_cmp(&a.preview.score)
+			.then(a.mask.cmp(&b.mask))
 	});
-	let refine: std::collections::HashSet<usize> =
-		chance.into_iter().take(PREVIEW_REFINE).collect();
-	first = first
-		.into_iter()
-		.enumerate()
-		.filter(|(i, f)| !f.2 || refine.contains(i))
-		.map(|(_, f)| f)
-		.collect();
-	let mut out: Vec<Candidate> = Vec::new();
-	for &(m, s0, chance) in &first {
-		let (mut scores, mut sampled) = ([s0; PREVIEW_SAMPLES], 1);
-		if chance {
-			for (i, alt) in alts.iter().enumerate().skip(1) {
-				if let Some(p) = preview_score(view(i), m, alt) {
-					scores[sampled] = p.score;
-					sampled += 1;
+	let refined: Vec<CardMask> = chance.iter().take(PREVIEW_REFINE).map(|f| f.mask).collect();
+	first.retain(|f| !f.preview.chance || refined.contains(&f.mask));
+	let mut out: Vec<Candidate> = first
+		.iter()
+		.map(|&FirstPreview { mask, preview }| {
+			let (mut scores, mut sampled) = ([preview.score; PREVIEW_SAMPLES], 1);
+			if preview.chance {
+				for (i, alt) in scenarios.alts.iter().enumerate().skip(1) {
+					if let Some(p) = preview_in(scratch.copy(scenarios.view(i), alt), mask) {
+						scores[sampled] = p.score;
+						sampled += 1;
+					}
 				}
 			}
-		}
-		let v = &scores[..sampled];
-		let n = num::float(v.len());
-		let mean = v.iter().sum::<f64>() / n;
-		let min = v.iter().copied().fold(f64::INFINITY, f64::min);
-		let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-		let p_clear = num::float(v.iter().filter(|&&s| s >= need).count()) / n;
-		out.push(Candidate {
-			mask: m,
-			mean,
-			min,
-			max,
-			p_clear,
-		});
-	}
+			Candidate::of(mask, &scores[..sampled], need)
+		})
+		.collect();
 	out.sort_by(|a, b| {
 		b.p_clear
-			.partial_cmp(&a.p_clear)
-			.unwrap_or(std::cmp::Ordering::Equal)
-			.then(
-				b.mean
-					.partial_cmp(&a.mean)
-					.unwrap_or(std::cmp::Ordering::Equal),
-			)
-			.then(a.mask.count_ones().cmp(&b.mask.count_ones()))
+			.total_cmp(&a.p_clear)
+			.then(b.mean.total_cmp(&a.mean))
+			.then(a.mask.len().cmp(&b.mask.len()))
 			.then(a.mask.cmp(&b.mask))
 	});
 	out.truncate(k);

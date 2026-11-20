@@ -3,18 +3,21 @@
 //! The game keeps every quantity in a Lua number (an `f64`), Rust indexes with
 //! `usize`, and the observation is made of `f32` and `i32`. Each function here
 //! is the one place where its `as` conversion is justified. The conversions
-//! that must be exact are checked in builds with debug assertions (the tests),
-//! and cost nothing in release builds.
+//! that must be exact check their range first, in every build.
 
-/// `n` as a Lua number.
+/// A count or index as a Lua number.
+///
+/// # Panics
+///
+/// Panics if `n` is 2^53 or more, which a Lua number does not hold exactly.
 #[inline]
 #[must_use]
 #[expect(
 	clippy::cast_precision_loss,
-	reason = "counts and indices stay far below 2^53, so the result is exact"
+	reason = "`n` was just checked to be below 2^53, so the result is exact"
 )]
 pub const fn float(n: usize) -> f64 {
-	debug_assert!(
+	assert!(
 		n < 1 << 53,
 		"a count this large is not exact as a Lua number"
 	);
@@ -34,7 +37,7 @@ pub const fn trunc(x: f64) -> usize {
 	x as usize
 }
 
-/// `x` as an observation feature. Observations are `f32`, so this rounds.
+/// A Lua number as an observation feature, rounded to the nearest `f32`.
 #[inline]
 #[must_use]
 #[expect(
@@ -46,15 +49,19 @@ pub const fn feat(x: f64) -> f32 {
 }
 
 /// A small index or table length as a categorical id.
+///
+/// # Panics
+///
+/// Panics if `n` does not fit an `i32`.
 #[inline]
 #[must_use]
 #[expect(
 	clippy::cast_possible_truncation,
 	clippy::cast_possible_wrap,
-	reason = "checked below in test builds"
+	reason = "`n` was just checked to fit an i32"
 )]
 pub const fn id(n: usize) -> i32 {
-	debug_assert!(
+	assert!(
 		n <= i32::MAX as usize,
 		"an index this large does not fit an id"
 	);
@@ -62,29 +69,59 @@ pub const fn id(n: usize) -> i32 {
 }
 
 /// An index or count as the `u32` of card ids and counters.
+///
+/// # Panics
+///
+/// Panics if `n` does not fit a `u32`.
 #[inline]
 #[must_use]
 #[expect(
 	clippy::cast_possible_truncation,
-	reason = "checked below in test builds"
+	reason = "`n` was just checked to fit a u32"
 )]
 pub const fn index32(n: usize) -> u32 {
-	debug_assert!(
+	assert!(
 		n <= u32::MAX as usize,
 		"an index this large does not fit a u32"
 	);
 	n as u32
 }
 
+/// A `u32` counter as an index.
+///
+/// # Panics
+///
+/// Never on the 32- and 64-bit targets the simulator builds for.
+#[inline]
+#[must_use]
+pub fn index(n: u32) -> usize {
+	usize::try_from(n).expect("a u32 fits a usize on every target the simulator builds for")
+}
+
+/// An index or count as a `u64` (a seed or hash input).
+///
+/// # Panics
+///
+/// Never on the 32- and 64-bit targets the simulator builds for.
+#[inline]
+#[must_use]
+pub fn index64(n: usize) -> u64 {
+	u64::try_from(n).expect("a usize fits a u64 on every target the simulator builds for")
+}
+
 /// A slot index or card count as the `u8` that actions and ops carry.
+///
+/// # Panics
+///
+/// Panics if `n` does not fit a `u8`.
 #[inline]
 #[must_use]
 #[expect(
 	clippy::cast_possible_truncation,
-	reason = "checked below in test builds"
+	reason = "`n` was just checked to fit a u8"
 )]
 pub const fn byte(n: usize) -> u8 {
-	debug_assert!(
+	assert!(
 		n <= u8::MAX as usize,
 		"an index this large does not fit a byte"
 	);

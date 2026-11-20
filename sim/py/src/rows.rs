@@ -1,139 +1,133 @@
 //! One state's encoded observation and legal ops, written into
 //! caller-provided buffers: numpy rows (`VecEnv`) or owned vectors
-//! (`Game.encode`, the final states of truncated episodes).
+//! (`Game.encode`).
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sim::game::Game;
 use sim::num;
-use sim::obs::{self, BuildPreview, ObsMut, Op};
+use sim::obs::{self, BuildPreview, ObsBuf, ObsMut, Op, OpOptions};
 
-/// Mutable views of one state's observation (row-major; see `sim::obs`).
+// The shape of one state's part of each two-dimensional observation array.
+// Each of the other arrays holds `obs::GLOB_INT` or `obs::GLOB_FLOAT` values
+// a state, or one value a state.
+pub(crate) const TOK_I_SHAPE: [usize; 2] = [obs::MAX_TOKENS, obs::TOK_INT];
+pub(crate) const TOK_F_SHAPE: [usize; 2] = [obs::MAX_TOKENS, obs::TOK_FLOAT];
+pub(crate) const OPS_SHAPE: [usize; 2] = [obs::MAX_OPS, obs::OP_INT];
+pub(crate) const OPS_F_SHAPE: [usize; 2] = [obs::MAX_OPS, obs::OP_FLOAT];
+
+/// The number of values in a row of the shape `row`.
+pub(crate) const fn row_len(row: [usize; 2]) -> usize {
+	row[0] * row[1]
+}
+
+/// Mutable views of one state's observation and ops (row-major; see
+/// `sim::obs`).
 pub(crate) struct Rows<'a> {
-	pub ti: &'a mut [i32],
-	pub tf: &'a mut [f32],
-	pub gi: &'a mut [i32],
-	pub gf: &'a mut [f32],
-	pub oa: &'a mut [i32],
-	pub of: &'a mut [f32],
+	pub obs: ObsMut<'a>,
+	pub ops: &'a mut [i32],
+	pub ops_f: &'a mut [f32],
 	pub n_ops: &'a mut i32,
 	pub n_tokens: &'a mut i32,
 	pub n_hand: &'a mut i32,
 }
 
+/// The ops of an observation with `candidates` scored plays and, if
+/// `allow_skip`, blind skips.
+///
+/// # Errors
+///
+/// Returns a `ValueError` if `candidates` is more than
+/// `obs::MAX_CANDIDATES`.
+pub(crate) fn op_options(candidates: usize, allow_skip: bool) -> PyResult<OpOptions> {
+	if candidates > obs::MAX_CANDIDATES {
+		return Err(PyValueError::new_err(format!(
+			"play_candidates must be at most {}, got {candidates}",
+			obs::MAX_CANDIDATES
+		)));
+	}
+	Ok(OpOptions {
+		candidates,
+		allow_skip,
+	})
+}
+
+/// What an observation holds besides its fixed part.
+#[derive(Clone, Copy)]
+pub(crate) struct ObsOptions {
+	pub ops: OpOptions,
+	pub deck_tokens: bool,
+	/// Build previews of shops, packs and blind select.
+	pub previews: bool,
+	/// The gain column of the joker-move ops (`obs::order_gain`).
+	pub order_gain: bool,
+}
+
 impl Rows<'_> {
 	/// Encodes `g` (after refreshing the joker values the game recomputes
-	/// every frame) and its legal ops; `ops` receives the ops, for decoding
-	/// the policy's choice. With `previews`, `pv` caches the env's recent
-	/// build previews between steps (see `obs::build_preview`).
+	/// every frame) and its legal ops; `op_list` receives the ops, for
+	/// decoding the policy's choice. With `options.previews`, `previews`
+	/// caches the env's recent build previews between steps (see
+	/// `obs::build_preview`).
 	pub fn write(
-		&mut self, g: &mut Game, candidates: usize, deck_tokens: bool, previews: bool,
-		ops: &mut Vec<Op>, pv: &mut Vec<BuildPreview>,
+		&mut self, g: &mut Game, options: ObsOptions, op_list: &mut Vec<Op>,
+		previews: &mut Vec<BuildPreview>,
 	) {
 		g.update_derived();
-		let has = previews && obs::build_preview(g, pv);
-		let cur = if has { pv.first_mut() } else { None };
-		let lay = obs::encode_with(
-			g,
-			&mut ObsMut {
-				tok_i: self.ti,
-				tok_f: self.tf,
-				glob_i: self.gi,
-				glob_f: self.gf,
-			},
-			deck_tokens,
-			cur,
-		);
-		obs::ops(g, &lay, candidates, ops);
-		self.oa.fill(0);
-		self.of.fill(0.0);
-		for (j, op) in ops.iter().enumerate() {
-			self.oa[j * obs::OP_INT..(j + 1) * obs::OP_INT].copy_from_slice(&op.ints());
-			self.of[j * obs::OP_FLOAT..(j + 1) * obs::OP_FLOAT].copy_from_slice(&op.feats);
+		let preview = if options.previews {
+			obs::build_preview(g, previews)
+		} else {
+			None
+		};
+		let lay = obs::encode_with(g, &mut self.obs, options.deck_tokens, preview);
+		obs::ops(g, &lay, options.ops, op_list);
+		if options.order_gain {
+			obs::order_gain(g, op_list);
 		}
-		*self.n_ops = num::id(ops.len());
+		self.ops.fill(0);
+		self.ops_f.fill(0.0);
+		for (j, op) in op_list.iter().enumerate() {
+			self.ops[j * obs::OP_INT..(j + 1) * obs::OP_INT].copy_from_slice(&op.ints());
+			self.ops_f[j * obs::OP_FLOAT..(j + 1) * obs::OP_FLOAT].copy_from_slice(&op.feats);
+		}
+		*self.n_ops = num::id(op_list.len());
 		*self.n_tokens = num::id(lay.n_tokens);
 		*self.n_hand = num::id(lay.hand);
 	}
-
-	pub fn copy_from(&mut self, r: &ObsRow) {
-		self.ti.copy_from_slice(&r.ti);
-		self.tf.copy_from_slice(&r.tf);
-		self.gi.copy_from_slice(&r.gi);
-		self.gf.copy_from_slice(&r.gf);
-		self.oa.copy_from_slice(&r.oa);
-		self.of.copy_from_slice(&r.of);
-		*self.n_ops = r.n_ops;
-		*self.n_tokens = r.n_tokens;
-		*self.n_hand = r.n_hand;
-	}
 }
 
-/// An owned observation.
+/// One state's observation and ops in owned buffers.
 pub(crate) struct ObsRow {
-	pub ti: Vec<i32>,
-	pub tf: Vec<f32>,
-	pub gi: Vec<i32>,
-	pub gf: Vec<f32>,
-	pub oa: Vec<i32>,
-	pub of: Vec<f32>,
+	pub obs: ObsBuf,
+	pub ops: Vec<i32>,
+	pub ops_f: Vec<f32>,
 	pub n_ops: i32,
 	pub n_tokens: i32,
 	pub n_hand: i32,
 }
 
-impl ObsRow {
-	pub fn new() -> ObsRow {
+impl Default for ObsRow {
+	fn default() -> ObsRow {
 		ObsRow {
-			ti: vec![0; obs::MAX_TOKENS * obs::TOK_INT],
-			tf: vec![0.0; obs::MAX_TOKENS * obs::TOK_FLOAT],
-			gi: vec![0; obs::GLOB_INT],
-			gf: vec![0.0; obs::GLOB_FLOAT],
-			oa: vec![0; obs::MAX_OPS * obs::OP_INT],
-			of: vec![0.0; obs::MAX_OPS * obs::OP_FLOAT],
+			obs: ObsBuf::new(),
+			ops: vec![0; row_len(OPS_SHAPE)],
+			ops_f: vec![0.0; row_len(OPS_F_SHAPE)],
 			n_ops: 0,
 			n_tokens: 0,
 			n_hand: 0,
 		}
 	}
+}
 
-	/// A copy of `r`.
-	pub fn of(r: &Rows<'_>) -> ObsRow {
-		ObsRow {
-			ti: r.ti.to_vec(),
-			tf: r.tf.to_vec(),
-			gi: r.gi.to_vec(),
-			gf: r.gf.to_vec(),
-			oa: r.oa.to_vec(),
-			of: r.of.to_vec(),
-			n_ops: *r.n_ops,
-			n_tokens: *r.n_tokens,
-			n_hand: *r.n_hand,
-		}
-	}
-
+impl ObsRow {
 	pub fn rows(&mut self) -> Rows<'_> {
 		Rows {
-			ti: &mut self.ti,
-			tf: &mut self.tf,
-			gi: &mut self.gi,
-			gf: &mut self.gf,
-			oa: &mut self.oa,
-			of: &mut self.of,
+			obs: self.obs.as_mut(),
+			ops: &mut self.ops,
+			ops_f: &mut self.ops_f,
 			n_ops: &mut self.n_ops,
 			n_tokens: &mut self.n_tokens,
 			n_hand: &mut self.n_hand,
 		}
 	}
-}
-
-/// `ValueError` unless `n` scored play candidates can be requested.
-pub(crate) fn check_candidates(n: usize) -> PyResult<()> {
-	if n > obs::MAX_CANDIDATES {
-		return Err(PyValueError::new_err(format!(
-			"play_candidates must be at most {}, got {n}",
-			obs::MAX_CANDIDATES
-		)));
-	}
-	Ok(())
 }
