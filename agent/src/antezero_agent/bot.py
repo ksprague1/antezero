@@ -9,9 +9,10 @@ antezero_agent.bot CKPT --port PORT``), which plays every such run until the
 game closes. Search and the bot's speed are settings of the mod (Mods >
 AnteZero > Config in the game).
 
-As in ``play_real``, the simulator runs in lockstep with the game (same seed,
-deck, stake and actions): the policy reads the simulator's observation, and
-the bot stops, leaving the run to the player, if the two ever disagree.
+Before every decision the simulator's copy of the run is rebuilt from the
+game's state (the mod's state dump), and the policy reads its observation:
+whatever the game holds (the profile's locked cards, unlocks during the run,
+moves the player made) is what the bot plays.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import torch
 
 from .critic import Critic
 from .play_real import greedy
-from .round_search import RoundSearch
+from .round_search import FREE, RoundSearch
 from .runtime import load_model, pick_device, read_checkpoint
 
 
@@ -52,25 +53,20 @@ def install(a) -> None:
 def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, critic: Critic | None) -> str | None:
     """Plays the bot run ``run`` of the mod; returns how it ended for the
     bot (the text the game shows), or ``None`` if the player left it."""
-    from antezero_bridge import canon
     from antezero_bridge.client import RPCError
     from antezero_bridge.game_env import ActionRejected
 
     sim = az.Game(run["seed"], run["back"], int(run["stake"]), endless=cfg.env.endless)
     sim.allow_skip = cfg.env.allow_skip  # the policy must see the action set it was trained on
     sim.steamodded = True  # the game runs Steamodded, whose xMult rounds differently
-    steps = 0
+    steps, free = 0, 0  # free: the bot's rearranges in a row, which the policy is held to as in training
     try:
         env.refresh()
         while True:
-            if sim.is_terminal() and sim.run_won:
-                return "won the run"  # the game shows its win screen, which the harness would dismiss
-            d = canon.diff(sim.canonical(), env.canonical())
-            if d:
-                print(f"[{run['seed']}] divergence after step {steps}: {d[:10]}", flush=True)
-                return "stopped: the game and the simulator disagree"
+            sim.load_state(env.state_json())
+            sim.rearranges = free
             if sim.is_terminal():
-                return "lost the run"
+                return "won the run" if sim.run_won else "lost the run"
             while True:  # a menu the player opened pauses the bot
                 s = client.az_bot(run=run["id"], status="thinking")
                 if not s["active"] or s["run"]["id"] != run["id"]:
@@ -89,7 +85,7 @@ def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, cr
             if code is None:
                 return "stopped: the policy has no legal action"
             env.step(code, run=run["id"], note=note)
-            sim.step(code)
+            free = free + 1 if code.startswith(FREE) else 0
             steps += 1
     except (ActionRejected, RPCError) as e:  # the run ended under the action
         print(f"[{run['seed']}] {e}", flush=True)

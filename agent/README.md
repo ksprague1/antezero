@@ -14,7 +14,7 @@ agent/
     search.py      determinized lookahead (test-time policy improvement)
     round_search.py risk-gated within-round search over determinized worlds (batched)
     bench.py       env-only and end-to-end PPO throughput on a device
-    bot.py         the agent behind the in-game bot button (plays the real game, sim in lockstep)
+    bot.py         the agent behind the in-game bot button (plays the real game, sim rebuilt from it every decision)
     play_real.py   win rate in the real game through the bridge, sim in lockstep
     stats.py       Wilson intervals, sample sizes
   tests/           legality, log-probs, shaping, GAE, truncation, overfit, config, training / resume

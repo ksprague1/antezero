@@ -1,5 +1,6 @@
 import csv
 import json
+import random
 
 import numpy as np
 import pytest
@@ -768,11 +769,14 @@ def test_wilson():
 
 class _BotGame:
     """Stands in for the game in a bot run (the mod's ``az_bot`` and a
-    ``GameEnv``), on a simulator of its own."""
+    ``GameEnv``) on a simulator of its own, whose state dumps the bot reads.
+    ``meddle(game)`` runs before every dump the bot reads: the game changing
+    under the bot."""
 
-    def __init__(self, run, leave_at=None):
-        self.g, self.run, self.leave_at = az.Game(run["seed"], run["back"], run["stake"]), run, leave_at
-        self.polls, self.notes = 0, []
+    def __init__(self, run, leave_at=None, meddle=None, g=None):
+        self.g = g or az.Game(run["seed"], run["back"], run["stake"])
+        self.run, self.leave_at, self.meddle = run, leave_at, meddle
+        self.polls, self.notes, self.meddled = 0, [], 0
 
     def az_bot(self, **params):
         self.polls += 1
@@ -781,8 +785,10 @@ class _BotGame:
     def refresh(self):
         pass
 
-    def canonical(self):
-        return dict(self.g.canonical())
+    def state_json(self):
+        if self.meddle and self.meddle(self.g):
+            self.meddled += 1
+        return self.g.state_json()
 
     def step(self, code, run, note):
         assert run == self.run["id"]
@@ -790,19 +796,90 @@ class _BotGame:
         self.g.step(code)
 
 
-def test_the_bot_plays_its_run_to_the_end_in_step_with_the_game(monkeypatch):
+@pytest.fixture
+def bot_game(monkeypatch):
+    """Makes a ``_BotGame`` whose bot must hold the game's state at every
+    decision."""
     from antezero_agent import bot
 
     monkeypatch.setattr(bot.time, "sleep", lambda s: None)
-    cfg, net, run = preset("smoke"), tiny(), {"id": 7, "seed": "BOTTEST1", "back": "b_red", "stake": 1}
+    games = []
+    greedy = bot.greedy
+
+    def checked(model, cfg, sim, dev):
+        assert sim.canonical() == games[-1].g.canonical()
+        return greedy(model, cfg, sim, dev)
+
+    monkeypatch.setattr(bot, "greedy", checked)
+
+    def make(*a, **kw):
+        games.append(_BotGame(*a, **kw))
+        return games[-1]
+
+    return make
+
+
+BOT_RUN = {"id": 7, "seed": "BOTTEST1", "back": "b_red", "stake": 1}
+
+
+def test_the_bot_plays_its_run_to_the_end_in_step_with_the_game(bot_game):
+    from antezero_agent import bot
+
+    cfg, net, run = preset("smoke"), tiny(), BOT_RUN
     critic = Critic(cfg.model).eval()
-    game = _BotGame(run)
+    game = bot_game(run)
     assert bot.play_run(game, game, run, net, cfg, "cpu", None, critic) == "lost the run"  # an untrained policy
     assert game.g.is_terminal() and len(game.notes) > 5 and all("sure, win " in n for n in game.notes)
     assert game.polls == len(game.notes) + 1  # one poll per action, and one more while a menu paused it
     # the player leaves the run: the bot stops without a result
-    game = _BotGame(run, leave_at=4)
+    game = bot_game(run, leave_at=4)
     assert bot.play_run(game, game, run, net, cfg, "cpu", None, None) is None and len(game.notes) == 2
-    # the game is not where the simulator is: the bot hands the run back
-    game = _BotGame(dict(run, seed="OTHERRUN"))
-    assert bot.play_run(game, game, run, net, cfg, "cpu", None, None).startswith("stopped")
+
+
+def _in_a_shop_with_a_joker() -> az.Game:
+    """A run that has reached a shop selling a joker (random play)."""
+    rng = random.Random(0)
+    for _ in range(1000):
+        g = az.Game(BOT_RUN["seed"], BOT_RUN["back"], BOT_RUN["stake"])
+        while not g.is_terminal():
+            if g.phase == "shop" and any(c["ability"]["set"] == "Joker" for c in json.loads(g.state_json())["shop_jokers"]):
+                return g
+            g.step(rng.choice(g.legal_codes()))
+    raise AssertionError("no run reached a shop")
+
+
+def test_the_bot_plays_a_shop_the_simulator_would_not_deal(bot_game):
+    """A locked card's slot holds another card: the bot reads the shop the
+    game has."""
+    from antezero_agent import bot
+
+    def swap(g):
+        d = json.loads(g.state_json())
+        jokers = [c for c in d["shop_jokers"] if c["ability"]["set"] == "Joker" and c["key"] != "j_blueprint"]
+        if g.phase != "shop" or not jokers:
+            return False
+        jokers[0]["key"] = "j_blueprint"
+        g.load_state(json.dumps(d))
+        return True
+
+    cfg, net = preset("smoke"), tiny()
+    game = bot_game(BOT_RUN, meddle=swap, g=_in_a_shop_with_a_joker())
+    assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) == "lost the run"
+    assert game.meddled > 0
+
+
+def test_the_bot_plays_on_after_the_player_acts(bot_game):
+    from antezero_agent import bot
+
+    def player(g):
+        player.calls += 1
+        if player.calls % 4 or g.is_terminal():
+            return False
+        g.step(g.legal_codes()[-1])
+        return True
+
+    player.calls = 0
+    cfg, net = preset("smoke"), tiny()
+    game = bot_game(BOT_RUN, meddle=player)
+    assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) in ("lost the run", "won the run")
+    assert game.meddled > 1
