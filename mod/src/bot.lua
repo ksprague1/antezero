@@ -307,14 +307,16 @@ function B.owns(id) return B.active and B.run ~= nil and B.run.id == id end
 function B.acting(a, note)
   local ok, text = pcall(describe, a)
   B.last = (ok and text or a.type) .. (note and note ~= '' and ('   ' .. note) or '')
-  B.seen, B.thinking = now(), nil
+  B.seen, B.thinking, B.interrupted = now(), nil, false
 end
 
 local function paused() return G.OVERLAY_MENU ~= nil and not (G.GAME and G.GAME.won) end
 
 function B.tick()
   if not B.run then return end
-  if paused() then B.seen = now() end -- the agent may be waiting in an action the menu holds
+  if paused() then -- the agent may be waiting in an action the menu holds
+    B.seen, B.interrupted = now(), true
+  end
   if B.active and now() - B.seen > (B.contact and 300 or 120) then
     stop(B.contact and 'stopped: the bot does not answer' or 'stopped: the bot did not start (see the "AnteZero bot" window)')
   end
@@ -385,7 +387,7 @@ end
 
 AZB.rpc.register({
   name = 'az_bot',
-  description = "The bot run to play, if any; `status` is shown while it plays, `stop` ends the bot's part with that text",
+  description = "The bot run to play, if any, and whether a menu was open since the bot's last action (`interrupted`); `status` is shown while it plays, `stop` ends the bot's part with that text",
   schema = {
     status = {type = 'string', required = false},
     stop = {type = 'string', required = false},
@@ -400,6 +402,6 @@ AZB.rpc.register({
         if B.last then B.thinking = B.thinking or now() else B.status = args.status end
       end
     end
-    send({active = B.active, run = B.active and B.run or nil, paused = paused(), search = cfg.search})
+    send({active = B.active, run = B.active and B.run or nil, paused = paused(), interrupted = B.interrupted or false, search = cfg.search})
   end,
 })

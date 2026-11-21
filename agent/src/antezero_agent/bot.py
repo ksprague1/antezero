@@ -12,7 +12,9 @@ AnteZero > Config in the game).
 Before every decision the simulator's copy of the run is rebuilt from the
 game's state (the mod's state dump), and the policy reads its observation:
 whatever the game holds (the profile's locked cards, unlocks during the run,
-moves the player made) is what the bot plays.
+moves the player made) is what the bot plays. The copy is checked first,
+against the dump as the bridge reads it and against what the simulator
+expected the bot's last action to do; a copy that fails either stops the bot.
 """
 
 from __future__ import annotations
@@ -49,10 +51,42 @@ def install(a) -> None:
         print("BalatroBot stays disabled outside the developer tools")
 
 
+# What the game draws from its pools may differ from the simulator's draw with
+# nothing wrong: a profile's locked cards are not offered (the simulator offers
+# every card), and Steamodded rolls a few things its own way (the Soul's rarity
+# roll, a used_jokers mark for a redeemed voucher) and keeps The Pillar's mark
+# through an enhancement. So the expected state is compared but for new cards,
+# the next voucher and skip tags, used_jokers, the RNG streams and those marks.
+LOOSE = ("rng.", "used_jokers", "voucher", "blind_tags.")
+
+
+def surprises(before: dict, expected: dict, game: dict) -> list[tuple[str, str, str]]:
+    """Where ``game`` differs from ``expected``, the simulator's prediction
+    of the action taken in ``before`` (canonical states)."""
+    from antezero_bridge import canon
+
+    def card(path: str) -> str:
+        return ".".join(path.split(".")[:2])
+
+    last = max((float(v) for k, v in before.items() if k.endswith(".id")), default=0.0)
+    new = {card(k) for c in (expected, game) for k, v in c.items() if k.endswith(".id") and float(v) > last}
+    return [
+        d
+        for d in canon.diff(expected, game)
+        if not d[0].startswith(LOOSE) and not d[0].endswith(".played_this_ante") and card(d[0]) not in new
+    ]
+
+
+def _stop(run: dict, why: str, diffs: list) -> str:
+    print(f"[{run['seed']}] {why} (simulator, game):", *(f"  {p}: {a} | {b}" for p, a, b in diffs[:20]), sep="\n", flush=True)
+    return f"stopped: {why}"
+
+
 @torch.no_grad()
 def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, critic: Critic | None) -> str | None:
     """Plays the bot run ``run`` of the mod; returns how it ended for the
     bot (the text the game shows), or ``None`` if the player left it."""
+    from antezero_bridge import canon
     from antezero_bridge.client import RPCError
     from antezero_bridge.game_env import ActionRejected
 
@@ -60,20 +94,31 @@ def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, cr
     sim.allow_skip, sim.null_sorts = cfg.env.allow_skip, cfg.env.null_sorts  # the action set the policy was trained on
     sim.steamodded = True  # the game runs Steamodded, whose xMult rounds differently
     steps, free = 0, 0  # free: the bot's rearranges in a row, which the policy is held to as in training
+    expected = None  # (the game before the bot's last action, what the simulator expected after it)
     try:
         env.refresh()
         while True:
-            sim.load_state(env.state_json())
-            sim.rearranges = free
-            if sim.is_terminal():
-                return "won the run" if sim.run_won else "lost the run"
+            interrupted = False
             while True:  # a menu the player opened pauses the bot
                 s = client.az_bot(run=run["id"], status="thinking")
                 if not s["active"] or s["run"]["id"] != run["id"]:
                     return None
+                interrupted = interrupted or s["interrupted"]
                 if not s["paused"]:
                     break
                 time.sleep(0.2)
+            if interrupted:  # the game as the player left it
+                env.refresh()
+                expected = None
+            game = env.canonical()
+            sim.load_state(env.state_json())
+            sim.rearranges = free
+            if wrong := canon.diff(sim.canonical(), game):
+                return _stop(run, "the simulator misread the game", wrong)
+            if sim.is_terminal():
+                return "won the run" if sim.run_won else "lost the run"
+            if expected and (wrong := surprises(*expected, game)):
+                return _stop(run, "the game did not do what the simulator expected", wrong)
             code, out, o = greedy(model, cfg, sim, dev)
             note = f"{math.exp(float(out['logp'][0])):.0%} sure"
             if rs is not None and s["search"]:
@@ -84,6 +129,9 @@ def play_run(client, env, run: dict, model, cfg, dev, rs: RoundSearch | None, cr
                 note += f", win {float(critic.win_prob(o)[0]):.0%}"
             if code is None:
                 return "stopped: the policy has no legal action"
+            nxt = sim.clone()
+            nxt.step(code)
+            expected = (game, nxt.canonical())
             env.step(code, run=run["id"], note=note)
             free = free + 1 if code.startswith(FREE) else 0
             steps += 1

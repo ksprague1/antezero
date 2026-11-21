@@ -377,6 +377,23 @@ def test_a_run_handed_back_says_it_does_not_count(game):
     """)
 
 
+def test_the_bot_hears_of_a_menu_opened_since_its_last_action(game):
+    game.run("""
+    play('b_red')
+    local reply
+    local function poll() AZB.rpc.az_bot({run = AZB.bot.run.id}, function(r) reply = r end) return reply end
+    assert(not poll().interrupted)
+    G.OVERLAY_MENU = {}
+    AZB.bot.tick()
+    assert(poll().paused and reply.interrupted)
+    G.OVERLAY_MENU = nil
+    AZB.bot.tick()
+    assert(not poll().paused and reply.interrupted, 'closed since')
+    AZB.bot.acting({type = 'reroll'}, '')
+    assert(not poll().interrupted, 'the next action')
+    """)
+
+
 def test_a_buy_the_game_refuses_is_refused(game):
     reply = game.run("""
     G.STATE, G.STATE_COMPLETE = G.STATES.SHOP, true

@@ -796,26 +796,40 @@ def test_wilson():
 
 class _BotGame:
     """Stands in for the game in a bot run (the mod's ``az_bot`` and a
-    ``GameEnv``) on a simulator of its own, whose state dumps the bot reads.
-    ``meddle(game)`` runs before every dump the bot reads: the game changing
-    under the bot."""
+    ``GameEnv``, which keeps the reply to the last request) on a simulator of
+    its own. A menu pauses the bot at the polls in ``pauses``, and
+    ``player(game)`` runs while it is open: the player changing the game.
+    ``deal(game, code)`` runs after each of the bot's actions: the game doing
+    what the simulator would not (a locked card in its shop). ``misread(dump)``
+    changes the dump the bot loads, but not what the bridge reads of it."""
 
-    def __init__(self, run, leave_at=None, meddle=None, g=None, refuse=False):
+    def __init__(self, run, leave_at=None, pauses=(2,), player=None, deal=None, misread=None, g=None, refuse=False):
         self.g = g or az.Game(run["seed"], run["back"], run["stake"])
-        self.run, self.leave_at, self.meddle, self.refuse = run, leave_at, meddle, refuse
-        self.polls, self.notes, self.meddled, self.free = 0, [], 0, 0
+        self.run, self.leave_at, self.pauses, self.refuse = run, leave_at, pauses, refuse
+        self.player, self.deal, self.misread = player, deal, misread
+        self.polls, self.notes, self.changed, self.free, self.interrupted = 0, [], 0, 0, False
+        self.reply = self.g.state_json()
 
     def az_bot(self, **params):
         self.polls += 1
-        return {"active": self.polls != self.leave_at, "paused": self.polls == 2, "run": self.run, "search": True}
+        paused = self.polls in self.pauses
+        if paused:
+            self.interrupted = True
+            if self.player and self.player(self.g):
+                self.changed += 1
+        active = self.polls != self.leave_at
+        return {"active": active, "paused": paused, "interrupted": self.interrupted, "run": self.run, "search": True}
 
     def refresh(self):
-        pass
+        self.reply = self.g.state_json()
 
     def state_json(self):
-        if self.meddle and self.meddle(self.g):
-            self.meddled += 1
-        return self.g.state_json()
+        return self.misread(self.reply) if self.misread else self.reply
+
+    def canonical(self):
+        from antezero_bridge import canon
+
+        return canon.from_lua(self.reply)
 
     def step(self, code, run, note):
         from antezero_bridge.game_env import ActionRejected
@@ -824,7 +838,11 @@ class _BotGame:
         if self.refuse:
             raise ActionRejected(code)
         self.notes.append(note)
+        self.interrupted = False
         self.g.step(code)
+        if self.deal and self.deal(self.g, code):
+            self.changed += 1
+        self.reply = self.g.state_json()
         self.free = self.free + 1 if code.startswith(("move", "sort")) else 0  # the bot's rearranges in a row
 
 
@@ -863,7 +881,7 @@ def test_the_bot_plays_its_run_to_the_end_in_step_with_the_game(bot_game):
     game = bot_game(run)
     assert bot.play_run(game, game, run, net, cfg, "cpu", None, critic) == "lost the run"  # an untrained policy
     assert game.g.is_terminal() and len(game.notes) > 5 and all("sure, win " in n for n in game.notes)
-    assert game.polls == len(game.notes) + 1  # one poll per action, and one more while a menu paused it
+    assert game.polls == len(game.notes) + 2  # one poll per action and at the end, and one more while a menu paused it
     # the player leaves the run: the bot stops without a result
     game = bot_game(run, leave_at=4)
     assert bot.play_run(game, game, run, net, cfg, "cpu", None, None) is None and len(game.notes) == 2
@@ -884,38 +902,70 @@ def _in_a_shop_with_a_joker() -> az.Game:
     raise AssertionError("no run reached a shop")
 
 
+def _blueprint_in_the_shop(g, code=None) -> bool:
+    """The shop just dealt holds a Blueprint where the simulator dealt
+    another joker (a locked card's slot, say)."""
+    if g.phase != "shop" or code not in (None, "cash_out", "reroll"):
+        return False
+    d = json.loads(g.state_json())
+    jokers = [c for c in d["shop_jokers"] if c["ability"]["set"] == "Joker"]
+    if not jokers:
+        return False
+    jokers[0]["key"] = "j_blueprint"
+    g.load_state(json.dumps(d))
+    return True
+
+
 def test_the_bot_plays_a_shop_the_simulator_would_not_deal(bot_game):
-    """A locked card's slot holds another card: the bot reads the shop the
-    game has."""
     from antezero_agent import bot
 
-    def swap(g):
-        d = json.loads(g.state_json())
-        jokers = [c for c in d["shop_jokers"] if c["ability"]["set"] == "Joker" and c["key"] != "j_blueprint"]
-        if g.phase != "shop" or not jokers:
-            return False
-        jokers[0]["key"] = "j_blueprint"
-        g.load_state(json.dumps(d))
-        return True
-
+    g = _in_a_shop_with_a_joker()
+    assert _blueprint_in_the_shop(g)
     cfg, net = preset("smoke"), tiny()
-    game = bot_game(BOT_RUN, meddle=swap, g=_in_a_shop_with_a_joker())
+    game = bot_game(BOT_RUN, deal=_blueprint_in_the_shop, g=g)
     assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) == "lost the run"
-    assert game.meddled > 0
 
 
-def test_the_bot_plays_on_after_the_player_acts(bot_game):
+def test_the_bot_reads_the_game_after_the_player_changed_it(bot_game):
     from antezero_agent import bot
 
     def player(g):
-        player.calls += 1
-        if player.calls % 4 or g.is_terminal():
+        if g.is_terminal():
             return False
         g.step(g.legal_codes()[-1])
         return True
 
-    player.calls = 0
     cfg, net = preset("smoke"), tiny()
-    game = bot_game(BOT_RUN, meddle=player)
+    game = bot_game(BOT_RUN, pauses=range(2, 1000, 3), player=player)
     assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) in ("lost the run", "won the run")
-    assert game.meddled > 1
+    assert game.changed > 1
+
+
+def test_the_bot_stops_on_a_dump_its_simulator_misreads(bot_game):
+    from antezero_agent import bot
+
+    def misread(dump):
+        d = json.loads(dump)
+        d["dollars"] += 1
+        return json.dumps(d)
+
+    cfg, net = preset("smoke"), tiny()
+    game = bot_game(BOT_RUN, misread=misread)
+    assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) == "stopped: the simulator misread the game"
+    assert not game.notes
+
+
+def test_the_bot_stops_when_the_game_does_not_do_what_it_expected(bot_game):
+    """A dump the simulator misreads where the bridge does not look (the
+    discards the next blind adds): the next blind shows it."""
+    from antezero_agent import bot
+
+    def misread(dump):
+        d = json.loads(dump)
+        d["round_bonus"]["discards"] += 1
+        return json.dumps(d)
+
+    cfg, net = preset("smoke"), tiny()
+    game = bot_game(BOT_RUN, misread=misread)
+    assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) == "stopped: the game did not do what the simulator expected"
+    assert game.notes
