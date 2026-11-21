@@ -1,6 +1,6 @@
 # Evaluating RLBalatro (`model_0095.pt`) in `antezero`
 
-This branch (`expose-extra-obs`) includes `rlbalatro_eval/`, a standalone Python runner that evaluates [RLBalatro](https://github.com/ksprague1/RLBalatro-public)'s released Run 95 policy (`model_0095.pt`) directly in `antezero_sim` without needing `RLBalatro-public` or `libbalatro.so`.
+This branch (`expose-extra-obs`) includes `rlbalatro_eval/`, a standalone Python runner that evaluates RLBalatro's Run 95 policy (`model_0095.pt`, bundled in `rlbalatro_eval/model_0095.pt`) directly in `antezero_sim` without needing external libraries.
 
 ## Quickstart
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -16,19 +15,13 @@ import torch
 from .antezero_adapter import AntezeroBalatroEnv
 from .policy import Policy
 
-MODEL_URL = "https://github.com/ksprague1/RLBalatro-public/releases/download/v0.1/model_0095.pt"
 DEFAULT_MODEL = Path(__file__).resolve().parent / "model_0095.pt"
 
 
 def fetch_model(path: str | Path) -> Path:
     p = Path(path)
-    if p.exists():
-        return p
-    if p != DEFAULT_MODEL:
+    if not p.exists():
         raise FileNotFoundError(f"model file not found: {p}")
-    print(f"Downloading {MODEL_URL} -> {p}", flush=True)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(MODEL_URL, p)
     return p
 
 
