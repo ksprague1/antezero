@@ -129,7 +129,9 @@ function AZB.act_main(a)
   elseif k == 'sell_consumable' then
     G.FUNCS.sell_card({config = {ref_table = area_card(G.consumeables, a.index)}})
   elseif k == 'buy' then
-    G.FUNCS.buy_from_shop({config = {ref_table = area_card(G.shop_jokers, a.index)}})
+    if G.FUNCS.buy_from_shop({config = {ref_table = area_card(G.shop_jokers, a.index)}}) == false then
+      fail('no room for the card')
+    end
   elseif k == 'buy_and_use' then
     G.FUNCS.buy_from_shop({config = {ref_table = area_card(G.shop_jokers, a.index), id = 'buy_and_use'}})
   elseif k == 'redeem' then

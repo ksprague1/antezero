@@ -375,3 +375,18 @@ def test_a_run_handed_back_says_it_does_not_count(game):
     AZB.bot.tick()
     assert(AZB.bot.line:find('does not count'), AZB.bot.line)
     """)
+
+
+def test_a_buy_the_game_refuses_is_refused(game):
+    reply = game.run("""
+    G.STATE, G.STATE_COMPLETE = G.STATES.SHOP, true
+    G.shop, G.E_MANAGER, G.CONTROLLER, G.TIMERS = {}, {queues = {base = {}}}, {locks = {}}, {TOTAL = 0}
+    G.shop_jokers = {cards = {{is = function() return true end}}}
+    G.FUNCS.check_for_buy_space = function() return false end -- a full joker row
+    AZB.quiet = AZB.config.quiet_frames
+    local reply
+    AZB.rpc.az_act({action = {type = 'buy', index = 1}}, function(r) reply = r end)
+    for _ = 1, AZB.config.quiet_frames + 1 do AZB.tick() end
+    return AZB.json.encode(reply)
+    """)
+    assert '"name":"BAD_REQUEST"' in reply and "no room" in reply
