@@ -609,6 +609,11 @@ impl PseudoRandom {
 		}
 	}
 
+	/// Sets the stream `key` to `state`, creating it if needed.
+	pub(crate) fn set_state(&mut self, key: &Key, state: f64) {
+		*self.slot(key) = state;
+	}
+
 	/// `pseudoseed(key)`.
 	#[inline]
 	pub fn seed_for(&mut self, key: &Key) -> f64 {

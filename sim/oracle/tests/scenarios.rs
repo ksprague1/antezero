@@ -5,15 +5,15 @@
 //! every command, the canonical state, the timeline order and the frame of
 //! every timeline entry.
 
+use oracle::Oracle;
 use oracle::command::{Command, Start};
 use oracle::difftest::{Checks, Comparison, compare};
 use oracle::policy::{highest_scoring_play, unused_cards};
-use oracle::{Oracle, json};
 use sim::actions::Action;
 use sim::data::{Back, BlindKind, Enhancement, Joker, Rank, Suit, TagKind};
 use sim::game::{Game, Phase, Scratch};
 use sim::inject::Inject;
-use sim::{CardMask, Stake};
+use sim::{CardMask, Stake, json};
 
 struct Both {
 	o: Oracle,

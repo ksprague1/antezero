@@ -16,92 +16,14 @@ use std::env::{self, VarError};
 use std::fs;
 use std::path::Path;
 
+use oracle::fingerprint::{Fingerprint, fingerprint};
 use oracle::policy::Policy;
 use sim::data::Back;
 use sim::game::Game;
-use sim::obs::{self, ObsBuf};
-use sim::{Stake, canon, num, rng};
+use sim::{Stake, num};
 
 const GAMES: u64 = 200;
 const STEPS: usize = 300;
-
-struct Fnv(u64);
-
-impl Fnv {
-	fn new() -> Fnv {
-		Fnv(rng::FNV_OFFSET_BASIS)
-	}
-
-	fn bytes(&mut self, b: &[u8]) {
-		for &x in b {
-			self.0 = rng::fnv1a(self.0, u64::from(x));
-		}
-	}
-
-	fn str(&mut self, s: &str) {
-		self.bytes(s.as_bytes());
-		self.bytes(&[0xff]);
-	}
-}
-
-/// Fingerprints of the state after a step.
-#[derive(Clone, Copy)]
-struct Fingerprint {
-	/// The simulator: canonical state and timeline.
-	sim: u64,
-	/// The learning interface: observation and ops.
-	obs: u64,
-}
-
-fn fingerprint(g: &mut Game, action: &str) -> Fingerprint {
-	let mut h = Fnv::new();
-	h.str(action);
-	for (k, v) in canon::from_sim(g) {
-		h.str(&k);
-		h.str(&v);
-	}
-	for t in g.timeline() {
-		h.str(t);
-	}
-	let sim = h.0;
-	let mut h = Fnv::new();
-	let mut buf = ObsBuf::new();
-	let lay = obs::encode_opts(g, &mut buf.as_mut(), /* deck_tokens= */ true);
-	let of = obs::Layout::of(&g.areas, &g.tags);
-	assert!(
-		of == obs::Layout {
-			n_tokens: of.n_tokens,
-			..lay
-		} && of.n_tokens <= lay.n_tokens,
-		"Layout::of {of:?} vs encoded {lay:?}"
-	);
-	for x in buf.tok_i.iter().chain(&buf.glob_i) {
-		h.bytes(&x.to_le_bytes());
-	}
-	for x in buf.tok_f.iter().chain(&buf.glob_f) {
-		h.bytes(&x.to_bits().to_le_bytes());
-	}
-	let mut ops = Vec::new();
-	obs::ops(
-		g,
-		&lay,
-		obs::OpOptions {
-			candidates: 4,
-			..Default::default()
-		},
-		&mut ops,
-	);
-	obs::order_gain(g, &mut ops);
-	for o in &ops {
-		for x in o.ints() {
-			h.bytes(&x.to_le_bytes());
-		}
-		for x in o.feats {
-			h.bytes(&x.to_bits().to_le_bytes());
-		}
-	}
-	Fingerprint { sim, obs: h.0 }
-}
 
 fn play(n: u64) -> Vec<Fingerprint> {
 	let backs: Vec<Back> = Back::simulated().collect();

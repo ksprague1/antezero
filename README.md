@@ -27,9 +27,10 @@ uv run python -m antezero_agent.bot --install antezero-v0.2.0.pt
 
 Then start Balatro, open New Run, switch on the bot toggle in the corner of
 the Play button, and press Play. Esc, Run Info and Options pause the bot.
-Bot runs leave your saves, unlocks and stats alone, unless you turn on "Bot
-runs count" (wins, losses, stats and stake progress are then kept). That
-setting, search and the bot's speed are under Mods > AnteZero > Config.
+Bot runs use only what your profile has unlocked and leave the profile as it
+was, unless you switch on "Bot runs count": the run then counts like one you
+played (wins, losses, stats, unlocks, achievements). Search, the bot's speed
+and that switch are under Mods > AnteZero > Config.
 
 ## Train and evaluate
 

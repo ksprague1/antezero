@@ -37,6 +37,22 @@ pub const fn trunc(x: f64) -> usize {
 	x as usize
 }
 
+/// A Lua number that holds a whole number, as an `i64`; `None` for any
+/// other number (a fraction, an infinity, NaN, or beyond 2^63).
+#[must_use]
+#[expect(
+	clippy::cast_possible_truncation,
+	reason = "`x` was just checked to be a whole number within i64's range"
+)]
+pub fn whole(x: f64) -> Option<i64> {
+	const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+	if x.fract() == 0.0 && (-LIMIT..LIMIT).contains(&x) {
+		Some(x as i64)
+	} else {
+		None
+	}
+}
+
 /// A Lua number as an observation feature, rounded to the nearest `f32`.
 #[inline]
 #[must_use]

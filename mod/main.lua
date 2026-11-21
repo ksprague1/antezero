@@ -6,12 +6,12 @@
 --
 -- State dumps are byte-compatible with the harness's H.state JSON. Where
 -- Steamodded represents vanilla state differently the dump reports the
--- vanilla value, and src/core.lua carries a few result-neutral or
--- vanilla-restoring shims (AZB_SMODS_COMPAT=0 disables them).
--- While the agent or the tools drive the game (a bot run, or a session the
--- tools started) it also blocks all profile/settings/run save writes
--- (AZB_ALLOW_SAVES=1 re-enables) and unlocks everything in memory like the
--- harness; otherwise it leaves the game alone. The az_eval method (arbitrary
+-- vanilla value. In a session the developer tools started, src/core.lua
+-- carries a few result-neutral or vanilla-restoring shims
+-- (AZB_SMODS_COMPAT=0 disables them), blocks all profile/settings/run save
+-- writes (AZB_ALLOW_SAVES=1 re-enables) and unlocks everything in memory
+-- like the harness; a bot run that does not count blocks the writes too;
+-- otherwise the mod leaves the game alone. The az_eval method (arbitrary
 -- Lua) is refused unless AZB_ALLOW_EVAL=1.
 
 AZB = AZB or {}

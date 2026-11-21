@@ -6,8 +6,8 @@ local function env_flag(name, default)
 end
 
 AZB.config = {
-  -- Block every write of settings/profile/progress/run saves (the bot
-  -- otherwise overwrites the player's save.jkr, settings and unlocks).
+  -- Block every write of settings/profile/progress/run saves in a session
+  -- the developer tools started and in a bot run that does not count.
   save_guard = not env_flag("AZB_ALLOW_SAVES", false),
   -- Unlock + discover everything in memory, like the oracle harness
   -- (pools depend on `unlocked`, tag pools on `discovered`).
@@ -26,16 +26,18 @@ AZB.config = {
 }
 
 -- Bridge session: the developer tools started the game with BalatroBot,
--- whose settings fix the timestep for the whole process; saves are guarded
--- and everything is unlocked from the start. In any other session the mod
--- leaves the game alone until a bot run (src/bot.lua) needs the same
--- conditions, and puts everything back after it.
+-- whose settings fix the timestep for the whole process, to play runs in
+-- step with the simulator: saves are guarded, everything is unlocked from
+-- the start, and the `smods_compat` shims below restore vanilla behaviour.
+-- In any other session the mod leaves the game alone, but for what a bot
+-- run (src/bot.lua) needs.
 function AZB.is_bridge() return BB_SETTINGS ~= nil end
-function AZB.parity() return AZB.is_bridge() or (AZB.bot ~= nil and AZB.bot.protected) end
 
 AZB.blocked_saves = {}
 
-local function guarding() return AZB.config.save_guard and AZB.parity() end
+local function guarding()
+  return AZB.config.save_guard and (AZB.is_bridge() or (AZB.bot ~= nil and AZB.bot.protected))
+end
 
 -- save_run() returns early on G.F_NO_SAVING.
 function AZB.guard_saves(on)
@@ -99,7 +101,7 @@ if not AZB._card_init_hooked then
   local card_init = Card.init
   function Card:init(...)
     card_init(self, ...)
-    if AZB.config.stable_unique_val and self.sort_id and AZB.parity() then
+    if AZB.config.stable_unique_val and self.sort_id and AZB.is_bridge() then
       self.unique_val = 1 - (self.sort_id * 50) / 1603301
     end
     if AZB.capture then AZB.capture[#AZB.capture + 1] = self end
@@ -153,7 +155,7 @@ if AZB.config.smods_compat and not AZB._gcp_hooked then
   AZB._gcp_hooked = true
   local gcp = get_current_pool
   function get_current_pool(_type, _rarity, _legendary, _append, ...)
-    if AZB.parity() and _type == 'Joker' and _legendary and _rarity == nil and G.GAME and G.GAME.round_resets then
+    if AZB.is_bridge() and _type == 'Joker' and _legendary and _rarity == nil and G.GAME and G.GAME.round_resets then
       pseudorandom('rarity' .. G.GAME.round_resets.ante .. (_append or ''))
     end
     return gcp(_type, _rarity, _legendary, _append, ...)
@@ -169,7 +171,7 @@ if AZB.config.smods_compat and not AZB._apply_hooked then
   local apply_to_run = Card.apply_to_run
   AZB.display_id = 0
   function Card.apply_to_run(self, ...)
-    if not AZB.parity() then return apply_to_run(self, ...) end
+    if not AZB.is_bridge() then return apply_to_run(self, ...) end
     local before = G.sort_id
     local outer = AZB.capture
     AZB.capture = {}
@@ -218,7 +220,7 @@ if AZB.config.smods_compat and not AZB._pta_hooked then
   local play = G.FUNCS.play_cards_from_highlighted
   G.FUNCS.play_cards_from_highlighted = function(...)
     played = {}
-    for _, c in ipairs(AZB.parity() and G.hand and G.hand.highlighted or {}) do
+    for _, c in ipairs(AZB.is_bridge() and G.hand and G.hand.highlighted or {}) do
       if c.ability then
         c.ability.played_this_ante = true
         played[#played + 1] = {c, c.azb_set_ability or 0}
@@ -260,7 +262,7 @@ if not AZB._used_hooked then
   local set_ability = Card.set_ability
   function Card:set_ability(...)
     local r = set_ability(self, ...)
-    if AZB.config.smods_compat and self.ability and AZB.parity() then
+    if AZB.config.smods_compat and self.ability and AZB.is_bridge() then
       self.ability.played_this_ante = nil -- vanilla rebuilds the table
       self.azb_set_ability = (self.azb_set_ability or 0) + 1
     end
@@ -492,32 +494,23 @@ end
 
 -- One game update, then the requests it may answer, then the settle count
 -- (BalatroBot serves its requests inside its own love.update). A bot run
--- outside a bridge session runs on the oracle's clock: dt = 1/60 at
--- GAMESPEED 1, as many updates per frame as the bot's speed setting asks
--- for and a frame has time for (the rest are dropped: the run just plays
--- slower than asked).
+-- outside a bridge session plays at the bot's speed setting: updates of
+-- 1/60 s of game time (the game scales dt by its game speed), as many per
+-- frame as the setting asks for and a frame has time for (the rest are
+-- dropped: the run just plays slower than asked).
 local love_update = love.update
 love.update = function(dt)
-  local n, gamespeed = 1, nil
+  local n, step = 1, dt
   if AZB.bot and AZB.bot.stepping() then
-    gamespeed = G.SETTINGS.GAMESPEED
     n = AZB.bot.steps(dt)
+    step = 1 / 60 / G.SETTINGS.GAMESPEED
   end
   local t0 = love.timer.getTime()
   for i = 1, n do
     if i > 1 and love.timer.getTime() - t0 > 0.008 then break end
-    if gamespeed then
-      G.SETTINGS.GAMESPEED = 1
-      love_update(1 / 60)
-    else
-      love_update(dt)
-    end
+    love_update(step)
     if AZB.server then AZB.server.update() end
     local ok, err = pcall(AZB.tick)
     if not ok then sendErrorMessage("tick failed: " .. tostring(err), "AnteZero") end
-    if gamespeed then
-      if G.SETTINGS.GAMESPEED ~= 1 then gamespeed = G.SETTINGS.GAMESPEED end -- changed in the settings menu
-      G.SETTINGS.GAMESPEED = gamespeed
-    end
   end
 end

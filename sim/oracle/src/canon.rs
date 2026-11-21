@@ -8,8 +8,7 @@ pub use sim::canon::{Canon, from_sim};
 use sim::canon::{CanonArea, JokerField, canon_number, normalize_key};
 use sim::data::{HandType, Joker};
 use sim::game::Game;
-
-use crate::json::Json;
+use sim::json::Json;
 
 /// The game's value at `path` of a joker's `ability` table, `absent` if it
 /// has none.

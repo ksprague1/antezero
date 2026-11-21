@@ -21,7 +21,8 @@
 pub mod canon;
 pub mod command;
 pub mod difftest;
-pub mod json;
+pub mod dumpcheck;
+pub mod fingerprint;
 #[cfg(windows)]
 mod lua;
 #[cfg(not(windows))]
