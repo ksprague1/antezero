@@ -8,22 +8,25 @@
 //!   (see [`part_diffs`]), and give its learning observation,
 //! * stay equal to the game for the rest of the game under the same
 //!   commands.
+//!
+//! There the game is also dumped by the mod's own writer (`mod/src/state.lua`,
+//! which the bot imports in the real game), and both dumps must be the same.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
+use std::path::Path;
 
-use sim::canon::normalize_key;
 use sim::data::Booster;
 use sim::game::{Areas, Flow, Game, PackSlot, Phase, State};
 use sim::json::{self, Json};
 use sim::rng::Xorshift;
 use sim::{AnyCard, CardLike, Kind};
 
-use crate::Oracle;
 use crate::canon::{self, Diff};
 use crate::difftest::GameSpec;
 use crate::fingerprint::obs_fingerprint;
 use crate::policy::Policy;
+use crate::{Oracle, lua_path};
 
 /// What a checked game covered.
 #[derive(Clone, Debug, Default)]
@@ -214,6 +217,21 @@ impl Check<'_> {
 
 	/// Imports the dump `j` of step `step` and checks the imported game.
 	fn import(&mut self, step: usize, j: &Json) -> Result<(), String> {
+		let theirs = self
+			.o
+			.eval("return AZB.state()")
+			.map_err(|e| self.fail(step, &e))?;
+		let theirs = json::parse(&theirs).map_err(|e| self.fail(step, &e))?;
+		let differ = writer_diffs(j, &theirs);
+		if !differ.is_empty() {
+			return Err(self.fail(
+				step,
+				&format!(
+					"the mod's dump differs from the harness's in {}",
+					differ.join(", ")
+				),
+			));
+		}
 		let mut imp = Game::from_dump(j).map_err(|e| self.fail(step, &e.to_string()))?;
 		imp.flow.rearranges = self.g.flow.rearranges;
 		let d = canon::diff(&canon::from_sim(&mut imp), &canon::from_lua(j));
@@ -274,24 +292,57 @@ impl Check<'_> {
 	}
 }
 
-/// A copy of `g` that shows the shop's packs as the first of their art
-/// variants, as the canonical state does: the game picks the variant of the
-/// first shop's Buffoon pack with the unseeded `math.random`, the simulator
-/// always deals the first.
-fn first_variants(g: &Game) -> Game {
-	let first = |b: Booster| {
-		Booster::from_key(normalize_key(b.key())).expect("a normalized key is a pack's")
+/// Loads the mod's state writer into the oracle as `AZB.state()`, with what
+/// it takes from the rest of the mod as the mod has it in a game without
+/// Steamodded.
+fn load_mod_writer(o: &mut Oracle) -> Result<(), String> {
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mod/src");
+	o.exec(&format!(
+		"SMODS = {{}}
+		AZB = {{json = dofile({json})}}
+		function AZB.state_name(s) for k, v in pairs(G.STATES) do if v == s then return k end end end
+		function AZB.vanilla_state_name() return AZB.state_name(G.STATE) end
+		function AZB.is_settled() return true end
+		function AZB.smods_only_rng() return false end
+		dofile({state})",
+		json = lua_path(&dir.join("json.lua")),
+		state = lua_path(&dir.join("state.lua")),
+	))
+}
+
+/// The keys of the harness's dump `ours` and the mod's `theirs` whose values
+/// differ, but for what only one of them writes (the harness's frame count
+/// and trace, the mod's frame count and `az`).
+fn writer_diffs(ours: &Json, theirs: &Json) -> Vec<String> {
+	let (Some(ours), Some(theirs)) = (ours.as_object(), theirs.as_object()) else {
+		return vec!["the whole dump".into()];
 	};
+	let own = |k: &str| matches!(k, "frame" | "trace" | "az");
+	let keys: BTreeSet<&String> = ours.keys().chain(theirs.keys()).collect();
+	keys.into_iter()
+		.filter(|k| !own(k) && ours.get(*k) != theirs.get(*k))
+		.cloned()
+		.collect()
+}
+
+/// A copy of `g` whose first shop's Buffoon Pack is the first of its two
+/// art variants: the game picks the variant with the unseeded `math.random`,
+/// the simulator always deals the first.
+fn first_variants(g: &Game) -> Game {
 	let mut g = g.clone();
+	// the first shop is the one after the first blind played
+	if g.run.round != 1 {
+		return g;
+	}
 	for c in &mut g.areas.shop_boosters {
-		if let Kind::Booster(b) = c.kind {
-			c.kind = Kind::Booster(first(b));
+		if c.booster_slot == Some(0) && c.kind == Kind::Booster(Booster::BuffoonNormal2) {
+			c.kind = Kind::Booster(Booster::BuffoonNormal1);
 		}
 	}
-	for slot in &mut g.shop.booster_slots {
-		if let PackSlot::Offered(b) = *slot {
-			*slot = PackSlot::Offered(first(b));
-		}
+	if let Some(slot @ PackSlot::Offered(Booster::BuffoonNormal2)) =
+		g.shop.booster_slots.first_mut()
+	{
+		*slot = PackSlot::Offered(Booster::BuffoonNormal1);
 	}
 	g
 }
@@ -321,6 +372,7 @@ pub fn check_game(
 		history: vec![spec.start.to_string()],
 		stats: DumpStats::default(),
 	};
+	load_mod_writer(c.o)?;
 	let mut policy = Policy::new(spec.policy_seed, spec.inject_rate);
 	let mut picks = Xorshift::new(spec.policy_seed ^ 0x5eed_d0d0);
 	let mut j = c.sync(0, &spec.start.to_lua())?;

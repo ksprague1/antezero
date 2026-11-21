@@ -27,7 +27,7 @@ fn imported_games_are_the_game() {
 				back: backs[num::pick(id * 2, backs.len())],
 				stake: Stake::ALL[num::pick(id, Stake::ALL.len())],
 			},
-			max_steps: 150,
+			max_steps: 5000, // games end before it
 			policy_seed: id.wrapping_mul(7919),
 			inject_rate: 0.1,
 		};
