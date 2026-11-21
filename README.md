@@ -73,6 +73,14 @@ stakes.
 <tr><th>All decks</th><td align="right">94%</td><td align="right">88%</td><td align="right">69%</td><td align="right">63%</td><td align="right">55%</td><td align="right">32%</td><td align="right">21%</td><td align="right">12%</td></tr>
 </table>
 
+## How it works
+
+- **Simulator:** A bit-exact Rust reimplementation of Balatro v1.0.1o, verified in lockstep against the real game and exposed to Python as a vectorized environment (`antezero_sim.VecEnv`).
+- **Model:** An entity transformer over variable-length game-state tokens, with card effects (jokers, tarots, planets) encoded directly as token features and factored action heads.
+- **Training:** PPO over parallel Rust environments with a decoupled critic and a stake curriculum spanning all 15 decks and 8 stakes.
+- **Search:** Optional test-time determinized lookahead and within-round search (both disabled in the win-rate table above).
+- **Real-game bridge:** A Steamodded mod and local bridge that rebuild the simulator state from the live game at every decision.
+
 ## More
 
 - [sim/README.md](sim/README.md): the simulator and how it is checked against the real game
