@@ -7,7 +7,7 @@ end
 
 AZB.config = {
   -- Block every write of settings/profile/progress/run saves in a session
-  -- the developer tools started and in a bot run that does not count.
+  -- the developer tools started.
   save_guard = not env_flag("AZB_ALLOW_SAVES", false),
   -- Unlock + discover everything in memory, like the oracle harness
   -- (pools depend on `unlocked`, tag pools on `discovered`).
@@ -35,13 +35,10 @@ function AZB.is_bridge() return BB_SETTINGS ~= nil end
 
 AZB.blocked_saves = {}
 
-local function guarding()
-  return AZB.config.save_guard and (AZB.is_bridge() or (AZB.bot ~= nil and AZB.bot.protected))
-end
+local function bridge_guard() return AZB.config.save_guard and AZB.is_bridge() end
 
 -- save_run() returns early on G.F_NO_SAVING.
 function AZB.guard_saves(on)
-  if not AZB.config.save_guard then return end
   if on and not AZB._no_saving then
     AZB._no_saving = {G.F_NO_SAVING}
     G.F_NO_SAVING = true
@@ -60,9 +57,13 @@ function AZB.install_save_guard()
     G.SAVE_MANAGER.channel = setmetatable({
       push = function(_, msg)
         local t = type(msg) == "table" and tostring(msg.type) or tostring(msg)
-        if guarding() and t:sub(1, 5) == "save_" then
-          AZB.blocked_saves[t] = (AZB.blocked_saves[t] or 0) + 1
-          return true
+        if t:sub(1, 5) == "save_" then
+          if bridge_guard() then
+            AZB.blocked_saves[t] = (AZB.blocked_saves[t] or 0) + 1
+            return true
+          end
+          msg = AZB.bot.outgoing(msg)
+          if not msg then return true end
         end
         return real:push(msg)
       end,
@@ -79,7 +80,7 @@ function AZB.install_save_guard()
   -- remove_save() deletes <profile>/save.jkr directly.
   local real_remove = remove_save
   remove_save = function(...)
-    if not guarding() then return real_remove(...) end
+    if not (bridge_guard() or AZB.bot.protected) then return real_remove(...) end
     AZB.blocked_saves.remove_save = (AZB.blocked_saves.remove_save or 0) + 1
   end
 end
@@ -110,7 +111,7 @@ end
 
 AZB.install_save_guard()
 if AZB.is_bridge() then
-  AZB.guard_saves(true)
+  if AZB.config.save_guard then AZB.guard_saves(true) end
   AZB.unlock_all()
 end
 

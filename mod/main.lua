@@ -10,9 +10,9 @@
 -- carries a few result-neutral or vanilla-restoring shims
 -- (AZB_SMODS_COMPAT=0 disables them), blocks all profile/settings/run save
 -- writes (AZB_ALLOW_SAVES=1 re-enables) and unlocks everything in memory
--- like the harness; a bot run that does not count blocks the writes too;
--- otherwise the mod leaves the game alone. The az_eval method (arbitrary
--- Lua) is refused unless AZB_ALLOW_EVAL=1.
+-- like the harness; a bot run saves only the player's own state (see
+-- src/bot.lua); otherwise the mod leaves the game alone. The az_eval method
+-- (arbitrary Lua) is refused unless AZB_ALLOW_EVAL=1.
 
 AZB = AZB or {}
 AZB.VERSION = "0.2.0"

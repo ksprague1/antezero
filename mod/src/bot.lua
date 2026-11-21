@@ -5,12 +5,14 @@
 -- A bot run is an ordinary run on the player's profile: the agent rebuilds
 -- its simulator from the game's state before every decision, so the run
 -- needs nothing set up for it. With "Bot runs count" off it leaves the
--- profile exactly as it was: nothing is saved during the run, no
--- achievement is awarded, and the profile, unlocks and discoveries are put
--- back when it ends. With it on, the run counts like one the player played.
--- Either way the tutorial is skipped for the run, the run plays at the bot's
--- speed setting (the clock of core.lua), and input is limited to Esc, Run
--- Info and Options, whose menus pause it.
+-- profile exactly as it was: the run is not saved, no achievement is
+-- awarded, what the game saves meanwhile is the profile as it was when Play
+-- was pressed (with the player's settings), and the profile, unlocks and
+-- discoveries are put back when the run ends. With it on, the run counts
+-- like one the player played. Either way the tutorial is skipped for the run
+-- (and saved as it was), the run plays at the bot's speed setting (the clock
+-- of core.lua), and input is limited to Esc, Run Info and Options, whose
+-- menus pause it.
 
 local B = {
   enabled = false,   -- the toggle
@@ -51,7 +53,6 @@ function B.release()
   if B.tutorial then
     G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress = B.tutorial[1], B.tutorial[2]
     B.tutorial = nil
-    if not B.protected then G:save_settings() end -- the run's start saved the skipped tutorial
   end
   if not B.protected then return end
   local s = B.saved
@@ -62,6 +63,9 @@ function B.release()
   local live = G.PROFILES[G.SETTINGS.profile]
   for k in pairs(live) do live[k] = nil end
   for k, v in pairs(s.profile) do live[k] = v end
+  -- Steamodded's per-stake views of the usage tables (wins_by_key, ...) were
+  -- copied bound to the run's tables; bind them anew, as loading a profile does.
+  if convert_save_data then convert_save_data(live, true) end
   set_discover_tallies()
   set_profile_progress()
   -- A progress save queued during the run would still write the run's unlocks and discoveries.
@@ -75,6 +79,47 @@ local unlock_achievement_ = unlock_achievement
 function unlock_achievement(...)
   if B.protected then return end
   return unlock_achievement_(...)
+end
+
+-- The start of a run shows the unlocks an earlier session left in
+-- unlock_notify.jkr and deletes it; they wait for a run that counts or the menu.
+local unlock_notify_ = unlock_notify
+function unlock_notify(...)
+  if B.protected then return end
+  return unlock_notify_(...)
+end
+
+-- What a save the game sends during a bot run writes (core.lua's save
+-- channel asks; nil: nothing): the player's tutorial, and while the run does
+-- not count, the profile and unlocks as they were when it started. Run saves
+-- are stopped where they are made (G.F_NO_SAVING), so one sent now was
+-- queued before the run started and is the player's.
+function B.outgoing(msg)
+  local t = msg.type
+  if not (B.tutorial or B.protected) or t == 'save_run' then return msg end
+  if t ~= 'save_settings' and t ~= 'save_progress' then return not B.protected and msg or nil end
+  local p = msg.save_progress
+  local settings = p and p.SETTINGS or msg.save_settings
+  if B.tutorial then
+    local s = {}
+    for k, v in pairs(settings) do s[k] = v end
+    s.tutorial_complete, s.tutorial_progress = B.tutorial[1], B.tutorial[2]
+    settings = s
+  end
+  if not B.protected then
+    if p then return {type = t, save_progress = {UDA = p.UDA, SETTINGS = settings, PROFILE = p.PROFILE}} end
+    return {type = t, save_settings = settings, profile_num = msg.profile_num, save_profile = msg.save_profile}
+  end
+  local s = B.saved
+  if not p then return {type = t, save_settings = settings, profile_num = msg.profile_num, save_profile = s.profile} end
+  local uda = {} -- as Game:save_progress writes the flags
+  for _, tbl in ipairs(TABLES()) do
+    for k, v in pairs(tbl or {}) do
+      local f = s.flags[v]
+      if f then uda[k] = (f[1] and 'u' or '') .. (f[2] and 'd' or '') .. (f[3] and 'a' or '') end
+    end
+  end
+  return {type = t, save_progress = {UDA = uda, SETTINGS = settings, PROFILE = s.profile}}
 end
 
 function B.stepping()
@@ -114,9 +159,10 @@ function Game:start_run(args)
   args = args or {}
   local bot = B.pending and not args.savetext and not args.challenge
   B.pending = false
-  B.release() -- a bot run before this one is settled first
-  if not bot then return start_run(self, args) end
-  protect()
+  if not bot then -- (a bot run's Play button settled the run before it)
+    B.release()
+    return start_run(self, args)
+  end
   if not G.SETTINGS.tutorial_complete then
     B.tutorial = {G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress}
     G.SETTINGS.tutorial_complete, G.SETTINGS.tutorial_progress = true, nil
@@ -137,18 +183,22 @@ function Game:main_menu(...)
   return main_menu(self, ...)
 end
 
--- The Play buttons: the vanilla screen's, and Steamodded's run select.
-local function play_button(name, is_new_run)
-  local f = G.FUNCS[name]
+-- The Play buttons: the vanilla screen's, and Steamodded's run select (its
+-- Play, Quick Start and double-click). They write the new run's choices to
+-- the profile, so the run on screen is settled first.
+local function play_button(t, name, is_new_run)
+  local f = t and t[name]
   if not f then return end
-  G.FUNCS[name] = function(...)
-    B.pending = B.enabled and is_new_run()
+  t[name] = function(...)
+    B.release()
+    B.pending = B.enabled and is_new_run(...)
     if B.pending then protect() end
     return f(...)
   end
 end
-play_button('start_setup_run', function() return G.SETTINGS.current_setup == 'New Run' end)
-play_button('run_select_start_run', function() return true end)
+-- holding R restarts a run through it, with no button
+play_button(G.FUNCS, 'start_setup_run', function(e) return e ~= nil and G.SETTINGS.current_setup == 'New Run' end)
+play_button(SMODS.RunSelect and SMODS.RunSelect.Functions, 'start_run', function() return true end)
 
 local atlas = SMODS.Atlas({key = 'bot', path = 'bot.png', px = 16, py = 16})
 
@@ -269,7 +319,7 @@ function B.tick()
     stop(B.contact and 'stopped: the bot does not answer' or 'stopped: the bot did not start (see the "AnteZero bot" window)')
   end
   local line
-  if not B.active then line = B.status or ''
+  if not B.active then line = (B.status or '') .. (B.protected and '   (this run does not count)' or '')
   elseif paused() then line = 'paused (close the menu to go on)'
   elseif not B.last then line = B.status or ''
   elseif B.thinking and now() - B.thinking > 0.7 then line = B.last .. '   thinking...'
