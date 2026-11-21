@@ -19,15 +19,15 @@ Useful flags:
 - `--sample` (sample actions instead of greedy argmax)
 - `--no-extra-obs` (ablation: disable `Game.extra_obs()` and use only `canonical()` + Python-derivable fields)
 
-## Evaluation Results (Gold Stake, Greedy, Interim `N = 128`)
+## Evaluation Results (Gold Stake, Greedy, `N = 1,024`)
 
-Evaluated in `antezero_sim` on seeds `EVAL00`..`EVAL127` (`stake=8`, `0` illegal actions, `0` truncations; reference `antezero-v0.2.0.pt` from `README.md`):
+Evaluated in `antezero_sim` on seeds `EVAL00`..`EVAL1023` (`stake=8`, `0` illegal actions, `0` truncations; reference `antezero-v0.2.0.pt` from `README.md`):
 
-| Deck | `model_0095.pt` (`N = 128`) | Mean Ante | Mean Steps | `antezero-v0.2.0.pt` (ref) |
+| Deck | `model_0095.pt` (`N = 1,024`) | Mean Ante | Mean Steps | `antezero-v0.2.0.pt` (ref) |
 |---|---:|---:|---:|---:|
-| Blue Deck (`b_blue`) | **43.0%** (`55/128`) | 6.47 | 308.2 | 24% |
-| Yellow Deck (`b_yellow`) | **40.6%** (`52/128`) | 6.46 | 318.0 | 21% |
-| Black Deck (`b_black`) | **9.4%** (`12/128`) | 3.71 | 130.7 | 3% |
+| Blue Deck (`b_blue`) | **44.2%** (`453/1024`) | 6.46 | 303.2 | 24% |
+| Yellow Deck (`b_yellow`) | **42.2%** (`432/1024`) | 6.43 | 313.5 | 21% |
+| Black Deck (`b_black`) | **10.2%** (`104/1024`) | 3.80 | 132.2 | 3% |
 
 ## Observation & Stepping Differences vs `BalatroEnv`
 
