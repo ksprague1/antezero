@@ -310,7 +310,10 @@ function B.acting(a, note)
   B.seen, B.thinking, B.interrupted = now(), nil, false
 end
 
-local function paused() return G.OVERLAY_MENU ~= nil and not (G.GAME and G.GAME.won) end
+-- A menu the player opened, not the screen that ends the run.
+local function paused()
+  return G.OVERLAY_MENU ~= nil and G.STATE ~= G.STATES.GAME_OVER and not (G.GAME and G.GAME.won)
+end
 
 function B.tick()
   if not B.run then return end

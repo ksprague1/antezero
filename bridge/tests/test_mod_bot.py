@@ -391,6 +391,9 @@ def test_the_bot_hears_of_a_menu_opened_since_its_last_action(game):
     assert(not poll().paused and reply.interrupted, 'closed since')
     AZB.bot.acting({type = 'reroll'}, '')
     assert(not poll().interrupted, 'the next action')
+    G.STATE, G.OVERLAY_MENU = G.STATES.GAME_OVER, {} -- the game over screen
+    AZB.bot.tick()
+    assert(not poll().paused and not reply.interrupted, 'the end of the run is no menu')
     """)
 
 
