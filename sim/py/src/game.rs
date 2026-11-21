@@ -2,7 +2,8 @@ use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use sim::data::{Back, Center};
+use sim::card::{AnyCard, Card, Kind};
+use sim::data::{Back, Center, HandType};
 use sim::game::Game as SimGame;
 use sim::inject::Inject;
 use sim::obs::{self, BuildPreview, Layout, Op, OpOptions};
@@ -329,6 +330,62 @@ impl Game {
 		for (k, v) in c {
 			d.set_item(k, v)?;
 		}
+		Ok(d)
+	}
+
+	/// Extra observation fields not in `canonical()` (so `canon.rs` and oracle
+	/// comparisons stay untouched): `last_hand_score`, `last_hand_chips`,
+	/// `last_hand_mult`, `hand_visible`, and `times_played` for hand/deck/discard.
+	fn extra_obs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+		let d = PyDict::new(py);
+		d.set_item("last_hand_score", self.g.run.last_hand_score)?;
+		d.set_item("last_hand_chips", self.g.run.last_hand_chips)?;
+		d.set_item("last_hand_mult", self.g.run.last_hand_mult)?;
+
+		let hv = PyDict::new(py);
+		for h in HandType::ALL {
+			hv.set_item(h.name(), self.g.hands[h].visible)?;
+		}
+		d.set_item("hand_visible", hv)?;
+
+		let hand_tp: Vec<u32> = self.g.areas.hand.cards.iter().map(|c| c.times_played).collect();
+		let deck_tp: Vec<u32> = self.g.areas.deck.iter().map(|c| c.times_played).collect();
+		let discard_tp: Vec<u32> = self.g.areas.discard.iter().map(|c| c.times_played).collect();
+		d.set_item("hand_times_played", hand_tp)?;
+		d.set_item("deck_times_played", deck_tp)?;
+		d.set_item("discard_times_played", discard_tp)?;
+
+		let card_extra = |c: &Card| -> (f64, f64) {
+			let e0 = if c.ab.extra != 0.0 {
+				c.ab.extra
+			} else if c.ab.chips != 0.0 {
+				c.ab.chips
+			} else if let Kind::Booster(b) = c.kind {
+				f64::from(b.def().extra)
+			} else {
+				0.0
+			};
+			let e1 = c.ab.dollars;
+			(e0, e1)
+		};
+		let other_extra = |cards: &[Card]| -> Vec<(f64, f64)> {
+			cards.iter().map(card_extra).collect()
+		};
+		let any_extra = |cards: &[AnyCard]| -> Vec<(f64, f64)> {
+			cards
+				.iter()
+				.map(|a| match a {
+					AnyCard::Playing(_) => (0.0, 0.0),
+					AnyCard::Card(c) => card_extra(c),
+				})
+				.collect()
+		};
+		d.set_item("jokers_extra", other_extra(&self.g.areas.jokers))?;
+		d.set_item("consumables_extra", other_extra(&self.g.areas.consumables))?;
+		d.set_item("shop_extra", any_extra(&self.g.areas.shop_jokers))?;
+		d.set_item("vouchers_extra", other_extra(&self.g.areas.shop_vouchers))?;
+		d.set_item("boosters_extra", other_extra(&self.g.areas.shop_boosters))?;
+		d.set_item("pack_extra", any_extra(&self.g.areas.pack_cards))?;
 		Ok(d)
 	}
 

@@ -308,6 +308,8 @@ pub(crate) fn evaluate_play(g: &mut Game) {
 		score_hand(g, &sc, n_play)
 	};
 	let score = (hand_chips * mult).floor();
+	g.run.last_hand_chips = hand_chips;
+	g.run.last_hand_mult = mult;
 	g.run.last_hand_score = score;
 	g.flow.scored = true;
 	g.events.push_after(0.4, Event::PushHandTextImmediate);
