@@ -67,13 +67,27 @@ fn opt_int<T: TryFrom<i64>>(j: &Json, key: &str) -> Result<Option<T>, DumpError>
 	opt_number(j, key)?.map(|x| whole(j, key, x)).transpose()
 }
 
-/// A flag: the game leaves it `nil` while it is false.
+/// A flag the dump always writes.
 fn flag(j: &Json, key: &str) -> Result<bool, DumpError> {
 	match j.get(key) {
 		Json::Bool(b) => Ok(*b),
-		Json::Null => Ok(false),
 		v => Err(bad(key, v)),
 	}
+}
+
+/// A flag the game leaves `nil` while it is false (a key the dump leaves
+/// out).
+fn opt_flag(j: &Json, key: &str) -> Result<bool, DumpError> {
+	match j.get(key) {
+		Json::Null => Ok(false),
+		_ => flag(j, key),
+	}
+}
+
+/// A table the dump always writes.
+fn object<'j>(j: &'j Json, key: &str) -> Result<&'j Json, DumpError> {
+	let v = j.get(key);
+	v.as_object().map(|_| v).ok_or_else(|| bad(key, v))
 }
 
 fn text<'j>(j: &'j Json, key: &str) -> Result<&'j str, DumpError> {
@@ -102,11 +116,10 @@ fn opt_named<T>(
 		.transpose()
 }
 
-/// A list: the dump writes an empty table as `[]` and `nil` as `null`.
+/// A list the dump always writes (an empty one as `[]`).
 fn list<'j>(j: &'j Json, key: &str) -> Result<&'j [Json], DumpError> {
 	match j.get(key) {
 		Json::Arr(a) => Ok(a),
-		Json::Null => Ok(&[]),
 		v => Err(bad(key, v)),
 	}
 }
@@ -179,7 +192,7 @@ pub(crate) fn read(j: &Json) -> Result<Game, DumpError> {
 		blind: read_blind(j.get("blind"))?,
 		shop,
 		pack: read_pack(j, state)?,
-		hands: read_hands(j.get("hands"))?,
+		hands: read_hands(object(j, "hands")?)?,
 		tags: read_tags(j)?,
 	};
 	g.update_derived();
@@ -308,9 +321,9 @@ fn read_history(j: &Json) -> Result<History, DumpError> {
 }
 
 fn read_round(j: &Json) -> Result<Round, DumpError> {
-	let bonus = j.get("round_bonus");
-	let idol = j.get("idol_card");
-	let mail = j.get("mail_card");
+	let bonus = object(j, "round_bonus")?;
+	let idol = object(j, "idol_card")?;
+	let mail = object(j, "mail_card")?;
 	let rank_id = |c: &Json| {
 		opt_int::<u8>(c, "id")?
 			.map(|id| Rank::from_id(id).ok_or_else(|| bad("id", c.get("id"))))
@@ -346,10 +359,10 @@ fn read_round(j: &Json) -> Result<Round, DumpError> {
 }
 
 fn read_blind_select(j: &Json) -> Result<BlindSelect, DumpError> {
-	let states = j.get("blind_states");
-	let tags = j.get("blind_tags");
+	let states = object(j, "blind_states")?;
+	let tags = object(j, "blind_tags")?;
 	let mut out = BlindSelect {
-		boss: named(j.get("blind_choices"), "Boss", BlindKind::from_key)?,
+		boss: named(object(j, "blind_choices")?, "Boss", BlindKind::from_key)?,
 		skip_tags: SkipTags {
 			small: opt_named(tags, "Small", TagKind::from_key)?,
 			big: opt_named(tags, "Big", TagKind::from_key)?,
@@ -400,7 +413,7 @@ fn read_blind(j: &Json) -> Result<Blind, DumpError> {
 		chips: number(j, "chips")?,
 		dollars: number(j, "dollars")?,
 		mult: number(j, "mult")?,
-		disabled: flag(j, "disabled")?,
+		disabled: opt_flag(j, "disabled")?,
 		triggered: flag(j, "triggered")?,
 		prepped: flag(j, "prepped")?,
 		eye_hands,
@@ -565,7 +578,11 @@ fn read_areas(j: &Json) -> Result<Areas, DumpError> {
 		shop_jokers: any_cards(j, "shop_jokers")?,
 		shop_vouchers: cards(j, "shop_vouchers")?,
 		shop_boosters: cards(j, "shop_booster")?,
-		pack_cards: any_cards(j, "pack_cards")?,
+		// The game has the area only while a pack is open.
+		pack_cards: match j.get("pack_cards") {
+			Json::Null => Vec::new(),
+			_ => any_cards(j, "pack_cards")?,
+		},
 		joker_buffer: number(j, "joker_buffer")?,
 		consumable_buffer: number(j, "consumeable_buffer")?,
 		next_sort_id: int(j, "sort_id")?,
@@ -612,7 +629,7 @@ fn core(c: &Json) -> Result<CardCore, DumpError> {
 		extra_cost: number(c, "extra_cost")?,
 		cost: number(c, "cost")?,
 		sell_cost: number(c, "sell_cost")?,
-		couponed: flag(ab, "couponed")?,
+		couponed: opt_flag(ab, "couponed")?,
 		hands_played_at_create: number(ab, "hands_played_at_create")?,
 		added_to_deck: flag(c, "added_to_deck")?,
 	})
@@ -632,9 +649,9 @@ fn playing_card(c: &Json) -> Result<PlayingCard, DumpError> {
 		enhancement: named(c, "key", Enhancement::from_key)?,
 		seal: opt_named(c, "seal", |s| by_name(&Seal::ALL, Seal::name, s))?,
 		perma_bonus: number(ab, "perma_bonus")?,
-		forced_selection: flag(ab, "forced_selection")?,
-		played_this_ante: flag(ab, "played_this_ante")?,
-		wheel_flipped: flag(ab, "wheel_flipped")?,
+		forced_selection: opt_flag(ab, "forced_selection")?,
+		played_this_ante: opt_flag(ab, "played_this_ante")?,
+		wheel_flipped: opt_flag(ab, "wheel_flipped")?,
 		times_played: int(c, "times_played")?,
 		shattered: false,
 		destroyed: false,
@@ -649,13 +666,13 @@ fn card(c: &Json) -> Result<Card, DumpError> {
 	let kind = named(c, "key", kind_of)?;
 	let mut card = Card::new(0, kind);
 	card.core = core(c)?;
-	card.queue_negative_removal = flag(ab, "queue_negative_removal")?;
+	card.queue_negative_removal = opt_flag(ab, "queue_negative_removal")?;
 	match kind {
 		Kind::Joker(j) => {
 			for &field in JokerField::COMMON.iter().chain(JokerField::of(j)) {
 				set_joker_field(&mut card, field, ab)?;
 			}
-			if flag(ab, "perishable")? {
+			if opt_flag(ab, "perishable")? {
 				card.ab.sticker = Some(Sticker::Perishable {
 					tally: number(ab, "perish_tally")?,
 				});
@@ -691,12 +708,12 @@ fn set_joker_field(c: &mut Card, field: JokerField, ab: &Json) -> Result<(), Dum
 		JokerField::XMult => a.x_mult = number(table, key)?,
 		JokerField::ExtraValue => a.extra_value = number(table, key)?,
 		JokerField::Eternal => {
-			if flag(table, key)? {
+			if opt_flag(table, key)? {
 				a.sticker = Some(Sticker::Eternal);
 			}
 		}
-		JokerField::Rental => a.rental = flag(table, key)?,
-		JokerField::Couponed => c.core.couponed = flag(table, key)?,
+		JokerField::Rental => a.rental = opt_flag(table, key)?,
+		JokerField::Couponed => c.core.couponed = opt_flag(table, key)?,
 		JokerField::ExtraChips => a.chips = number(table, key)?,
 		JokerField::ExtraDollars => a.dollars = number(table, key)?,
 		JokerField::Extra | JokerField::ExtraHandSize => a.extra = number(table, key)?,
@@ -718,6 +735,7 @@ mod tests {
 	use std::collections::BTreeMap;
 
 	use super::*;
+	use crate::inject::Inject;
 
 	/// A dump of a new run with `change` made to its top-level fields.
 	fn changed(change: impl FnOnce(&mut BTreeMap<String, Json>)) -> Json {
@@ -743,6 +761,82 @@ mod tests {
 			rng.insert("k".repeat(Key::CAPACITY - 4), Json::Num(0.5));
 		});
 		assert!(read(&dump).is_err());
+	}
+
+	/// Removes the key `path` (`key`, or `area.key` of the area's first card).
+	fn without(dump: &Json, path: &str) -> Json {
+		let mut dump = dump.clone();
+		let Json::Obj(fields) = &mut dump else {
+			panic!("a dump is an object");
+		};
+		match path.split_once('.') {
+			None => fields.remove(path),
+			Some((area, key)) => {
+				let Some(Json::Arr(cards)) = fields.get_mut(area) else {
+					panic!("the dump has the area {area}");
+				};
+				let Some(Json::Obj(card)) = cards.first_mut() else {
+					panic!("the area {area} has a card");
+				};
+				card.remove(key)
+			}
+		};
+		dump
+	}
+
+	#[test]
+	fn a_dump_without_a_key_the_game_always_has_is_refused() {
+		let mut g = Game::new_run("TESTSEED", Back::Red, Stake::White);
+		g.inject(Inject::joker(Joker::Joker));
+		let dump = g.to_dump();
+		let mut paths: Vec<String> = dump
+			.as_object()
+			.expect("a dump is an object")
+			.keys()
+			.cloned()
+			.collect();
+		for area in ["deck", "jokers"] {
+			let card = dump
+				.get(area)
+				.as_list()
+				.first()
+				.expect("the area has a card");
+			let keys = card.as_object().expect("a card is an object").keys();
+			paths.extend(keys.map(|k| format!("{area}.{k}")));
+		}
+		let accepted: Vec<&str> = paths
+			.iter()
+			.map(String::as_str)
+			.filter(|p| read(&without(&dump, p)).is_ok())
+			.collect();
+		// What the game leaves `nil` at times (so the dump leaves it out), and
+		// what the canonical state reads but the simulator does not (`idol`,
+		// `mail`, a card's `card` and `perma_bonus`).
+		let nil_or_unread = [
+			"blind_on_deck",
+			"blind_selected",
+			"consumable_real_limit",
+			"consumeable_usage_total",
+			"dollar_buffer",
+			"hand_real_limit",
+			"idol",
+			"joker_real_limit",
+			"last_hand_played",
+			"last_tarot_planet",
+			"mail",
+			"pack_cards",
+			"pack_choices",
+			"pack_interrupt",
+			"temp_handsize",
+			"temp_reroll_cost",
+			"voucher",
+			"deck.card",
+			"deck.edition",
+			"deck.perma_bonus",
+			"deck.seal",
+			"jokers.edition",
+		];
+		assert_eq!(accepted, nil_or_unread, "keys a dump can be without");
 	}
 
 	#[test]
