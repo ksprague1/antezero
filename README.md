@@ -1,14 +1,14 @@
 # AnteZero
 
-A Balatro agent: a bit-exact Rust simulator of the game (v1.0.1o), a
-transformer policy trained on it with PPO, and a mod that lets it play your
-real game.
+An AI that plays Balatro. It includes a fast Rust simulator matching the real
+game (v1.0.1o), a neural network trained to play all 15 decks and 8 stakes,
+and a mod so you can watch it play your copy of the game.
 
-It plays all 15 decks at all 8 stakes. Without any search it wins about 94%
-of games at White Stake and about 12% at Gold Stake.
+Playing purely on instinct (no lookahead search), it wins about 94% of White
+Stake runs and 12% of Gold Stake runs.
 
 Not affiliated with LocalThunk or Playstack. You need your own copy of the
-game. The trained checkpoint is on the
+game. Download the trained model from the
 [releases page](https://github.com/namecallfilter/antezero/releases/latest).
 
 ## Watch it play
@@ -17,8 +17,8 @@ Needs [Balatro](https://store.steampowered.com/app/2379780/Balatro/) on
 Windows (Steam) with
 [lovely](https://github.com/ethangreen-dev/lovely-injector) and
 [Steamodded](https://github.com/Steamodded/smods), [uv](https://docs.astral.sh/uv/),
-[Rust](https://www.rust-lang.org/tools/install), and the checkpoint from the
-releases page. A CUDA GPU is recommended.
+[Rust](https://www.rust-lang.org/tools/install), and the trained model from the
+releases page. An NVIDIA (CUDA) GPU is recommended.
 
 ```
 uv sync
@@ -26,11 +26,11 @@ uv run python -m antezero_agent.bot --install antezero-v0.2.0.pt
 ```
 
 Then start Balatro, open New Run, switch on the bot toggle in the corner of
-the Play button, and press Play. Esc, Run Info and Options pause the bot.
-Bot runs use only what your profile has unlocked and leave the profile as it
-was, unless you switch on "Bot runs count": the run then counts like one you
-played (wins, losses, stats, unlocks, achievements). Search, the bot's speed
-and that switch are under Mods > AnteZero > Config.
+the Play button, and press Play. Esc, Run Info, and Options pause the bot.
+By default, the bot only uses items unlocked on your profile and won't save
+progress. If you want bot runs to count for wins, stats, unlocks, and
+achievements, turn on "Bot runs count" under Mods > AnteZero > Config (where
+you can also adjust bot speed and lookahead search).
 
 ## Train and evaluate
 
@@ -48,9 +48,9 @@ uv run --with pytest pytest agent/tests bridge/tests -q
 
 ## Win rates
 
-Games won by the released checkpoint, playing its own choice with no search,
-over about 1,024 games per cell (about ±3 points; 122,880 games in all).
-Rows are decks, columns are stakes.
+Win rates for the released model with lookahead search turned off (~1,024 runs
+per cell, 122,880 total; margin of error ~±3%). Rows are decks, columns are
+stakes.
 
 <table>
 <tr><th rowspan="2">Deck</th><th colspan="8">Stake</th></tr>
