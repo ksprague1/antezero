@@ -1,6 +1,10 @@
+import argparse
 import csv
 import json
+import os
 import random
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -969,3 +973,44 @@ def test_the_bot_stops_when_the_game_does_not_do_what_it_expected(bot_game):
     game = bot_game(BOT_RUN, misread=misread)
     assert bot.play_run(game, game, BOT_RUN, net, cfg, "cpu", None, None) == "stopped: the game did not do what the simulator expected"
     assert game.notes
+
+
+def test_the_bot_hands_its_run_back_after_losing_contact(monkeypatch):
+    import httpx
+    from antezero_agent import bot
+    from antezero_bridge import client
+
+    class Client:
+        def __init__(self, port):
+            self.polls, self.stops = 0, []
+
+        def az_bot(self, run=None, stop=None, status=None):
+            if stop:
+                self.stops.append((run, stop))
+            self.polls += 1
+            if self.polls > 4:
+                raise httpx.ConnectError("the game closed")
+            return {"active": True, "run": dict(BOT_RUN)}
+
+    def lost(*a):
+        raise httpx.ReadTimeout("no reply")
+
+    made = []
+    monkeypatch.setattr(client, "BridgeClient", lambda port: made.append(Client(port)) or made[-1])
+    monkeypatch.setattr(bot, "load_model", lambda ckpt, dev: (None, None, None))
+    monkeypatch.setattr(bot, "read_checkpoint", lambda ckpt: {})
+    monkeypatch.setattr(bot, "play_run", lost)
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    bot.serve(argparse.Namespace(port=1, device="cpu", checkpoint="ckpt"))
+    assert made[0].stops == [(BOT_RUN["id"], "stopped: lost contact with the game (ReadTimeout)")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the mod starts the bot through cmd.exe")
+def test_the_bot_command_keeps_its_arguments_through_cmd(tmp_path):
+    from antezero_agent.bot import command_line
+
+    ckpt, out = tmp_path / "a&b(1)^x" / "last.pt", tmp_path / "argv.json"
+    script = "import json, sys; open(sys.argv[2], 'w').write(json.dumps(sys.argv[1:]))"
+    cmd = command_line([sys.executable, "-c", script, str(ckpt), str(out)])
+    subprocess.run(f'start "AnteZero bot" /b /wait {cmd}', shell=True, check=True)  # as bot.lua starts it
+    assert json.loads(out.read_text()) == [str(ckpt), str(out)]

@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
 import sys
 import time
 import traceback
@@ -38,13 +37,19 @@ from .round_search import FREE, RoundSearch
 from .runtime import load_model, pick_device, read_checkpoint
 
 
+def command_line(args: list[str]) -> str:
+    """``args`` as the mod runs them, through cmd.exe: every one quoted, so
+    that ``&``, ``(`` or ``^`` in a path stay in it."""
+    return " ".join(f'"{a}"' for a in args)
+
+
 def install(a) -> None:
     from antezero_bridge.launch import BB_DISABLED, SAVE_DIR, install_companion_mod
 
     ckpt = Path(a.checkpoint).resolve()
     read_checkpoint(ckpt)  # it must load in this simulator
     cmd = [sys.executable, "-m", "antezero_agent.bot", str(ckpt), "--device", a.device]
-    (SAVE_DIR / "antezero.json").write_text(json.dumps({"command": subprocess.list2cmdline(cmd)}), encoding="utf-8")
+    (SAVE_DIR / "antezero.json").write_text(json.dumps({"command": command_line(cmd)}), encoding="utf-8")
     print("installed", install_companion_mod())
     if BB_DISABLED.parent.exists():  # it mutes the game and overrides its settings whenever it loads
         BB_DISABLED.touch()
@@ -175,8 +180,8 @@ def serve(a) -> None:
                 print(f"playing {run}", flush=True)
                 try:
                     end = play_run(client, env, run, model, cfg, dev, rs, critic)
-                except httpx.HTTPError:
-                    raise
+                except httpx.HTTPError as e:  # handed back if the game is still there, else the stop fails too
+                    end = f"stopped: lost contact with the game ({type(e).__name__})"
                 except Exception as e:
                     traceback.print_exc()
                     end = f"stopped: {type(e).__name__}"
