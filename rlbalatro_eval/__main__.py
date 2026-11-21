@@ -6,6 +6,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import os
 import time
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import numpy as np
 import torch
 
 from .antezero_adapter import AntezeroBalatroEnv
-from .policy import Policy
+from .runner import init_worker, load_policy, run_episode, run_worker_seed
 
 DEFAULT_MODEL = Path(__file__).resolve().parent / "model_0095.pt"
 
@@ -82,6 +84,7 @@ def main(argv=None) -> None:
     ap.add_argument("--sample", action="store_true", help="sample actions instead of greedy argmax")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--max-steps", type=int, default=5000)
+    ap.add_argument("--workers", type=int, default=1, help="parallel worker processes (1 = single-process)")
     ap.add_argument("--no-extra-obs", action="store_true", help="disable Game.extra_obs() (ablation)")
     a = ap.parse_args(argv)
 
@@ -89,9 +92,11 @@ def main(argv=None) -> None:
         torch.multinomial = lambda probs, n, replacement=False, **kw: probs.argmax(-1, keepdim=True)
 
     model_path = fetch_model(a.model)
-    probe = AntezeroBalatroEnv(deck=a.decks[0], stake=a.stakes[0], max_steps=a.max_steps)
-    model, _ = load_policy(model_path, probe.groups, dev=a.device)
-    probe.close()
+    model = None
+    if a.workers <= 1:
+        probe = AntezeroBalatroEnv(deck=a.decks[0], stake=a.stakes[0], max_steps=a.max_steps)
+        model, _ = load_policy(model_path, probe.groups, dev=a.device)
+        probe.close()
 
     total_games = 0
     total_wins = 0
@@ -103,22 +108,36 @@ def main(argv=None) -> None:
     t0 = time.perf_counter()
     for deck in a.decks:
         for stake in a.stakes:
-            env = AntezeroBalatroEnv(
-                deck=deck,
-                stake=stake,
-                max_steps=a.max_steps,
-                use_extra_obs=not a.no_extra_obs,
-            )
+            seeds = [f"{a.seed_prefix}{a.seed_start + i:02d}" for i in range(a.games)]
             wins, d_antes, d_steps, d_illegal, d_trunc = 0, [], 0, 0, 0
-            for i in range(a.games):
-                seed = f"{a.seed_prefix}{a.seed_start + i:02d}"
-                res = run_episode(env, model, seed, device=a.device)
-                wins += int(res["won"])
-                d_antes.append(res["ante"])
-                d_steps += res["steps"]
-                d_illegal += res["illegal_steps"]
-                d_trunc += int(res["truncated"])
-            env.close()
+            if a.workers <= 1:
+                env = AntezeroBalatroEnv(
+                    deck=deck,
+                    stake=stake,
+                    max_steps=a.max_steps,
+                    use_extra_obs=not a.no_extra_obs,
+                )
+                for seed in seeds:
+                    res = run_episode(env, model, seed, device=a.device)
+                    wins += int(res["won"])
+                    d_antes.append(res["ante"])
+                    d_steps += res["steps"]
+                    d_illegal += res["illegal_steps"]
+                    d_trunc += int(res["truncated"])
+                env.close()
+            else:
+                n_workers = min(a.workers, a.games)
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=init_worker,
+                    initargs=(str(model_path), deck, stake, a.max_steps, not a.no_extra_obs, a.sample, a.device),
+                ) as ex:
+                    for res in ex.map(run_worker_seed, seeds, chunksize=max(1, len(seeds) // (n_workers * 4))):
+                        wins += int(res["won"])
+                        d_antes.append(res["ante"])
+                        d_steps += res["steps"]
+                        d_illegal += res["illegal_steps"]
+                        d_trunc += int(res["truncated"])
             total_games += a.games
             total_wins += wins
             total_steps += d_steps

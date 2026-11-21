@@ -6,17 +6,28 @@ This branch (`expose-extra-obs`) includes `rlbalatro_eval/`, a standalone Python
 
 ```bash
 uv sync
-uv run python -m rlbalatro_eval --decks b_blue --stakes 8 --games 50
+uv run python -m rlbalatro_eval --decks b_blue --stakes 8 --games 50 --workers 16
 ```
 
-If `--model` is omitted, `rlbalatro_eval` automatically downloads `model_0095.pt` from the RLBalatro release (`v0.1`) to `rlbalatro_eval/model_0095.pt`.
+`model_0095.pt` is bundled in `rlbalatro_eval/model_0095.pt` (pass `--model PATH` to evaluate another checkpoint).
 
 Useful flags:
 - `--decks b_red b_blue ...` (default: `b_blue`)
 - `--stakes 1 8 ...` (default: `8` Gold Stake)
 - `--games N` (games per `(deck, stake)` pair, default: `50`)
+- `--workers N` (parallel worker processes, default: `1`)
 - `--sample` (sample actions instead of greedy argmax)
 - `--no-extra-obs` (ablation: disable `Game.extra_obs()` and use only `canonical()` + Python-derivable fields)
+
+## Evaluation Results (Gold Stake, Greedy, Interim `N = 128`)
+
+Evaluated in `antezero_sim` on seeds `EVAL00`..`EVAL127` (`stake=8`, `0` illegal actions, `0` truncations; reference `antezero-v0.2.0.pt` from `README.md`):
+
+| Deck | `model_0095.pt` (`N = 128`) | Mean Ante | Mean Steps | `antezero-v0.2.0.pt` (ref) |
+|---|---:|---:|---:|---:|
+| Blue Deck (`b_blue`) | **43.0%** (`55/128`) | 6.47 | 308.2 | 24% |
+| Yellow Deck (`b_yellow`) | **40.6%** (`52/128`) | 6.46 | 318.0 | 21% |
+| Black Deck (`b_black`) | **9.4%** (`12/128`) | 3.71 | 130.7 | 3% |
 
 ## Observation & Stepping Differences vs `BalatroEnv`
 
